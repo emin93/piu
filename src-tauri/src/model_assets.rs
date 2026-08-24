@@ -4537,6 +4537,13 @@ mod tests {
             .write_all(&bytes[..9])
             .await
             .expect("crash-time partial bytes");
+        private
+            .output
+            .as_mut()
+            .expect("private output is open")
+            .flush()
+            .await
+            .expect("crash-time partial bytes reached the file");
         let private_path = private.temporary_path().to_path_buf();
         std::mem::forget(private);
         drop(manager);
