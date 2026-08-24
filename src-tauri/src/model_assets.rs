@@ -1827,11 +1827,15 @@ impl ModelAssetManager {
                 Err(ModelAssetError::OperationInProgress)
             };
         }
-        if self.status().phase == ModelAssetPhase::Ready {
+        let status = self.status();
+        if status.phase == ModelAssetPhase::Ready {
             return Ok((0, None));
         }
-        if self.status().phase == ModelAssetPhase::RevisionMismatch {
+        if status.phase == ModelAssetPhase::RevisionMismatch {
             return Err(ModelAssetError::RevisionMismatch);
+        }
+        if status.error_code == Some(ModelAssetErrorCode::Ownership) {
+            return Err(ModelAssetError::NotOwned);
         }
         let operation_id = self.0.next_operation_id.fetch_add(1, Ordering::Relaxed);
         let cancellation = CancellationToken::new();
@@ -2936,7 +2940,10 @@ impl ModelAssetManager {
                     })?,
             )
             .map_err(|_| ModelAssetError::NotOwned)?;
-            if marker.repository == manifest.repository && marker.revision != manifest.revision {
+            let marker_is_current = marker.matches(manifest);
+            let marker_is_removable_old_revision =
+                marker.revision != manifest.revision && marker.authorizes_removal(manifest);
+            if marker_is_removable_old_revision {
                 status.phase = ModelAssetPhase::RevisionMismatch;
                 status.message = Some(ModelAssetError::RevisionMismatch.to_string());
                 status.error_code = Some(ModelAssetErrorCode::RevisionMismatch);
@@ -2945,7 +2952,18 @@ impl ModelAssetManager {
                     requires_validation: false,
                 });
             }
-            let marker_is_current = marker.matches(manifest);
+            if !marker_is_current {
+                status.phase = ModelAssetPhase::Failed;
+                status.error_code = Some(ModelAssetErrorCode::Ownership);
+                status.message = Some(
+                    "Più found unsupported pre-release model ownership metadata and left every file untouched. Reset Più's pre-release application data, then download the pinned model again."
+                        .into(),
+                );
+                return Ok(InstallInspection {
+                    status,
+                    requires_validation: false,
+                });
+            }
             let all_files_have_pinned_size = manifest.files.iter().all(|file| {
                 storage
                     .metadata(Path::new(&file.install_path))
@@ -5694,6 +5712,84 @@ mod tests {
 
         assert_eq!(status.status.phase, ModelAssetPhase::RevisionMismatch);
         assert!(!status.requires_validation);
+    }
+
+    #[tokio::test]
+    async fn unsupported_ownership_metadata_never_adopts_existing_files() {
+        let bytes = b"unsupported ownership fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+
+        for metadata_case in [
+            "schema-zero-current",
+            "schema-zero-old",
+            "foreign-owner-current",
+            "foreign-owner-old",
+            "unsupported-current-manifest",
+        ] {
+            let temporary = TempDir::new().expect("temporary model root");
+            let manifest = fixture_manifest(&bytes);
+            let root = temporary.path().join("models");
+            fs::create_dir_all(root.join("target")).expect("target directory");
+            fs::write(root.join("target/model.bin"), &bytes).expect("existing model bytes");
+            let mut marker = OwnershipMarker::from_manifest(&manifest);
+            match metadata_case {
+                "schema-zero-current" => marker.schema_version = 0,
+                "schema-zero-old" => {
+                    marker.schema_version = 0;
+                    marker.revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+                }
+                "foreign-owner-current" => marker.owner = "com.example.foreign".into(),
+                "foreign-owner-old" => {
+                    marker.owner = "com.example.foreign".into();
+                    marker.revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+                }
+                "unsupported-current-manifest" => {
+                    marker.manifest_id = "unsupported-manifest".into()
+                }
+                _ => unreachable!("fixed ownership metadata case"),
+            }
+            let marker_bytes = serde_json::to_vec(&marker).expect("unsupported marker JSON");
+            fs::write(root.join(OWNERSHIP_FILE), &marker_bytes).expect("unsupported marker");
+
+            let manager = ModelAssetManager::new(
+                temporary.path().to_path_buf(),
+                PathBuf::from("models"),
+                manifest.clone(),
+                format!("{}/resolve/{}", fixture.base_url, manifest.revision),
+                format!("{}/whoami", fixture.base_url),
+                Arc::new(MemoryCredentials::default()),
+                Arc::new(FixedDisk(AtomicU64::new(u64::MAX))),
+            )
+            .expect("unsupported ownership is an actionable resource state");
+
+            assert_eq!(manager.status().phase, ModelAssetPhase::Failed);
+            assert_eq!(
+                manager.status().error_code,
+                Some(ModelAssetErrorCode::Ownership)
+            );
+            assert!(
+                manager
+                    .status()
+                    .message
+                    .expect("ownership recovery message")
+                    .contains("Reset Più's pre-release application data")
+            );
+            assert!(matches!(
+                manager.start_download(),
+                Err(ModelAssetError::NotOwned)
+            ));
+            tokio::task::yield_now().await;
+            assert_eq!(
+                fs::read(root.join(OWNERSHIP_FILE)).expect("preserved unsupported marker"),
+                marker_bytes
+            );
+            assert_eq!(
+                fs::read(root.join("target/model.bin")).expect("preserved existing model"),
+                bytes
+            );
+        }
+
+        assert_eq!(fixture.state.requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
