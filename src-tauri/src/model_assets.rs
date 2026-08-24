@@ -4644,6 +4644,13 @@ mod tests {
             .write_all(b"not yet published")
             .await
             .expect("private metadata bytes");
+        private
+            .output
+            .as_mut()
+            .expect("private output is open")
+            .flush()
+            .await
+            .expect("private metadata bytes reached the file");
         let private_path = private.temporary_path().to_path_buf();
 
         drop(private);
