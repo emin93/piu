@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { expect, test, vi } from "vitest";
 
 import type { InboxSnapshot } from "../../platform/project-inbox";
+import { ProjectDraftController } from "./draft-controller";
 import { InboxWorkspace } from "./InboxWorkspace";
 
 const populatedSnapshot: InboxSnapshot = {
@@ -59,26 +60,34 @@ const populatedSnapshot: InboxSnapshot = {
 
 function WorkspaceHarness({
   onRemove = vi.fn().mockResolvedValue(undefined),
+  onSave,
 }: {
   onRemove?: (projectId: number) => Promise<string | undefined>;
+  onSave?: (projectId: number, prompt: string) => Promise<void>;
 }) {
   const [snapshot, setSnapshot] = useState(populatedSnapshot);
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
   const [query, setQuery] = useState("");
+  const [drafts] = useState(() => {
+    const controller = new ProjectDraftController(async (projectId, prompt) => {
+      await onSave?.(projectId, prompt);
+      setSnapshot((current) => ({
+        ...current,
+        drafts: [
+          ...current.drafts.filter((draft) => draft.projectId !== projectId),
+          ...(prompt ? [{ projectId, prompt, updatedAtMs: 700 }] : []),
+        ],
+      }));
+    });
+    controller.reconcile(populatedSnapshot);
+    return controller;
+  });
+  useEffect(() => drafts.reconcile(snapshot), [drafts, snapshot]);
 
   return (
     <InboxWorkspace
       actionError={undefined}
-      draftStatus={{ state: "saved" }}
-      onDraftChange={(projectId, prompt) => {
-        setSnapshot((current) => ({
-          ...current,
-          drafts: [
-            ...current.drafts.filter((draft) => draft.projectId !== projectId),
-            { projectId, prompt, updatedAtMs: 700 },
-          ],
-        }));
-      }}
+      drafts={drafts}
       onOpenRepository={vi.fn()}
       onQueryChange={setQuery}
       onRemoveProject={onRemove}
@@ -133,34 +142,70 @@ test("keeps one controlled draft per project across navigation", async () => {
   );
 });
 
+test("All Projects uses the first available project as the centered composer target", async () => {
+  const user = userEvent.setup();
+  render(<WorkspaceHarness />);
+
+  expect(screen.getByRole("button", { name: "All Projects, 3 projects" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  const composer = screen.getByRole("textbox", { name: "Draft for Atlas" });
+  expect(composer).toHaveValue("Explain the parser");
+  expect(screen.getByRole("heading", { name: "What should we build?" })).toBeVisible();
+  expect(screen.getByText(/New chat in/)).toHaveTextContent("New chat in Atlas");
+
+  await user.clear(composer);
+  await user.type(composer, "Use the global inbox draft");
+  expect(composer).toHaveValue("Use the global inbox draft");
+});
+
+test("the inbox sidebar resize seam is keyboard operable", async () => {
+  const user = userEvent.setup();
+  render(<WorkspaceHarness />);
+
+  const resizeHandle = screen.getByRole("separator", { name: "Resize inbox" });
+  expect(resizeHandle).toHaveAttribute("aria-valuenow", "256");
+  await user.click(resizeHandle);
+  await user.keyboard("{ArrowRight}");
+  expect(resizeHandle).toHaveAttribute("aria-valuenow", "272");
+  await user.keyboard("{Home}");
+  expect(resizeHandle).toHaveAttribute("aria-valuenow", "208");
+});
+
 test("explains unavailable projects and enforces removal rules", async () => {
   const removeProject = vi.fn().mockResolvedValue(undefined);
   const user = userEvent.setup();
   render(<WorkspaceHarness onRemove={removeProject} />);
 
-  const blockedRemoval = screen.getByRole("button", { name: "Remove Atlas" });
+  const blockedTrigger = screen.getByRole("button", { name: "Project actions for Atlas" });
+  await user.click(blockedTrigger);
+  const blockedRemoval = await screen.findByRole("menuitem", { name: "Remove project" });
   expect(blockedRemoval).toHaveAttribute("aria-disabled", "true");
   expect(blockedRemoval).toHaveAccessibleDescription("Merge active chats before removing Atlas.");
-  expect(screen.getByRole("button", { name: "Remove Beacon" })).toHaveAttribute(
-    "aria-disabled",
-    "true",
-  );
-  expect(screen.getByText("Repository unavailable")).toBeVisible();
   await user.click(blockedRemoval);
-  expect(blockedRemoval).toHaveFocus();
   expect(removeProject).not.toHaveBeenCalled();
 
-  const trigger = screen.getByRole("button", { name: "Remove Caldera" });
-  await user.click(trigger);
-  const confirmation = screen.getByRole("dialog", { name: "Remove Caldera?" });
-  expect(confirmation).toHaveTextContent("repository on disk won’t be changed");
-  expect(within(confirmation).getByRole("button", { name: "Cancel" })).toHaveFocus();
   await user.keyboard("{Escape}");
-  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /Beacon, repository unavailable/ }));
+  expect(screen.getByRole("heading", { name: "Beacon is unavailable" })).toBeVisible();
+  expect(screen.getByText("Repository access required")).toBeVisible();
+
+  const trigger = screen.getByRole("button", { name: "Project actions for Caldera" });
+  await user.click(trigger);
+  await user.click(await screen.findByRole("menuitem", { name: "Remove project" }));
+  const confirmation = screen.getByRole("alertdialog", { name: "Remove Caldera?" });
+  expect(confirmation).toHaveTextContent("repository on disk won't be changed");
+  await vi.waitFor(() =>
+    expect(within(confirmation).getByRole("button", { name: "Cancel" })).toHaveFocus(),
+  );
+  await user.keyboard("{Escape}");
+  expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
   expect(trigger).toHaveFocus();
 
   await user.click(trigger);
-  const reopenedConfirmation = screen.getByRole("dialog", { name: "Remove Caldera?" });
+  await user.click(await screen.findByRole("menuitem", { name: "Remove project" }));
+  const reopenedConfirmation = screen.getByRole("alertdialog", { name: "Remove Caldera?" });
   await user.click(within(reopenedConfirmation).getByRole("button", { name: "Remove project" }));
   expect(removeProject).toHaveBeenCalledWith(3);
 });
@@ -172,12 +217,59 @@ test("removal discloses draft deletion and keeps the modal open on failure", asy
 
   await user.click(screen.getByRole("button", { name: /Caldera, available/ }));
   await user.type(screen.getByRole("textbox", { name: "Draft for Caldera" }), "Unsent work");
-  await user.click(screen.getByRole("button", { name: "Remove Caldera" }));
-  const dialog = screen.getByRole("dialog", { name: "Remove Caldera?" });
+  await user.click(screen.getByRole("button", { name: "Project actions for Caldera" }));
+  await user.click(await screen.findByRole("menuitem", { name: "Remove project" }));
+  const dialog = screen.getByRole("alertdialog", { name: "Remove Caldera?" });
   expect(dialog).toHaveTextContent("unsent draft will be deleted");
 
   await user.click(within(dialog).getByRole("button", { name: "Remove project" }));
 
   expect(await within(dialog).findByRole("alert")).toHaveTextContent("Couldn't remove");
   expect(dialog).toBeVisible();
+});
+
+test("a failed draft stays visible in All Projects and can be retried", async () => {
+  const save = vi
+    .fn<(projectId: number, prompt: string) => Promise<void>>()
+    .mockRejectedValueOnce(new Error("database offline"))
+    .mockResolvedValueOnce();
+  const user = userEvent.setup();
+  render(<WorkspaceHarness onSave={save} />);
+
+  await user.click(screen.getByRole("button", { name: /Caldera, available/ }));
+  await user.type(screen.getByRole("textbox", { name: "Draft for Caldera" }), "Keep this work");
+  expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't save this draft");
+  await user.click(screen.getByRole("button", { name: "All Projects, 3 projects" }));
+
+  const draftsList = screen.getByRole("list", { name: "Unsent drafts" });
+  expect(within(draftsList).getByText("Keep this work")).toBeVisible();
+  await user.click(within(draftsList).getByRole("button", { name: "Retry" }));
+  await vi.waitFor(() => expect(save).toHaveBeenCalledTimes(2));
+  expect(within(draftsList).queryByText("Not saved")).not.toBeInTheDocument();
+});
+
+test("removal keeps focus contained while the host response is pending", async () => {
+  let finishRemoval: ((value: string | undefined) => void) | undefined;
+  const removeProject = vi.fn(
+    () =>
+      new Promise<string | undefined>((resolve) => {
+        finishRemoval = resolve;
+      }),
+  );
+  const user = userEvent.setup();
+  render(<WorkspaceHarness onRemove={removeProject} />);
+
+  await user.click(screen.getByRole("button", { name: "Project actions for Caldera" }));
+  await user.click(await screen.findByRole("menuitem", { name: "Remove project" }));
+  const dialog = screen.getByRole("alertdialog", { name: "Remove Caldera?" });
+  await user.click(within(dialog).getByRole("button", { name: "Remove project" }));
+  expect(within(dialog).getByRole("button", { name: "Removing" })).toBeDisabled();
+
+  await user.keyboard("{Tab}{Tab}");
+  expect(dialog).toContainElement(document.activeElement as HTMLElement);
+  await user.keyboard("{Escape}");
+  expect(dialog).toBeVisible();
+
+  finishRemoval?.(undefined);
+  await vi.waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
 });

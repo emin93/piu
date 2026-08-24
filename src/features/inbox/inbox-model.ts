@@ -1,4 +1,9 @@
-import type { ChatSummary, DraftSummary, InboxSnapshot } from "../../platform/project-inbox";
+import type {
+  ChatSummary,
+  DraftSummary,
+  InboxSnapshot,
+  ProjectSummary,
+} from "../../platform/project-inbox";
 
 export interface InboxSelection {
   drafts: DraftSummary[];
@@ -46,4 +51,19 @@ export function selectInbox(snapshot: InboxSnapshot, filter: InboxFilter): Inbox
 
 export function projectDraft(snapshot: InboxSnapshot, projectId: number) {
   return snapshot.drafts.find((draft) => draft.projectId === projectId);
+}
+
+export function composerProject(
+  snapshot: InboxSnapshot,
+  selectedProjectId: number | null,
+): ProjectSummary | undefined {
+  if (selectedProjectId !== null) {
+    const selected = snapshot.projects.find((project) => project.id === selectedProjectId);
+    if (selected) return selected;
+  }
+
+  return (
+    snapshot.projects.find((project) => project.availability === "available") ??
+    snapshot.projects[0]
+  );
 }

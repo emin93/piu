@@ -35,6 +35,7 @@ Più is a greenfield Apple Silicon macOS application. The implementation should 
 
 ## Keep the interface coherent
 
+- Compose product surfaces from Più's checked-in shadcn/Base UI primitives, semantic Tailwind tokens, local Geist faces, and Lucide icons. T3 Code is a behavior and density reference only; do not import its runtime, state, routing, or theme architecture.
 - Use one visual system and one interaction vocabulary across onboarding, inbox, chat, review, files, terminal, and settings.
 - Let status determine emphasis. Work that needs the user should be prominent; work that is running should remain visible without demanding attention; completed work should recede without disappearing.
 - Give each control one stable name that matches the resulting status and confirmation message.

@@ -1,13 +1,47 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ChevronDownIcon,
+  FolderPlusIcon,
+  MoreHorizontalIcon,
+  SearchIcon,
+  Trash2Icon,
+} from "lucide-react";
+import { memo, useCallback, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
-import type { ChatSummary, InboxSnapshot, ProjectSummary } from "../../platform/project-inbox";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
+import { Input } from "@/components/ui/input";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Separator } from "@/components/ui/separator";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import type { ChatSummary, InboxSnapshot, ProjectSummary } from "@/platform/project-inbox";
+
+import { ChatComposer } from "./ChatComposer";
 import { EmptyInbox } from "./EmptyInbox";
-import { projectDraft, selectInbox } from "./inbox-model";
+import { type DraftPersistenceStatus, ProjectDraftController } from "./draft-controller";
+import { composerProject, selectInbox } from "./inbox-model";
+import { SidebarResizeHandle } from "./SidebarResizeHandle";
 
 interface InboxWorkspaceProps {
   actionError: string | undefined;
-  draftStatus: DraftPersistenceStatus;
-  onDraftChange: (projectId: number, prompt: string) => void;
+  drafts: ProjectDraftController;
   onOpenRepository: () => void;
   onQueryChange: (query: string) => void;
   onRemoveProject: (projectId: number) => Promise<string | undefined>;
@@ -17,114 +51,197 @@ interface InboxWorkspaceProps {
   snapshot: InboxSnapshot;
 }
 
-export type DraftPersistenceStatus =
-  { state: "idle" | "saving" | "saved" } | { state: "failed"; message: string };
+export type { DraftPersistenceStatus };
 
-function RemoveIcon() {
-  return (
-    <svg aria-hidden="true" viewBox="0 0 16 16">
-      <path d="M4.5 4.5h7M6.2 4.5V3.2h3.6v1.3m.9 0-.5 8.2H5.8l-.5-8.2M7 6.4v4.4m2-4.4v4.4" />
-    </svg>
-  );
-}
-
-function SearchIcon() {
-  return (
-    <svg aria-hidden="true" viewBox="0 0 16 16">
-      <circle cx="6.8" cy="6.8" r="4.1" />
-      <path d="m9.8 9.8 3.2 3.2" />
-    </svg>
-  );
-}
-
-function ProjectFilter({
+const ProjectFilter = memo(function ProjectFilter({
+  onRemove,
+  onSelect,
   project,
   selected,
-  onSelect,
-  onRemove,
 }: {
+  onRemove: (trigger: HTMLButtonElement) => void;
+  onSelect: () => void;
   project: ProjectSummary;
   selected: boolean;
-  onSelect: () => void;
-  onRemove: (trigger: HTMLButtonElement) => void;
 }) {
+  const actionsTriggerRef = useRef<HTMLButtonElement>(null);
   const removalBlocked = project.unmergedChatCount > 0;
   const activeChatLabel = `${project.unmergedChatCount} active ${project.unmergedChatCount === 1 ? "chat" : "chats"}`;
   const availabilityLabel =
     project.availability === "available" ? "available" : "repository unavailable";
   const removalReasonId = `project-${project.id}-removal-reason`;
+
   return (
-    <li className="project-filter">
-      <button
+    <li className="project-row">
+      <Button
         aria-label={`${project.name}, ${availabilityLabel}, ${activeChatLabel}`}
         aria-pressed={selected}
-        className="project-filter__select"
+        className="project-row-select"
         onClick={onSelect}
         type="button"
+        variant="ghost"
       >
         <span
           aria-hidden="true"
-          className={`project-filter__status project-filter__status--${project.availability}`}
+          className="project-availability"
+          data-availability={project.availability}
         />
-        <span className="project-filter__copy">
-          <span className="project-filter__name" title={project.name}>
+        <span className="project-row-copy">
+          <span className="project-row-name" title={project.name}>
             {project.name}
           </span>
-          {project.availability === "available" ? (
-            <span>
-              {project.unmergedChatCount} active{" "}
-              {project.unmergedChatCount === 1 ? "chat" : "chats"}
-            </span>
-          ) : (
-            <span>Repository unavailable</span>
-          )}
+          <span>{project.availability === "available" ? activeChatLabel : availabilityLabel}</span>
         </span>
-      </button>
-      <button
-        aria-describedby={removalBlocked ? removalReasonId : undefined}
-        aria-disabled={removalBlocked}
-        aria-label={`Remove ${project.name}`}
-        className="project-filter__remove"
-        onClick={(event) => {
-          if (!removalBlocked) onRemove(event.currentTarget);
-        }}
-        type="button"
-      >
-        <RemoveIcon />
-      </button>
-      {removalBlocked && (
-        <span className="visually-hidden" id={removalReasonId}>
+      </Button>
+
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button
+              aria-label={`Project actions for ${project.name}`}
+              className="project-actions-trigger"
+              ref={actionsTriggerRef}
+              size="icon-sm"
+              type="button"
+              variant="ghost"
+            />
+          }
+        >
+          <MoreHorizontalIcon aria-hidden="true" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-44">
+          <DropdownMenuItem
+            aria-describedby={removalBlocked ? removalReasonId : undefined}
+            disabled={removalBlocked}
+            onClick={() => {
+              if (actionsTriggerRef.current) onRemove(actionsTriggerRef.current);
+            }}
+            variant="destructive"
+          >
+            <Trash2Icon aria-hidden="true" />
+            Remove project
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      {removalBlocked ? (
+        <span className="sr-only" id={removalReasonId}>
           Merge active chats before removing {project.name}.
         </span>
-      )}
+      ) : null}
     </li>
   );
-}
+});
 
-function ChatRow({ chat }: { chat: ChatSummary }) {
+const ChatRow = memo(function ChatRow({ chat }: { chat: ChatSummary }) {
   return (
     <li className="chat-row" data-chat-id={chat.id}>
-      <div className="chat-row__main">
+      <div className="chat-row-copy">
         <h3 title={chat.title}>{chat.title}</h3>
         <p>
           <span>{chat.projectName}</span>
           <span aria-hidden="true">/</span>
-          <span className="chat-row__branch" title={chat.branchName}>
+          <span className="font-mono" title={chat.branchName}>
             {chat.branchName}
           </span>
         </p>
       </div>
-      {chat.pullRequestNumber !== null && (
-        <span className="chat-row__pr">PR #{chat.pullRequestNumber}</span>
-      )}
+      {chat.pullRequestNumber !== null ? (
+        <Badge className="font-mono" variant="outline">
+          #{chat.pullRequestNumber}
+        </Badge>
+      ) : null}
     </li>
+  );
+});
+
+function DraftList({
+  drafts,
+  onSelectProject,
+  projects,
+  query,
+  selectedProjectId,
+}: {
+  drafts: ProjectDraftController;
+  onSelectProject: (projectId: number | null) => void;
+  projects: ProjectSummary[];
+  query: string;
+  selectedProjectId: number | null;
+}) {
+  useSyncExternalStore(drafts.subscribeAll, drafts.getRevision, drafts.getRevision);
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const visibleDrafts = projects.flatMap((project) => {
+    if (selectedProjectId !== null && project.id !== selectedProjectId) return [];
+    const draft = drafts.get(project.id);
+    if (!draft.prompt) return [];
+    if (
+      normalizedQuery &&
+      !`${project.name} ${draft.prompt}`.toLocaleLowerCase().includes(normalizedQuery)
+    ) {
+      return [];
+    }
+    return [{ draft, project }];
+  });
+
+  if (visibleDrafts.length === 0) return null;
+
+  return (
+    <section aria-labelledby="retained-drafts-heading">
+      <div className="sidebar-section-heading">
+        <span id="retained-drafts-heading">Drafts</span>
+        <span className="font-mono">{visibleDrafts.length}</span>
+      </div>
+      <ul aria-label="Unsent drafts" className="draft-list">
+        {visibleDrafts.map(({ draft, project }) => (
+          <li key={project.id}>
+            <Button
+              className="draft-row"
+              onClick={() => onSelectProject(project.id)}
+              type="button"
+              variant="ghost"
+            >
+              <span className="draft-row-project">{project.name}</span>
+              <span className="draft-row-prompt">{draft.prompt}</span>
+              {draft.status.state === "failed" ? (
+                <span className="draft-row-failure">Not saved</span>
+              ) : null}
+            </Button>
+            {draft.status.state === "failed" ? (
+              <Button
+                className="draft-row-retry"
+                onClick={() => void drafts.retry(project.id)}
+                size="sm"
+                type="button"
+                variant="ghost"
+              >
+                Retry
+              </Button>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function SearchStage({ count }: { count: number }) {
+  return (
+    <Empty className="stage-empty">
+      <EmptyHeader>
+        <EmptyTitle>{count === 0 ? "No matching chats" : `${count} matching chats`}</EmptyTitle>
+        <EmptyDescription>
+          {count === 0
+            ? "Try a title, project, branch, or pull-request number."
+            : "Search results are shown in the inbox."}
+        </EmptyDescription>
+      </EmptyHeader>
+    </Empty>
   );
 }
 
 export function InboxWorkspace({
   actionError,
-  draftStatus,
-  onDraftChange,
+  drafts,
   onOpenRepository,
   onQueryChange,
   onRemoveProject,
@@ -136,57 +253,19 @@ export function InboxWorkspace({
   const [projectPendingRemoval, setProjectPendingRemoval] = useState<ProjectSummary>();
   const [removalError, setRemovalError] = useState<string>();
   const [removing, setRemoving] = useState(false);
-  const dialogRef = useRef<HTMLElement>(null);
-  const removalTriggerRef = useRef<HTMLButtonElement | undefined>(undefined);
-  const dialogWasOpen = useRef(false);
+  const removalCancelRef = useRef<HTMLButtonElement>(null);
+  const removalTriggerRef = useRef<HTMLButtonElement>(null);
   const selection = useMemo(
     () => selectInbox(snapshot, { projectId: selectedProjectId, query }),
     [query, selectedProjectId, snapshot],
   );
-  const selectedProject = snapshot.projects.find(({ id }) => id === selectedProjectId);
-  const selectedDraft = selectedProject ? projectDraft(snapshot, selectedProject.id) : undefined;
+  const targetProject = composerProject(snapshot, selectedProjectId);
   const visibleChatCount = selection.unmergedChats.length;
 
   const closeRemovalDialog = useCallback(() => {
     setProjectPendingRemoval(undefined);
     setRemovalError(undefined);
   }, []);
-
-  useEffect(() => {
-    if (!projectPendingRemoval) {
-      if (dialogWasOpen.current) removalTriggerRef.current?.focus();
-      dialogWasOpen.current = false;
-      return;
-    }
-    dialogWasOpen.current = true;
-    dialogRef.current?.querySelector<HTMLElement>("[data-dialog-initial-focus]")?.focus();
-    const containFocus = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !removing) {
-        event.preventDefault();
-        closeRemovalDialog();
-        return;
-      }
-      if (event.key !== "Tab") return;
-      const controls = [
-        ...(dialogRef.current?.querySelectorAll<HTMLElement>("button") ?? []),
-      ].filter((element) => !element.hasAttribute("disabled"));
-      if (controls.length === 0) return;
-      const first = controls[0];
-      const last = controls[controls.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      } else if (!dialogRef.current?.contains(document.activeElement)) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener("keydown", containFocus);
-    return () => window.removeEventListener("keydown", containFocus);
-  }, [closeRemovalDialog, projectPendingRemoval, removing]);
 
   const confirmRemoval = useCallback(async () => {
     if (!projectPendingRemoval) return;
@@ -199,72 +278,83 @@ export function InboxWorkspace({
   }, [closeRemovalDialog, onRemoveProject, projectPendingRemoval]);
 
   const pendingRemovalHasDraft = projectPendingRemoval
-    ? Boolean(projectDraft(snapshot, projectPendingRemoval.id)?.prompt)
+    ? Boolean(drafts.get(projectPendingRemoval.id).prompt)
     : false;
-
-  const draftStatusLabel =
-    draftStatus.state === "saving"
-      ? "Saving…"
-      : draftStatus.state === "saved"
-        ? "Saved locally"
-        : draftStatus.state === "failed"
-          ? "Not saved"
-          : "Not saved yet";
+  const totalSearchResults = selection.unmergedChats.length + selection.mergedChats.length;
 
   return (
     <main className="workspace" aria-label="Più inbox">
       <aside
-        className="inbox-rail"
         aria-label="Chat inbox navigation"
+        className="inbox-sidebar"
         inert={projectPendingRemoval ? true : undefined}
       >
-        <div className="inbox-rail__top">
-          <div className="inbox-rail__heading">
-            <div>
-              <p className="inbox-rail__label">Workspace</p>
-              <h1>Inbox</h1>
+        <div className="sidebar-header">
+          <div className="sidebar-title-row">
+            <h1>Inbox</h1>
+            <div className="sidebar-title-actions">
+              <Badge aria-label={`${visibleChatCount} active chats`} variant="secondary">
+                {visibleChatCount}
+              </Badge>
+              {snapshot.projects.length > 0 ? (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <Button
+                        aria-label="Open Repository"
+                        onClick={onOpenRepository}
+                        size="icon"
+                        type="button"
+                        variant="ghost"
+                      />
+                    }
+                  >
+                    <FolderPlusIcon aria-hidden="true" />
+                  </TooltipTrigger>
+                  <TooltipContent side="right">Open Repository</TooltipContent>
+                </Tooltip>
+              ) : null}
             </div>
-            <span aria-label={`${visibleChatCount} active chats`}>{visibleChatCount}</span>
           </div>
-          {snapshot.projects.length > 0 && (
-            <>
-              <div className="inbox-search">
-                <SearchIcon />
-                <input
-                  aria-label="Search chats"
-                  onChange={(event) => onQueryChange(event.target.value)}
-                  placeholder="Search chats"
-                  type="search"
-                  value={query}
-                />
-              </div>
-              <button className="rail-open-action" onClick={onOpenRepository} type="button">
-                <span aria-hidden="true">+</span>
-                Open Repository
-              </button>
-            </>
-          )}
-          {actionError && snapshot.projects.length > 0 && (
-            <p className="inline-error" role="alert">
+
+          <label className="search-field">
+            <span className="sr-only">Search chats</span>
+            <SearchIcon aria-hidden="true" />
+            <Input
+              aria-label="Search chats"
+              disabled={snapshot.projects.length === 0}
+              onChange={(event) => onQueryChange(event.target.value)}
+              placeholder="Search chats"
+              type="search"
+              value={query}
+            />
+          </label>
+
+          {actionError && snapshot.projects.length > 0 ? (
+            <p className="sidebar-error" role="alert">
               {actionError}
             </p>
-          )}
-          {snapshot.projects.length > 0 && (
+          ) : null}
+        </div>
+
+        <ScrollArea className="sidebar-scroll-area">
+          <div className="sidebar-scroll-content">
             <nav aria-label="Project filters" className="project-filters">
-              <p className="project-filters__label">Projects</p>
-              <button
+              <div className="sidebar-section-heading">
+                <span>Projects</span>
+              </div>
+              <Button
                 aria-label={`All Projects, ${snapshot.projects.length} ${snapshot.projects.length === 1 ? "project" : "projects"}`}
                 aria-pressed={selectedProjectId === null}
                 className="all-projects-filter"
+                disabled={snapshot.projects.length === 0}
                 onClick={() => onSelectProject(null)}
                 type="button"
+                variant="ghost"
               >
                 <span>All Projects</span>
-                <span>
-                  {snapshot.projects.length}{" "}
-                  {snapshot.projects.length === 1 ? "project" : "projects"}
-                </span>
-              </button>
+                <span className="font-mono">{snapshot.projects.length}</span>
+              </Button>
               <ul>
                 {snapshot.projects.map((project) => (
                   <ProjectFilter
@@ -281,98 +371,21 @@ export function InboxWorkspace({
                 ))}
               </ul>
             </nav>
-          )}
-        </div>
-        <p className="inbox-rail__hint">
-          Unmerged chats stay in the inbox until their pull request merges.
-        </p>
-      </aside>
 
-      <section
-        className={`conversation-stage${snapshot.projects.length > 0 ? " conversation-stage--populated" : ""}`}
-        aria-label="Chat inbox"
-        inert={projectPendingRemoval ? true : undefined}
-      >
-        {snapshot.projects.length === 0 ? (
-          <EmptyInbox actionError={actionError} onOpenRepository={onOpenRepository} />
-        ) : (
-          <div className="inbox-content">
-            <header className="inbox-content__header">
-              <div>
-                <p className="inbox-content__eyebrow">
-                  {selectedProject ? selectedProject.name : "Every project"}
-                </p>
-                <h2>Chat inbox</h2>
-              </div>
-              <span>{visibleChatCount} active</span>
-            </header>
+            <Separator className="sidebar-separator" />
 
-            {selectedProject?.availability !== "available" && selectedProject && (
-              <div className="repository-warning" role="alert">
-                <strong>Repository unavailable</strong>
-                <span>Move it back or restore access before starting new work.</span>
-              </div>
-            )}
-            {selectedProject && !query.trim() && (
-              <section className="draft-card" aria-labelledby="draft-heading">
-                <div className="draft-card__header">
-                  <div>
-                    <p>Unsent draft</p>
-                    <h3 id="draft-heading">Start something in {selectedProject.name}</h3>
-                  </div>
-                  <span
-                    aria-live="polite"
-                    className={`draft-status draft-status--${draftStatus.state}`}
-                  >
-                    {draftStatusLabel}
-                  </span>
-                </div>
-                <textarea
-                  aria-label={`Draft for ${selectedProject.name}`}
-                  disabled={selectedProject.availability !== "available"}
-                  onChange={(event) => onDraftChange(selectedProject.id, event.target.value)}
-                  placeholder="Describe what you want to change…"
-                  rows={4}
-                  value={selectedDraft?.prompt ?? ""}
-                />
-                {draftStatus.state === "failed" && (
-                  <p className="inline-error" role="alert">
-                    {draftStatus.message}
-                  </p>
-                )}
-              </section>
-            )}
+            <DraftList
+              drafts={drafts}
+              onSelectProject={onSelectProject}
+              projects={snapshot.projects}
+              query={query}
+              selectedProjectId={selectedProjectId}
+            />
 
-            {!selectedProject && !query.trim() && selection.drafts.length > 0 && (
-              <section className="retained-drafts" aria-labelledby="retained-drafts-heading">
-                <div className="section-heading">
-                  <h3 id="retained-drafts-heading">Unsent drafts</h3>
-                  <span>{selection.drafts.length}</span>
-                </div>
-                <div className="retained-drafts__grid">
-                  {selection.drafts.map((draft) => {
-                    const project = snapshot.projects.find(({ id }) => id === draft.projectId);
-                    if (!project) return null;
-                    return (
-                      <button
-                        className="retained-draft"
-                        key={draft.projectId}
-                        onClick={() => onSelectProject(draft.projectId)}
-                        type="button"
-                      >
-                        <span>{project.name}</span>
-                        <strong>{draft.prompt}</strong>
-                      </button>
-                    );
-                  })}
-                </div>
-              </section>
-            )}
-
-            <section className="chat-list-section" aria-labelledby="active-chats-heading">
-              <div className="section-heading">
-                <h3 id="active-chats-heading">Active chats</h3>
-                <span>{visibleChatCount}</span>
+            <section aria-labelledby="active-chats-heading" className="chat-list-section">
+              <div className="sidebar-section-heading">
+                <span id="active-chats-heading">Chats</span>
+                <span className="font-mono">{visibleChatCount}</span>
               </div>
               {selection.unmergedChats.length > 0 ? (
                 <ul aria-label="Active chats" className="chat-list">
@@ -381,79 +394,89 @@ export function InboxWorkspace({
                   ))}
                 </ul>
               ) : (
-                <div className="inbox-zero-state">
-                  <h3>{query.trim() ? "No matching chats" : "No active chats"}</h3>
-                  <p>
-                    {query.trim()
-                      ? "Try a title, project, branch, or pull-request number."
-                      : selectedProject
-                        ? "Your draft is ready whenever you are."
-                        : "Choose a project to begin a draft."}
-                  </p>
-                </div>
+                <p className="sidebar-zero-copy">
+                  {query.trim() ? "No matching chats" : "No active chats"}
+                </p>
               )}
             </section>
 
-            {selection.mergedChats.length > 0 && (
-              <details className="merged-history">
-                <summary>Merged history · {selection.mergedChats.length}</summary>
-                <ul aria-label="Merged chats" className="chat-list">
-                  {selection.mergedChats.map((chat) => (
-                    <ChatRow chat={chat} key={chat.id} />
-                  ))}
-                </ul>
-              </details>
-            )}
+            {selection.mergedChats.length > 0 ? (
+              <Collapsible className="merged-history">
+                <CollapsibleTrigger
+                  render={
+                    <Button className="merged-history-trigger" type="button" variant="ghost" />
+                  }
+                >
+                  <ChevronDownIcon aria-hidden="true" />
+                  Merged
+                  <span className="font-mono">{selection.mergedChats.length}</span>
+                </CollapsibleTrigger>
+                <CollapsibleContent>
+                  <ul aria-label="Merged chats" className="chat-list chat-list-merged">
+                    {selection.mergedChats.map((chat) => (
+                      <ChatRow chat={chat} key={chat.id} />
+                    ))}
+                  </ul>
+                </CollapsibleContent>
+              </Collapsible>
+            ) : null}
           </div>
-        )}
+        </ScrollArea>
+      </aside>
+
+      <SidebarResizeHandle disabled={snapshot.projects.length === 0} />
+
+      <section
+        aria-label="Chat workspace"
+        className="conversation-stage"
+        inert={projectPendingRemoval ? true : undefined}
+      >
+        {snapshot.projects.length === 0 ? (
+          <EmptyInbox actionError={actionError} onOpenRepository={onOpenRepository} />
+        ) : query.trim() ? (
+          <SearchStage count={totalSearchResults} />
+        ) : targetProject ? (
+          <ChatComposer drafts={drafts} project={targetProject} />
+        ) : null}
       </section>
 
-      {projectPendingRemoval && (
-        <div className="dialog-backdrop">
-          <section
-            aria-labelledby="remove-project-title"
-            aria-modal="true"
-            className="remove-project-dialog"
-            ref={dialogRef}
-            role="dialog"
-          >
-            <p className="inbox-content__eyebrow">Remove project</p>
-            <h2 id="remove-project-title">Remove {projectPendingRemoval.name}?</h2>
-            <p className="remove-project-dialog__description">
-              Più will forget this project. The repository on disk won’t be changed.
-            </p>
-            {pendingRemovalHasDraft && (
-              <p className="remove-project-dialog__draft-warning">
-                Its unsent draft will be deleted from Più.
-              </p>
-            )}
-            {removalError && (
-              <p className="inline-error remove-project-dialog__error" role="alert">
+      <AlertDialog
+        onOpenChange={(open) => {
+          if (!open && !removing) closeRemovalDialog();
+        }}
+        open={Boolean(projectPendingRemoval)}
+      >
+        {projectPendingRemoval ? (
+          <AlertDialogContent finalFocus={removalTriggerRef} initialFocus={removalCancelRef}>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Remove {projectPendingRemoval.name}?</AlertDialogTitle>
+              <AlertDialogDescription>
+                Più will forget this project. The repository on disk won&apos;t be changed.
+                {pendingRemovalHasDraft ? (
+                  <span className="mt-2 block">Its unsent draft will be deleted from Più.</span>
+                ) : null}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            {removalError ? (
+              <p className="dialog-error" role="alert">
                 {removalError}
               </p>
-            )}
-            <div className="remove-project-dialog__actions">
-              <button
-                className="secondary-action"
-                data-dialog-initial-focus
-                disabled={removing}
-                onClick={closeRemovalDialog}
-                type="button"
-              >
+            ) : null}
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={removing} ref={removalCancelRef}>
                 Cancel
-              </button>
-              <button
-                className="danger-action"
+              </AlertDialogCancel>
+              <AlertDialogAction
                 disabled={removing}
                 onClick={() => void confirmRemoval()}
-                type="button"
+                variant="destructive"
               >
-                {removing ? "Removing…" : "Remove project"}
-              </button>
-            </div>
-          </section>
-        </div>
-      )}
+                {removing ? "Removing" : "Remove project"}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        ) : null}
+      </AlertDialog>
     </main>
   );
 }

@@ -1,7 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { Button } from "@/components/ui/button";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyTitle,
+} from "@/components/ui/empty";
+import { Skeleton } from "@/components/ui/skeleton";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { DeferredSurface, type DeferredSurfaceName } from "./features/deferred/DeferredSurface";
-import { InboxWorkspace, type DraftPersistenceStatus } from "./features/inbox/InboxWorkspace";
+import { ProjectDraftController } from "./features/inbox/draft-controller";
+import { InboxWorkspace } from "./features/inbox/InboxWorkspace";
 import { useSystemAppearance } from "./hooks/use-system-appearance";
 import { verifyHostBoundary } from "./platform/host-boundary";
 import {
@@ -21,48 +32,36 @@ interface AppProps {
   surface?: "inbox" | DeferredSurfaceName;
 }
 
-interface PendingDraft {
-  prompt: string;
-  timer: number;
-  generation: number;
-}
-
 const EMPTY_INBOX: InboxSnapshot = { projects: [], drafts: [], chats: [] };
-const DRAFT_SAVE_DELAY_MS = 250;
 
 function StartupFailure({ onRetry }: { onRetry: () => void }) {
   return (
-    <section className="startup-failure" aria-labelledby="startup-failure-title">
-      <p className="startup-failure__eyebrow">Application unavailable</p>
-      <h2 id="startup-failure-title">Più couldn't start</h2>
-      <p>Something interrupted startup. Retry to continue without changing your work.</p>
-      <button className="primary-action" type="button" onClick={onRetry}>
-        Retry
-      </button>
-    </section>
+    <Empty aria-labelledby="startup-failure-title" className="startup-state">
+      <EmptyHeader>
+        <EmptyTitle id="startup-failure-title">Più couldn&apos;t start</EmptyTitle>
+        <EmptyDescription>
+          Something interrupted startup. Retry to continue without changing your work.
+        </EmptyDescription>
+      </EmptyHeader>
+      <EmptyContent>
+        <Button onClick={onRetry} type="button">
+          Retry
+        </Button>
+      </EmptyContent>
+    </Empty>
   );
 }
 
 function StartupLoading() {
   return (
     <section className="startup-loading" aria-live="polite" role="status">
-      <span aria-hidden="true" className="startup-loading__indicator" />
-      <div>
-        <p>Preparing Più</p>
-        <h2>Opening your inbox…</h2>
+      <div className="startup-loading-copy">
+        <Skeleton className="h-3 w-20" />
+        <Skeleton className="h-5 w-32" />
       </div>
+      <span className="sr-only">Opening your inbox</span>
     </section>
   );
-}
-
-function optimisticDraft(
-  snapshot: InboxSnapshot,
-  projectId: number,
-  prompt: string,
-): InboxSnapshot {
-  const drafts = snapshot.drafts.filter((draft) => draft.projectId !== projectId);
-  if (prompt) drafts.push({ projectId, prompt, updatedAtMs: Date.now() });
-  return { ...snapshot, drafts };
 }
 
 export function App({ onOpenRepository, surface = "inbox" }: AppProps) {
@@ -72,24 +71,37 @@ export function App({ onOpenRepository, surface = "inbox" }: AppProps) {
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
   const [query, setQuery] = useState("");
   const [repositoryActionError, setRepositoryActionError] = useState<string>();
-  const [draftStatuses, setDraftStatuses] = useState<Record<number, DraftPersistenceStatus>>({});
   const verificationGeneration = useRef(0);
-  const pendingDrafts = useRef(new Map<number, PendingDraft>());
-  const draftSaveQueue = useRef(new Map<number, Promise<void>>());
-  const draftGenerations = useRef(new Map<number, number>());
-
-  const completeStartup = useCallback((generation: number) => {
-    void Promise.all([verifyHostBoundary(), loadProjectInbox()]).then(
-      ([, loadedSnapshot]) => {
-        if (verificationGeneration.current !== generation) return;
-        setSnapshot(loadedSnapshot);
-        setHostStatus("ready");
+  const [drafts] = useState(() => {
+    const controller = new ProjectDraftController(
+      async (projectId, prompt) => {
+        await saveProjectDraft(projectId, prompt);
+        setSnapshot((current) => controller.overlay(current));
       },
-      () => {
-        if (verificationGeneration.current === generation) setHostStatus("failed");
+      {
+        toFailureMessage: (error) =>
+          projectErrorMessage(error, "Couldn't save this draft. Keep Più open and try again."),
       },
     );
-  }, []);
+    return controller;
+  });
+
+  const completeStartup = useCallback(
+    (generation: number) => {
+      void Promise.all([verifyHostBoundary(), loadProjectInbox()]).then(
+        ([, loadedSnapshot]) => {
+          if (verificationGeneration.current !== generation) return;
+          drafts.reconcile(loadedSnapshot);
+          setSnapshot(drafts.overlay(loadedSnapshot));
+          setHostStatus("ready");
+        },
+        () => {
+          if (verificationGeneration.current === generation) setHostStatus("failed");
+        },
+      );
+    },
+    [drafts],
+  );
 
   const retryStartup = useCallback(() => {
     const generation = ++verificationGeneration.current;
@@ -97,54 +109,10 @@ export function App({ onOpenRepository, surface = "inbox" }: AppProps) {
     completeStartup(generation);
   }, [completeStartup]);
 
-  const persistDraft = useCallback((projectId: number, prompt: string, generation: number) => {
-    const previous = draftSaveQueue.current.get(projectId);
-    const save = previous
-      ? previous.catch(() => undefined).then(() => saveProjectDraft(projectId, prompt))
-      : saveProjectDraft(projectId, prompt);
-    const current = save.then(
-      () => {
-        if (draftGenerations.current.get(projectId) !== generation) return;
-        setDraftStatuses((statuses) => ({ ...statuses, [projectId]: { state: "saved" } }));
-      },
-      (error: unknown) => {
-        if (draftGenerations.current.get(projectId) !== generation) return;
-        setDraftStatuses((statuses) => ({
-          ...statuses,
-          [projectId]: {
-            state: "failed",
-            message: projectErrorMessage(
-              error,
-              "Couldn't save this draft. Keep Più open and try again.",
-            ),
-          },
-        }));
-        throw error;
-      },
-    );
-    draftSaveQueue.current.set(projectId, current);
-    void current.catch(() => undefined);
-    return current;
-  }, []);
-
-  const flushDraft = useCallback(
-    (projectId: number) => {
-      const pending = pendingDrafts.current.get(projectId);
-      if (!pending) return;
-      window.clearTimeout(pending.timer);
-      pendingDrafts.current.delete(projectId);
-      return persistDraft(projectId, pending.prompt, pending.generation);
-    },
-    [persistDraft],
-  );
-
-  const flushAllDrafts = useCallback(async () => {
-    for (const projectId of [...pendingDrafts.current.keys()]) void flushDraft(projectId);
-    await Promise.all(draftSaveQueue.current.values());
-  }, [flushDraft]);
+  const flushAllDrafts = useCallback(() => drafts.flushAll(), [drafts]);
 
   const openSelectedRepository = useCallback(() => {
-    if (selectedProjectId !== null) void flushDraft(selectedProjectId);
+    void flushAllDrafts().catch(() => undefined);
     setRepositoryActionError(undefined);
     if (onOpenRepository) {
       onOpenRepository();
@@ -161,7 +129,8 @@ export function App({ onOpenRepository, surface = "inbox" }: AppProps) {
       if (!path) return;
       try {
         const opened = await openRepository(path);
-        setSnapshot(opened.snapshot);
+        drafts.reconcile(opened.snapshot);
+        setSnapshot(drafts.overlay(opened.snapshot));
         setSelectedProjectId(opened.focusedProjectId);
         setQuery("");
       } catch (error: unknown) {
@@ -170,59 +139,43 @@ export function App({ onOpenRepository, surface = "inbox" }: AppProps) {
         );
       }
     })();
-  }, [flushDraft, onOpenRepository, selectedProjectId]);
-
-  const changeDraft = useCallback(
-    (projectId: number, prompt: string) => {
-      setSnapshot((current) => optimisticDraft(current, projectId, prompt));
-      const generation = (draftGenerations.current.get(projectId) ?? 0) + 1;
-      draftGenerations.current.set(projectId, generation);
-      setDraftStatuses((statuses) => ({ ...statuses, [projectId]: { state: "saving" } }));
-      const previous = pendingDrafts.current.get(projectId);
-      if (previous) window.clearTimeout(previous.timer);
-      const timer = window.setTimeout(() => void flushDraft(projectId), DRAFT_SAVE_DELAY_MS);
-      pendingDrafts.current.set(projectId, { prompt, timer, generation });
-    },
-    [flushDraft],
-  );
+  }, [drafts, flushAllDrafts, onOpenRepository]);
 
   const selectProject = useCallback(
     (projectId: number | null) => {
-      if (selectedProjectId !== null) void flushDraft(selectedProjectId);
+      void flushAllDrafts().catch(() => undefined);
       setSelectedProjectId(projectId);
     },
-    [flushDraft, selectedProjectId],
+    [flushAllDrafts],
   );
 
   const changeQuery = useCallback(
     (nextQuery: string) => {
-      if (selectedProjectId !== null && !query && nextQuery) void flushDraft(selectedProjectId);
+      if (!query && nextQuery) void flushAllDrafts().catch(() => undefined);
       setQuery(nextQuery);
     },
-    [flushDraft, query, selectedProjectId],
+    [flushAllDrafts, query],
   );
 
   const removeSelectedProject = useCallback(
     async (projectId: number) => {
-      const pending = pendingDrafts.current.get(projectId);
-      if (pending) window.clearTimeout(pending.timer);
-      pendingDrafts.current.delete(projectId);
+      const draftBeforeRemoval = drafts.get(projectId);
+      drafts.cancel(projectId);
       try {
         const nextSnapshot = await removeProject(projectId);
-        setSnapshot(nextSnapshot);
-        setDraftStatuses((statuses) => {
-          const next = { ...statuses };
-          delete next[projectId];
-          return next;
-        });
+        drafts.forget(projectId);
+        drafts.reconcile(nextSnapshot);
+        setSnapshot(drafts.overlay(nextSnapshot));
         if (selectedProjectId === projectId) setSelectedProjectId(null);
         return undefined;
       } catch (error: unknown) {
-        if (pending) void persistDraft(projectId, pending.prompt, pending.generation);
+        if (draftBeforeRemoval.status.state === "saving") {
+          drafts.change(projectId, draftBeforeRemoval.prompt);
+        }
         return projectErrorMessage(error, "Couldn't remove that project. Try again.");
       }
     },
-    [persistDraft, selectedProjectId],
+    [drafts, selectedProjectId],
   );
 
   useEffect(() => {
@@ -238,7 +191,8 @@ export function App({ onOpenRepository, surface = "inbox" }: AppProps) {
     let stopListening: (() => void) | undefined;
     void listenToProjectInbox((event) => {
       if (disposed) return;
-      setSnapshot(event.snapshot);
+      drafts.reconcile(event.snapshot);
+      setSnapshot(drafts.overlay(event.snapshot));
       if (event.focusedProjectId !== null) setSelectedProjectId(event.focusedProjectId);
     })
       .then((unlisten) => {
@@ -250,7 +204,7 @@ export function App({ onOpenRepository, surface = "inbox" }: AppProps) {
       disposed = true;
       stopListening?.();
     };
-  }, []);
+  }, [drafts]);
 
   useEffect(() => {
     const flush = () => void flushAllDrafts().catch(() => undefined);
@@ -277,52 +231,47 @@ export function App({ onOpenRepository, surface = "inbox" }: AppProps) {
   }, [flushAllDrafts]);
 
   const selectedProject = snapshot.projects.find(({ id }) => id === selectedProjectId);
-  const selectedDraft = snapshot.drafts.find(({ projectId }) => projectId === selectedProjectId);
-  const selectedDraftStatus: DraftPersistenceStatus =
-    selectedProjectId === null
-      ? { state: "idle" }
-      : (draftStatuses[selectedProjectId] ??
-        (selectedDraft ? { state: "saved" } : { state: "idle" }));
 
   return (
-    <div className="app-shell">
-      <header className="titlebar" data-tauri-drag-region>
-        <div className="wordmark" aria-label="Più">
-          <span className="wordmark__symbol" aria-hidden="true">
-            π
-          </span>
-          <span>Più</span>
-        </div>
-        <div className="titlebar__context">{selectedProject?.name ?? "All Projects"}</div>
-      </header>
-      {hostStatus === "checking" ? (
-        <main className="startup-workspace">
-          <StartupLoading />
-        </main>
-      ) : hostStatus === "failed" ? (
-        <main className="startup-workspace">
-          <StartupFailure onRetry={retryStartup} />
-        </main>
-      ) : surface === "inbox" ? (
-        <InboxWorkspace
-          actionError={repositoryActionError}
-          draftStatus={selectedDraftStatus}
-          onDraftChange={changeDraft}
-          onOpenRepository={openSelectedRepository}
-          onQueryChange={changeQuery}
-          onRemoveProject={removeSelectedProject}
-          onSelectProject={selectProject}
-          query={query}
-          selectedProjectId={selectedProjectId}
-          snapshot={snapshot}
-        />
-      ) : (
-        <main className="workspace workspace--deferred">
-          <div className="conversation-stage">
-            <DeferredSurface surface={surface} />
+    <TooltipProvider>
+      <div className="app-shell">
+        <header className="titlebar" data-tauri-drag-region>
+          <div className="wordmark" aria-label="Più">
+            <span className="wordmark-symbol" aria-hidden="true">
+              π
+            </span>
+            <span>Più</span>
           </div>
-        </main>
-      )}
-    </div>
+          <div className="titlebar-context">{selectedProject?.name ?? "All Projects"}</div>
+        </header>
+        {hostStatus === "checking" ? (
+          <main className="startup-workspace">
+            <StartupLoading />
+          </main>
+        ) : hostStatus === "failed" ? (
+          <main className="startup-workspace">
+            <StartupFailure onRetry={retryStartup} />
+          </main>
+        ) : surface === "inbox" ? (
+          <InboxWorkspace
+            actionError={repositoryActionError}
+            drafts={drafts}
+            onOpenRepository={openSelectedRepository}
+            onQueryChange={changeQuery}
+            onRemoveProject={removeSelectedProject}
+            onSelectProject={selectProject}
+            query={query}
+            selectedProjectId={selectedProjectId}
+            snapshot={snapshot}
+          />
+        ) : (
+          <main className="deferred-workspace">
+            <div className="conversation-stage">
+              <DeferredSurface surface={surface} />
+            </div>
+          </main>
+        )}
+      </div>
+    </TooltipProvider>
   );
 }

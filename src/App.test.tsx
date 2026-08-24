@@ -79,12 +79,43 @@ test("the empty inbox action is keyboard reachable", async () => {
 
   render(<App onOpenRepository={openRepository} />);
 
-  expect(await screen.findByRole("heading", { name: "Your work starts here" })).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "Open a repository to start" })).toBeVisible();
   const action = screen.getByRole("button", { name: "Open Repository" });
   await user.tab();
   expect(action).toHaveFocus();
   await user.keyboard("{Enter}");
   expect(openRepository).toHaveBeenCalledOnce();
+});
+
+test("launch keeps All Projects selected and focuses the first available project draft", async () => {
+  installMatchMedia("light");
+  projectInbox.load.mockResolvedValueOnce({
+    projects: [
+      { id: 1, name: "Atlas", availability: "available", unmergedChatCount: 0 },
+      { id: 2, name: "Beacon", availability: "available", unmergedChatCount: 0 },
+    ],
+    drafts: [{ projectId: 1, prompt: "Continue the parser work", updatedAtMs: 1 }],
+    chats: [],
+  });
+
+  render(<App />);
+
+  expect(await screen.findByRole("button", { name: "All Projects, 2 projects" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  const composer = screen.getByRole("textbox", { name: "Draft for Atlas" });
+  expect(composer).toHaveValue("Continue the parser work");
+  await waitFor(() => expect(composer).toHaveFocus());
+});
+
+test("launch without repositories never exposes an unsendable prompt", async () => {
+  installMatchMedia("dark");
+
+  render(<App />);
+
+  expect(await screen.findByRole("button", { name: "Open Repository" })).toBeVisible();
+  expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
 });
 
 test("the production empty inbox action opens the native repository picker", async () => {
@@ -149,7 +180,7 @@ test("draft changes update immediately and cross the persistence boundary", asyn
   await user.type(screen.getByRole("textbox", { name: "Draft for Atlas" }), "Fix parsing");
 
   expect(screen.getByRole("textbox", { name: "Draft for Atlas" })).toHaveValue("Fix parsing");
-  expect(screen.getByText("Saving…")).toBeVisible();
+  expect(screen.getByText("Saving")).toBeVisible();
   await waitFor(() => expect(projectInbox.saveDraft).toHaveBeenLastCalledWith(1, "Fix parsing"));
   expect(projectInbox.saveDraft).toHaveBeenCalledTimes(1);
   expect(await screen.findByText("Saved locally")).toBeVisible();
@@ -207,6 +238,7 @@ test("a failed draft save never claims the draft is saved", async () => {
 
   expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't save this draft");
   expect(screen.queryByText("Saved locally")).not.toBeInTheDocument();
+  await expect(windowLifecycle.beforeClose?.()).rejects.toThrow("could not be saved");
 });
 
 test("a repository picker failure is explained in product language", async () => {
