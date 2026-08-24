@@ -84,6 +84,8 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
   const [query, setQuery] = useState("");
   const [repositoryActionError, setRepositoryActionError] = useState<string>();
   const verificationGeneration = useRef(0);
+  const settingsTriggerRef = useRef<HTMLButtonElement>(null);
+  const restoreSettingsFocus = useRef(false);
   const [setups] = useState(() => new ChatSetupController());
   const [drafts] = useState(() => {
     const controller = new ProjectDraftController(
@@ -127,10 +129,17 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
 
   const openSettings = useCallback(() => {
     void flushAllDrafts().catch(() => undefined);
+    restoreSettingsFocus.current = true;
     setActiveSurface("settings");
   }, [flushAllDrafts]);
 
   const closeDeferredSurface = useCallback(() => setActiveSurface("inbox"), []);
+
+  useEffect(() => {
+    if (activeSurface !== "inbox" || !restoreSettingsFocus.current) return;
+    restoreSettingsFocus.current = false;
+    settingsTriggerRef.current?.focus();
+  }, [activeSurface]);
 
   const openSelectedRepository = useCallback(() => {
     void flushAllDrafts().catch(() => undefined);
@@ -367,6 +376,7 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
             query={query}
             selectedChatId={selectedChatId}
             selectedProjectId={selectedProjectId}
+            settingsTriggerRef={settingsTriggerRef}
             setups={setups}
             snapshot={snapshot}
           />

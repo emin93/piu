@@ -6,7 +6,15 @@ import {
   SettingsIcon,
   Trash2Icon,
 } from "lucide-react";
-import { memo, useCallback, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  memo,
+  type RefObject,
+  useCallback,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 
 import {
   AlertDialog,
@@ -58,6 +66,7 @@ interface InboxWorkspaceProps {
   query: string;
   selectedProjectId: number | null;
   selectedChatId: string | null;
+  settingsTriggerRef?: RefObject<HTMLButtonElement | null>;
   setups: ChatSetupController;
   snapshot: InboxSnapshot;
 }
@@ -294,6 +303,7 @@ export function InboxWorkspace({
   query,
   selectedProjectId,
   selectedChatId,
+  settingsTriggerRef,
   setups,
   snapshot,
 }: InboxWorkspaceProps) {
@@ -486,6 +496,7 @@ export function InboxWorkspace({
           <Button
             className="sidebar-settings-action"
             onClick={onOpenSettings}
+            ref={settingsTriggerRef}
             type="button"
             variant="ghost"
           >
