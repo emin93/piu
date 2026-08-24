@@ -1240,6 +1240,7 @@ struct ModelAssetManagerInner {
     status: watch::Sender<ModelAssetStatus>,
     active: Mutex<Option<ActiveOperation>>,
     recovery_required: AtomicBool,
+    recovery_serialization: Mutex<()>,
     invalid_finals: Mutex<HashSet<String>>,
     removal_persistence: Mutex<Arc<dyn RemovalPersistence>>,
     next_operation_id: AtomicU64,
@@ -1302,6 +1303,7 @@ impl ModelAssetManager {
                 status,
                 active: Mutex::new(None),
                 recovery_required: AtomicBool::new(false),
+                recovery_serialization: Mutex::new(()),
                 invalid_finals: Mutex::new(HashSet::new()),
                 removal_persistence: Mutex::new(Arc::new(DurableRemovalPersistence)),
                 next_operation_id: AtomicU64::new(1),
@@ -1394,6 +1396,7 @@ impl ModelAssetManager {
             status,
             active: Mutex::new(None),
             recovery_required: AtomicBool::new(false),
+            recovery_serialization: Mutex::new(()),
             invalid_finals: Mutex::new(HashSet::new()),
             removal_persistence: Mutex::new(Arc::new(DurableRemovalPersistence)),
             next_operation_id: AtomicU64::new(1),
@@ -2052,11 +2055,6 @@ impl ModelAssetManager {
 
     pub async fn retry_recovery(&self) -> Result<ModelAssetStatus, ModelAssetError> {
         self.ensure_initialized()?;
-        if !self.0.recovery_required.load(Ordering::Acquire) {
-            return Err(ModelAssetError::Unavailable(
-                "model resources do not require recovery".into(),
-            ));
-        }
         let manager = self.clone();
         blocking_phase(move || {
             manager.reconcile_recovery_required()?;
@@ -2131,6 +2129,10 @@ impl ModelAssetManager {
     }
 
     fn reconcile_recovery_required(&self) -> Result<(), ModelAssetError> {
+        self.serialize_recovery(|| self.reconcile_recovery_required_inner())
+    }
+
+    fn reconcile_recovery_required_inner(&self) -> Result<(), ModelAssetError> {
         if !self.0.recovery_required.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -2153,6 +2155,10 @@ impl ModelAssetManager {
     }
 
     fn reconcile_download_recovery(&self, operation_id: u64) -> Result<(), ModelAssetError> {
+        self.serialize_recovery(|| self.reconcile_download_recovery_inner(operation_id))
+    }
+
+    fn reconcile_download_recovery_inner(&self, operation_id: u64) -> Result<(), ModelAssetError> {
         if !self.0.recovery_required.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -2182,6 +2188,29 @@ impl ModelAssetManager {
         status.message = Some("Recovered model resources. Resuming the download.".into());
         self.publish(status);
         Ok(())
+    }
+
+    /// Recovery callers enter through `blocking_phase`, so waiting here never
+    /// occupies an asynchronous executor thread. Publishing while the guard is
+    /// held removes the retry capability for the exact mutation interval.
+    fn serialize_recovery<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, ModelAssetError>,
+    ) -> Result<T, ModelAssetError> {
+        let guard = self
+            .0
+            .recovery_serialization
+            .lock()
+            .expect("model asset recovery lock");
+        if self.0.recovery_required.load(Ordering::Acquire) {
+            self.publish(self.status());
+        }
+        let result = operation();
+        drop(guard);
+        if result.is_err() && self.0.recovery_required.load(Ordering::Acquire) {
+            self.publish(self.status());
+        }
+        result
     }
 
     fn require_recovery(
@@ -3202,7 +3231,13 @@ impl ModelAssetManager {
             return Vec::new();
         }
         if self.0.recovery_required.load(Ordering::Acquire) {
-            return vec![ModelAssetAction::RetryRecovery];
+            return self
+                .0
+                .recovery_serialization
+                .try_lock()
+                .ok()
+                .map(|_| vec![ModelAssetAction::RetryRecovery])
+                .unwrap_or_default();
         }
         if let Some(active) = self
             .0
@@ -4143,6 +4178,40 @@ mod tests {
     impl DiskSpace for SlowDisk {
         fn available(&self, _path: &Path) -> Result<u64, ModelAssetError> {
             self.0.wait();
+            Ok(u64::MAX)
+        }
+    }
+
+    #[derive(Default)]
+    struct ContendedRecoveryDisk {
+        gate: BlockingFixture,
+        armed: AtomicBool,
+        calls: AtomicU64,
+        in_flight: AtomicU64,
+        max_in_flight: AtomicU64,
+    }
+
+    impl ContendedRecoveryDisk {
+        fn arm(&self) {
+            self.calls.store(0, Ordering::Release);
+            self.max_in_flight.store(0, Ordering::Release);
+            self.armed.store(true, Ordering::Release);
+        }
+
+        fn release(&self) {
+            self.gate.release();
+        }
+    }
+
+    impl DiskSpace for ContendedRecoveryDisk {
+        fn available(&self, _path: &Path) -> Result<u64, ModelAssetError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let in_flight = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_in_flight.fetch_max(in_flight, Ordering::AcqRel);
+            if self.armed.swap(false, Ordering::AcqRel) {
+                self.gate.wait();
+            }
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
             Ok(u64::MAX)
         }
     }
@@ -6186,12 +6255,87 @@ mod tests {
         assert!(manager.0.recovery_required.load(Ordering::Acquire));
 
         manager
-            .reconcile_recovery_required()
+            .retry_recovery()
+            .await
             .expect("full-sync and clear the deleting journal");
 
         assert_eq!(manager.status().phase, ModelAssetPhase::Missing);
         assert!(!staging.path().exists());
         assert!(!manager.0.recovery_required.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_recovery_retries_serialize_and_coalesce_to_one_safe_outcome() {
+        let bytes = b"serialized recovery fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manifest = fixture_manifest(&bytes);
+        let disk = Arc::new(ContendedRecoveryDisk::default());
+        let manager = ModelAssetManager::new(
+            temporary.path().to_path_buf(),
+            PathBuf::from("models"),
+            manifest.clone(),
+            format!("{}/resolve/{}", fixture.base_url, manifest.revision),
+            format!("{}/whoami", fixture.base_url),
+            Arc::new(MemoryCredentials::default()),
+            disk.clone(),
+        )
+        .expect("test manager");
+        manager.start_download().expect("install fixture");
+        wait_for_phase(&manager, ModelAssetPhase::Ready).await;
+        manager.set_removal_persistence(Arc::new(FailingCompletionSync));
+        assert!(matches!(
+            manager.remove_owned_assets().await,
+            Err(ModelAssetError::RecoveryRequired(_))
+        ));
+        assert_eq!(
+            manager.status().available_actions,
+            vec![ModelAssetAction::RetryRecovery]
+        );
+
+        disk.arm();
+        let first_manager = manager.clone();
+        let first = tokio::spawn(async move { first_manager.retry_recovery().await });
+        wait_for_blocking_fixture(&disk.gate).await;
+        assert!(manager.status().available_actions.is_empty());
+
+        let second_manager = manager.clone();
+        let mut second = tokio::spawn(async move { second_manager.retry_recovery().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "the second retry must wait for the active journal mutation"
+        );
+        assert_async_executor_yields().await;
+        assert_eq!(disk.max_in_flight.load(Ordering::Acquire), 1);
+        assert_eq!(disk.calls.load(Ordering::Acquire), 1);
+        assert!(manager.status().available_actions.is_empty());
+
+        disk.release();
+        let first_status = first
+            .await
+            .expect("first retry task")
+            .expect("first recovery result");
+        let second_status = second
+            .await
+            .expect("second retry task")
+            .expect("coalesced recovery result");
+        assert_eq!(first_status, second_status);
+        assert_eq!(second_status.phase, ModelAssetPhase::Missing);
+        assert_eq!(
+            second_status.available_actions,
+            vec![ModelAssetAction::Download]
+        );
+        assert_eq!(
+            manager
+                .retry_recovery()
+                .await
+                .expect("already recovered retry result"),
+            second_status
+        );
+        assert_eq!(disk.max_in_flight.load(Ordering::Acquire), 1);
+        assert_eq!(disk.calls.load(Ordering::Acquire), 1);
     }
 
     #[cfg(unix)]
@@ -6534,7 +6678,7 @@ mod tests {
         .expect("blocking fixture entered");
     }
 
-    async fn assert_executor_yields_while_initialization_is_blocked() {
+    async fn assert_async_executor_yields() {
         let (sent, received) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             tokio::task::yield_now().await;
@@ -6585,7 +6729,7 @@ mod tests {
         );
 
         wait_for_blocking_fixture(&gate).await;
-        assert_executor_yields_while_initialization_is_blocked().await;
+        assert_async_executor_yields().await;
         assert_eq!(manager.status().phase, ModelAssetPhase::Initializing);
         gate.release();
         assert_eq!(
@@ -6609,7 +6753,7 @@ mod tests {
             .start_deferred_initialization(temporary.path().to_path_buf(), PathBuf::from("models"));
 
         wait_for_blocking_fixture(&gate).await;
-        assert_executor_yields_while_initialization_is_blocked().await;
+        assert_async_executor_yields().await;
         gate.release();
         wait_for_phase(&manager, ModelAssetPhase::Missing).await;
     }
@@ -6627,7 +6771,7 @@ mod tests {
             .start_deferred_initialization(temporary.path().to_path_buf(), PathBuf::from("models"));
 
         wait_for_blocking_fixture(&gate).await;
-        assert_executor_yields_while_initialization_is_blocked().await;
+        assert_async_executor_yields().await;
         gate.release();
         wait_for_phase(&manager, ModelAssetPhase::Missing).await;
     }
