@@ -1,6 +1,6 @@
 use std::{env, fs, path::Path, process::Command};
 
-use piu_lib::project_inbox::ProjectInbox;
+use piu_lib::{git_process::GitProcess, project_inbox::ProjectInbox};
 use rusqlite::{Connection, params};
 
 struct ReviewChatFixture<'a> {
@@ -14,9 +14,9 @@ struct ReviewChatFixture<'a> {
     merge_state: &'a str,
 }
 
-fn initialize_repository(path: &Path) {
+fn initialize_repository(git_executable: &Path, path: &Path) {
     fs::create_dir_all(path).expect("review repository directory should be created");
-    let status = Command::new("git")
+    let status = Command::new(git_executable)
         .args(["init", "--quiet"])
         .arg(path)
         .status()
@@ -37,13 +37,19 @@ fn main() {
         "review app data must start empty"
     );
     let repository_root = app_data.join("review-repositories");
+    let git_runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/git/runtime");
+    let git_executable = git_runtime.join("bin/git");
     let atlas_path = repository_root.join("atlas-desktop-with-a-deliberately-long-project-name");
     let beacon_path = repository_root.join("beacon-indexer");
-    initialize_repository(&atlas_path);
-    initialize_repository(&beacon_path);
+    initialize_repository(&git_executable, &atlas_path);
+    initialize_repository(&git_executable, &beacon_path);
 
     let database_path = app_data.join("piu.sqlite3");
-    let inbox = ProjectInbox::open(&database_path).expect("review inbox should open");
+    let inbox = ProjectInbox::with_git(
+        &database_path,
+        GitProcess::from_bundled_runtime(&git_runtime),
+    )
+    .expect("review inbox should open");
     let atlas = inbox
         .open_repository(&atlas_path)
         .expect("Atlas should open")

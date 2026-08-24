@@ -1,8 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use thiserror::Error;
 
-use crate::project_inbox::{ProjectInbox, ProjectInboxError};
+use crate::{
+    git_process::GitProcess,
+    project_inbox::{ProjectInbox, ProjectInboxError},
+};
 
 #[derive(Debug, Error)]
 pub enum ApplicationError {
@@ -11,19 +17,25 @@ pub enum ApplicationError {
 }
 
 pub struct ApplicationCore {
-    project_inbox: ProjectInbox,
+    project_inbox: Arc<ProjectInbox>,
 }
 
 impl ApplicationCore {
-    pub fn open(database_path: &Path) -> Result<Self, ApplicationError> {
-        let core = Self::deferred(database_path.to_path_buf());
+    pub fn open(database_path: &Path, git: GitProcess) -> Result<Self, ApplicationError> {
+        let core = Self::deferred(database_path.to_path_buf(), git);
         core.schema_version()?;
         Ok(core)
     }
 
-    pub fn deferred(database_path: PathBuf) -> Self {
+    pub fn deferred(database_path: PathBuf, git: GitProcess) -> Self {
         Self {
-            project_inbox: ProjectInbox::deferred(database_path),
+            project_inbox: Arc::new(ProjectInbox::deferred_with_git(database_path, git)),
+        }
+    }
+
+    pub fn from_project_inbox(project_inbox: ProjectInbox) -> Self {
+        Self {
+            project_inbox: Arc::new(project_inbox),
         }
     }
 
@@ -33,7 +45,7 @@ impl ApplicationCore {
             .map_err(ApplicationError::ProjectInbox)
     }
 
-    pub fn project_inbox(&self) -> &ProjectInbox {
-        &self.project_inbox
+    pub fn project_inbox(&self) -> Arc<ProjectInbox> {
+        Arc::clone(&self.project_inbox)
     }
 }

@@ -3,12 +3,17 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::Path,
     process::Command,
-    time::{Duration, Instant},
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::Duration,
 };
 
-use piu_lib::git_process::GitProcess;
-use piu_lib::project_inbox::{
-    ChatMergeState, OpenRepositoryOutcome, ProjectAvailability, ProjectInbox, ProjectInboxError,
+use piu_lib::{
+    git_process::GitProcess,
+    project_inbox::{
+        ChatMergeState, OpenRepositoryOutcome, ProjectAvailability, ProjectInbox,
+        ProjectInboxError, RepositoryIdentity, RepositoryInspectionError, RepositoryInspector,
+    },
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -21,6 +26,14 @@ fn make_repository(path: &Path) {
         .status()
         .expect("git should be available to create a real repository fixture");
     assert!(status.success(), "git init should succeed");
+}
+
+fn open_inbox(database_path: &Path) -> ProjectInbox {
+    ProjectInbox::with_git(
+        database_path,
+        GitProcess::with_executable("/usr/bin/git".into()),
+    )
+    .expect("inbox should open")
 }
 
 fn seed_chat(
@@ -65,7 +78,7 @@ fn rejects_non_repositories_without_persisting_them() {
     let database_path = fixture.path().join("piu.sqlite3");
     let ordinary_directory = fixture.path().join("ordinary-directory");
     fs::create_dir(&ordinary_directory).expect("ordinary directory should be created");
-    let inbox = ProjectInbox::open(&database_path).expect("inbox should open");
+    let inbox = open_inbox(&database_path);
 
     let error = inbox
         .open_repository(&ordinary_directory)
@@ -87,7 +100,7 @@ fn opens_real_repositories_once_and_retains_one_draft_per_project() {
     let database_path = fixture.path().join("piu.sqlite3");
     let repository_path = fixture.path().join("alpha");
     make_repository(&repository_path);
-    let inbox = ProjectInbox::open(&database_path).expect("inbox should open");
+    let inbox = open_inbox(&database_path);
 
     let opened = inbox
         .open_repository(&repository_path)
@@ -109,7 +122,7 @@ fn opens_real_repositories_once_and_retains_one_draft_per_project() {
         .expect("draft should update");
     drop(inbox);
 
-    let reopened = ProjectInbox::open(&database_path).expect("inbox should reopen");
+    let reopened = open_inbox(&database_path);
     let snapshot = reopened.snapshot().expect("snapshot should load");
     assert_eq!(snapshot.projects.len(), 1);
     assert_eq!(snapshot.drafts.len(), 1);
@@ -123,7 +136,7 @@ fn reports_a_repository_that_moves_after_it_was_opened() {
     let original_path = fixture.path().join("before");
     let moved_path = fixture.path().join("after");
     make_repository(&original_path);
-    let inbox = ProjectInbox::open(&database_path).expect("inbox should open");
+    let inbox = open_inbox(&database_path);
     let opened = inbox
         .open_repository(&original_path)
         .expect("repository should open");
@@ -140,12 +153,52 @@ fn reports_a_repository_that_moves_after_it_was_opened() {
 }
 
 #[test]
+fn relaunch_revalidates_the_original_git_worktree_identity() {
+    let fixture = TempDir::new().expect("fixture should be created");
+    let database_path = fixture.path().join("piu.sqlite3");
+    let repository_path = fixture.path().join("alpha");
+    make_repository(&repository_path);
+    let inbox = open_inbox(&database_path);
+    let project = inbox
+        .open_repository(&repository_path)
+        .expect("repository should open")
+        .project;
+    drop(inbox);
+
+    fs::remove_dir_all(repository_path.join(".git"))
+        .expect("the admitted repository metadata should be removable");
+    let without_git = open_inbox(&database_path);
+    let availability = without_git
+        .snapshot()
+        .expect("snapshot should load")
+        .projects
+        .into_iter()
+        .find(|candidate| candidate.id == project.id)
+        .expect("project should remain remembered")
+        .availability;
+    assert_eq!(availability, ProjectAvailability::Missing);
+    drop(without_git);
+
+    make_repository(&repository_path);
+    let replacement = open_inbox(&database_path);
+    let availability = replacement
+        .snapshot()
+        .expect("snapshot should load")
+        .projects
+        .into_iter()
+        .find(|candidate| candidate.id == project.id)
+        .expect("project should remain remembered")
+        .availability;
+    assert_eq!(availability, ProjectAvailability::Missing);
+}
+
+#[test]
 fn reports_a_repository_that_becomes_inaccessible() {
     let fixture = TempDir::new().expect("fixture should be created");
     let database_path = fixture.path().join("piu.sqlite3");
     let repository_path = fixture.path().join("restricted");
     make_repository(&repository_path);
-    let inbox = ProjectInbox::open(&database_path).expect("inbox should open");
+    let inbox = open_inbox(&database_path);
     let opened = inbox
         .open_repository(&repository_path)
         .expect("repository should open");
@@ -172,7 +225,7 @@ fn removal_is_transactional_and_preserves_merged_history() {
     let database_path = fixture.path().join("piu.sqlite3");
     let repository_path = fixture.path().join("alpha");
     make_repository(&repository_path);
-    let inbox = ProjectInbox::open(&database_path).expect("inbox should open");
+    let inbox = open_inbox(&database_path);
     let project = inbox
         .open_repository(&repository_path)
         .expect("repository should open")
@@ -220,31 +273,89 @@ fn removal_is_transactional_and_preserves_merged_history() {
     assert_eq!(removed.chats[0].project_name, "alpha");
 }
 
+struct BlockingRepositoryInspector {
+    started: Mutex<Option<mpsc::SyncSender<()>>>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl RepositoryInspector for BlockingRepositoryInspector {
+    fn inspect(
+        &self,
+        _selected_path: &Path,
+    ) -> Result<RepositoryIdentity, RepositoryInspectionError> {
+        if let Some(started) = self
+            .started
+            .lock()
+            .expect("start signal lock should remain healthy")
+            .take()
+        {
+            started
+                .send(())
+                .expect("snapshot should announce repository inspection");
+        }
+        self.release
+            .lock()
+            .expect("release signal lock should remain healthy")
+            .recv()
+            .expect("test should release repository inspection");
+        Err(RepositoryInspectionError::Missing)
+    }
+}
+
 #[test]
-fn snapshot_does_not_hold_storage_behind_git_inspection() {
+fn slow_repository_revalidation_does_not_block_draft_storage() {
     let fixture = TempDir::new().expect("fixture should be created");
     let database_path = fixture.path().join("piu.sqlite3");
     let repository_path = fixture.path().join("alpha");
     make_repository(&repository_path);
-    let inbox = ProjectInbox::open(&database_path).expect("inbox should open");
-    inbox
+    let initial = open_inbox(&database_path);
+    let project = initial
         .open_repository(&repository_path)
-        .expect("repository should open");
-    drop(inbox);
+        .expect("repository should open")
+        .project;
+    drop(initial);
 
-    let slow_git = fixture.path().join("slow-git.zsh");
-    fs::write(&slow_git, "#!/bin/zsh\nsleep 10\n").expect("fixture executable should be written");
-    fs::set_permissions(&slow_git, fs::Permissions::from_mode(0o755))
-        .expect("fixture executable should be runnable");
-    let inbox = ProjectInbox::with_git(&database_path, GitProcess::with_executable(slow_git))
-        .expect("inbox should open without inspecting Git");
+    let (started_sender, started_receiver) = mpsc::sync_channel(0);
+    let (release_sender, release_receiver) = mpsc::sync_channel(0);
+    let inspector = Arc::new(BlockingRepositoryInspector {
+        started: Mutex::new(Some(started_sender)),
+        release: Mutex::new(release_receiver),
+    });
+    let inbox = Arc::new(
+        ProjectInbox::with_inspector(&database_path, inspector)
+            .expect("inbox should reopen with a controlled repository inspector"),
+    );
+    let snapshot_inbox = Arc::clone(&inbox);
+    let snapshot = thread::spawn(move || snapshot_inbox.snapshot());
+    started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("snapshot should reach repository inspection");
 
-    let started = Instant::now();
-    let snapshot = inbox.snapshot().expect("snapshot should load");
+    let (saved_sender, saved_receiver) = mpsc::channel();
+    let draft_inbox = Arc::clone(&inbox);
+    thread::spawn(move || {
+        saved_sender
+            .send(draft_inbox.save_draft(project.id, "Store while probing"))
+            .expect("draft result should be observed");
+    });
+    let saved = saved_receiver
+        .recv_timeout(Duration::from_millis(250))
+        .expect("repository inspection must not hold the database mutex");
+    assert_eq!(
+        saved.expect("draft should save").prompt,
+        "Store while probing"
+    );
 
-    assert_eq!(snapshot.projects.len(), 1);
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "snapshot availability must not invoke Git while storage is locked"
+    release_sender
+        .send(())
+        .expect("snapshot repository inspection should be released");
+    assert_eq!(
+        snapshot
+            .join()
+            .expect("snapshot thread should finish")
+            .expect("snapshot should load")
+            .projects[0]
+            .availability,
+        ProjectAvailability::Missing
     );
 }

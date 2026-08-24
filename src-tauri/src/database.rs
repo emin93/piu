@@ -26,6 +26,11 @@ const MIGRATIONS: &[Migration] = &[
     CREATE TABLE projects (
         id INTEGER PRIMARY KEY,
         canonical_path TEXT NOT NULL UNIQUE,
+        root_device TEXT NOT NULL,
+        root_inode TEXT NOT NULL,
+        git_dir_path TEXT NOT NULL,
+        git_dir_device TEXT NOT NULL,
+        git_dir_inode TEXT NOT NULL,
         name TEXT NOT NULL,
         created_at_ms INTEGER NOT NULL
     );

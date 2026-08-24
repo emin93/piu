@@ -17,8 +17,9 @@
     "test": "npm run test:frontend && npm run test:rust",
     "rust:check": "cargo check --manifest-path src-tauri/Cargo.toml --all-targets",
     "rust:clippy": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings",
+    "git:verify": "src-tauri/vendor/git/verify-macos-arm64.sh",
     "bundle:check": "node scripts/check-initial-bundle.mjs",
-    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test && npm run rust:clippy && npm run frontend:build && npm run bundle:check",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test && npm run rust:clippy && npm run git:verify && npm run frontend:build && npm run bundle:check",
     "bindings": "cargo test --manifest-path src-tauri/Cargo.toml export_bindings",
     "smoke:packaged": "node scripts/smoke-packaged.mjs"
   },

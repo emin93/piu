@@ -2,6 +2,7 @@ use std::{sync::mpsc, time::Duration};
 
 use piu_lib::application::ApplicationCore;
 use piu_lib::database::CURRENT_SCHEMA_VERSION;
+use piu_lib::git_process::GitProcess;
 use piu_lib::host_boundary::{HOST_ROUND_TRIP_EVENT, HostRoundTripRequest, HostRoundTripResponse};
 use tauri::{
     Listener, WebviewWindowBuilder,
@@ -13,8 +14,11 @@ use tauri::{
 #[test]
 fn typed_round_trip_crosses_the_command_and_event_boundary() {
     let app_data = tempfile::TempDir::new().expect("temporary application data");
-    let core =
-        ApplicationCore::open(&app_data.path().join("piu.sqlite3")).expect("application core");
+    let core = ApplicationCore::open(
+        &app_data.path().join("piu.sqlite3"),
+        GitProcess::with_executable("/usr/bin/git".into()),
+    )
+    .expect("application core");
     let app = piu_lib::configure_builder(test::mock_builder().manage(core))
         .build(test::mock_context(test::noop_assets()))
         .expect("mock Più application");

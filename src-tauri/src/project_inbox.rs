@@ -1,7 +1,8 @@
 use std::{
     fs,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -118,34 +119,121 @@ pub enum ProjectInboxError {
     GitProcess(#[from] GitProcessError),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryIdentity {
+    canonical_path: PathBuf,
+    root_device: String,
+    root_inode: String,
+    git_dir_path: PathBuf,
+    git_dir_device: String,
+    git_dir_inode: String,
+}
+
+#[derive(Debug, Error)]
+pub enum RepositoryInspectionError {
+    #[error("the repository is missing")]
+    Missing,
+    #[error("the repository is inaccessible")]
+    Inaccessible,
+    #[error(transparent)]
+    Git(#[from] GitProcessError),
+}
+
+pub trait RepositoryInspector: Send + Sync {
+    fn inspect(
+        &self,
+        selected_path: &Path,
+    ) -> Result<RepositoryIdentity, RepositoryInspectionError>;
+}
+
+impl RepositoryInspector for GitProcess {
+    fn inspect(
+        &self,
+        selected_path: &Path,
+    ) -> Result<RepositoryIdentity, RepositoryInspectionError> {
+        match fs::metadata(selected_path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(RepositoryInspectionError::Missing),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(RepositoryInspectionError::Inaccessible);
+            }
+            Err(_) => return Err(RepositoryInspectionError::Missing),
+        }
+        let paths = self
+            .inspect_worktree(selected_path)
+            .map_err(|error| match error {
+                GitProcessError::Failed { ref stderr, .. }
+                    if stderr.to_ascii_lowercase().contains("permission denied") =>
+                {
+                    RepositoryInspectionError::Inaccessible
+                }
+                GitProcessError::Failed { .. } => RepositoryInspectionError::Missing,
+                other => RepositoryInspectionError::Git(other),
+            })?;
+        let canonical_path = paths
+            .root
+            .canonicalize()
+            .map_err(classify_identity_io_error)?;
+        let git_dir_path = paths
+            .git_dir
+            .canonicalize()
+            .map_err(classify_identity_io_error)?;
+        let root_metadata = fs::metadata(&canonical_path).map_err(classify_identity_io_error)?;
+        let git_dir_metadata = fs::metadata(&git_dir_path).map_err(classify_identity_io_error)?;
+        Ok(RepositoryIdentity {
+            canonical_path,
+            root_device: root_metadata.dev().to_string(),
+            root_inode: root_metadata.ino().to_string(),
+            git_dir_path,
+            git_dir_device: git_dir_metadata.dev().to_string(),
+            git_dir_inode: git_dir_metadata.ino().to_string(),
+        })
+    }
+}
+
+fn classify_identity_io_error(error: std::io::Error) -> RepositoryInspectionError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => RepositoryInspectionError::Missing,
+        _ => RepositoryInspectionError::Inaccessible,
+    }
+}
+
 pub struct ProjectInbox {
     database_path: PathBuf,
     database: Mutex<Option<Database>>,
-    git: GitProcess,
+    repository_inspector: Arc<dyn RepositoryInspector>,
 }
 
 impl ProjectInbox {
-    pub fn open(database_path: &Path) -> Result<Self, ProjectInboxError> {
-        let inbox = Self::deferred(database_path.to_path_buf());
-        inbox.schema_version()?;
-        Ok(inbox)
+    pub fn with_git(database_path: &Path, git: GitProcess) -> Result<Self, ProjectInboxError> {
+        Self::with_inspector(database_path, Arc::new(git))
     }
 
-    pub fn with_git(database_path: &Path, git: GitProcess) -> Result<Self, ProjectInboxError> {
+    pub fn with_inspector(
+        database_path: &Path,
+        repository_inspector: Arc<dyn RepositoryInspector>,
+    ) -> Result<Self, ProjectInboxError> {
         let inbox = Self {
             database_path: database_path.to_path_buf(),
             database: Mutex::new(None),
-            git,
+            repository_inspector,
         };
         inbox.schema_version()?;
         Ok(inbox)
     }
 
-    pub fn deferred(database_path: PathBuf) -> Self {
+    pub fn deferred_with_git(database_path: PathBuf, git: GitProcess) -> Self {
+        Self::deferred_with_inspector(database_path, Arc::new(git))
+    }
+
+    pub fn deferred_with_inspector(
+        database_path: PathBuf,
+        repository_inspector: Arc<dyn RepositoryInspector>,
+    ) -> Self {
         Self {
             database_path,
             database: Mutex::new(None),
-            git: GitProcess::default(),
+            repository_inspector,
         }
     }
 
@@ -162,12 +250,16 @@ impl ProjectInbox {
         &self,
         selected_path: &Path,
     ) -> Result<OpenRepositoryResult, ProjectInboxError> {
-        let canonical_path = self.canonical_repository_root(selected_path)?;
-        let name = repository_name(&canonical_path)?;
-        let canonical_path = canonical_path.to_string_lossy().into_owned();
+        let identity = self
+            .repository_inspector
+            .inspect(selected_path)
+            .map_err(map_admission_error)?;
+        let name = repository_name(&identity.canonical_path)?;
+        let canonical_path = identity.canonical_path.to_string_lossy().into_owned();
+        let git_dir_path = identity.git_dir_path.to_string_lossy().into_owned();
         let created_at_ms = now_ms()?;
 
-        self.with_database(|database| {
+        let (project_id, outcome) = self.with_database(|database| {
             let connection = database.connection_mut();
             let transaction = connection
                 .transaction()
@@ -187,9 +279,20 @@ impl ProjectInbox {
                 None => {
                     transaction
                         .execute(
-                            "INSERT INTO projects (canonical_path, name, created_at_ms)
-                             VALUES (?1, ?2, ?3)",
-                            params![canonical_path, name, created_at_ms],
+                            "INSERT INTO projects (
+                               canonical_path, root_device, root_inode, git_dir_path,
+                               git_dir_device, git_dir_inode, name, created_at_ms
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            params![
+                                canonical_path,
+                                identity.root_device,
+                                identity.root_inode,
+                                git_dir_path,
+                                identity.git_dir_device,
+                                identity.git_dir_inode,
+                                name,
+                                created_at_ms
+                            ],
                         )
                         .map_err(DatabaseError::Query)
                         .map_err(ProjectInboxError::Database)?;
@@ -203,18 +306,19 @@ impl ProjectInbox {
                 .commit()
                 .map_err(DatabaseError::Query)
                 .map_err(ProjectInboxError::Database)?;
-            let snapshot = load_snapshot(connection)?;
-            let project = snapshot
-                .projects
-                .iter()
-                .find(|project| project.id == project_id)
-                .cloned()
-                .ok_or(ProjectInboxError::ProjectNotFound { project_id })?;
-            Ok(OpenRepositoryResult {
-                outcome,
-                project,
-                snapshot,
-            })
+            Ok((project_id, outcome))
+        })?;
+        let snapshot = self.snapshot()?;
+        let project = snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .cloned()
+            .ok_or(ProjectInboxError::ProjectNotFound { project_id })?;
+        Ok(OpenRepositoryResult {
+            outcome,
+            project,
+            snapshot,
         })
     }
 
@@ -293,13 +397,14 @@ impl ProjectInbox {
             transaction
                 .commit()
                 .map_err(DatabaseError::Query)
-                .map_err(ProjectInboxError::Database)?;
-            load_snapshot(connection)
-        })
+                .map_err(ProjectInboxError::Database)
+        })?;
+        self.snapshot()
     }
 
     pub fn snapshot(&self) -> Result<InboxSnapshot, ProjectInboxError> {
-        self.with_database(|database| load_snapshot(database.connection()))
+        let stored = self.with_database(|database| load_stored_snapshot(database.connection()))?;
+        Ok(stored.materialize(self.repository_inspector.as_ref()))
     }
 
     fn with_database<T>(
@@ -322,32 +427,13 @@ impl ProjectInbox {
                 .expect("database is initialized before use"),
         )
     }
+}
 
-    fn canonical_repository_root(
-        &self,
-        selected_path: &Path,
-    ) -> Result<PathBuf, ProjectInboxError> {
-        match fs::metadata(selected_path) {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => return Err(ProjectInboxError::InvalidRepository),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Err(ProjectInboxError::RepositoryInaccessible);
-            }
-            Err(_) => return Err(ProjectInboxError::InvalidRepository),
-        }
-        self.git
-            .discover_worktree(selected_path)
-            .map_err(|error| match error {
-                GitProcessError::Failed { ref stderr, .. }
-                    if stderr.to_ascii_lowercase().contains("permission denied") =>
-                {
-                    ProjectInboxError::RepositoryInaccessible
-                }
-                GitProcessError::Failed { .. } => ProjectInboxError::InvalidRepository,
-                other => ProjectInboxError::GitProcess(other),
-            })?
-            .canonicalize()
-            .map_err(|_| ProjectInboxError::RepositoryInaccessible)
+fn map_admission_error(error: RepositoryInspectionError) -> ProjectInboxError {
+    match error {
+        RepositoryInspectionError::Missing => ProjectInboxError::InvalidRepository,
+        RepositoryInspectionError::Inaccessible => ProjectInboxError::RepositoryInaccessible,
+        RepositoryInspectionError::Git(error) => ProjectInboxError::GitProcess(error),
     }
 }
 
@@ -379,10 +465,45 @@ fn require_project(
     }
 }
 
-fn load_snapshot(connection: &Connection) -> Result<InboxSnapshot, ProjectInboxError> {
+struct StoredProject {
+    id: i64,
+    identity: RepositoryIdentity,
+    name: String,
+    unmerged_chat_count: u32,
+}
+
+struct StoredInboxSnapshot {
+    projects: Vec<StoredProject>,
+    drafts: Vec<DraftSummary>,
+    chats: Vec<ChatSummary>,
+}
+
+impl StoredInboxSnapshot {
+    fn materialize(self, inspector: &dyn RepositoryInspector) -> InboxSnapshot {
+        let projects = self
+            .projects
+            .into_iter()
+            .map(|stored| ProjectSummary {
+                id: stored.id,
+                availability: repository_availability(inspector, &stored.identity),
+                name: stored.name,
+                unmerged_chat_count: stored.unmerged_chat_count,
+            })
+            .collect();
+        InboxSnapshot {
+            projects,
+            drafts: self.drafts,
+            chats: self.chats,
+        }
+    }
+}
+
+fn load_stored_snapshot(connection: &Connection) -> Result<StoredInboxSnapshot, ProjectInboxError> {
     let mut project_statement = connection
         .prepare(
-            "SELECT projects.id, projects.canonical_path, projects.name,
+            "SELECT projects.id, projects.canonical_path, projects.root_device,
+                    projects.root_inode, projects.git_dir_path, projects.git_dir_device,
+                    projects.git_dir_inode, projects.name,
                     COUNT(chats.id) FILTER (WHERE chats.merge_state = 'unmerged')
              FROM projects
              LEFT JOIN chats ON chats.project_id = projects.id
@@ -393,11 +514,19 @@ fn load_snapshot(connection: &Connection) -> Result<InboxSnapshot, ProjectInboxE
     let project_rows = project_statement
         .query_map([], |row| {
             let canonical_path: String = row.get(1)?;
-            Ok(ProjectSummary {
+            let git_dir_path: String = row.get(4)?;
+            Ok(StoredProject {
                 id: row.get(0)?,
-                availability: repository_availability(Path::new(&canonical_path)),
-                name: row.get(2)?,
-                unmerged_chat_count: row.get(3)?,
+                identity: RepositoryIdentity {
+                    canonical_path: PathBuf::from(canonical_path),
+                    root_device: row.get(2)?,
+                    root_inode: row.get(3)?,
+                    git_dir_path: PathBuf::from(git_dir_path),
+                    git_dir_device: row.get(5)?,
+                    git_dir_inode: row.get(6)?,
+                },
+                name: row.get(7)?,
+                unmerged_chat_count: row.get(8)?,
             })
         })
         .map_err(DatabaseError::Query)?;
@@ -454,25 +583,23 @@ fn load_snapshot(connection: &Connection) -> Result<InboxSnapshot, ProjectInboxE
         .collect::<Result<Vec<_>, _>>()
         .map_err(DatabaseError::Query)?;
 
-    Ok(InboxSnapshot {
+    Ok(StoredInboxSnapshot {
         projects,
         drafts,
         chats,
     })
 }
 
-fn repository_availability(path: &Path) -> ProjectAvailability {
-    match fs::metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProjectAvailability::Missing,
-        Err(_) => ProjectAvailability::Inaccessible,
-        Ok(metadata) if !metadata.is_dir() => ProjectAvailability::Missing,
-        Ok(_) => match fs::read_dir(path) {
-            Ok(_) => ProjectAvailability::Available,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                ProjectAvailability::Missing
-            }
-            Err(_) => ProjectAvailability::Inaccessible,
-        },
+fn repository_availability(
+    inspector: &dyn RepositoryInspector,
+    expected: &RepositoryIdentity,
+) -> ProjectAvailability {
+    match inspector.inspect(&expected.canonical_path) {
+        Ok(actual) if actual == *expected => ProjectAvailability::Available,
+        Ok(_) | Err(RepositoryInspectionError::Missing) => ProjectAvailability::Missing,
+        Err(RepositoryInspectionError::Inaccessible | RepositoryInspectionError::Git(_)) => {
+            ProjectAvailability::Inaccessible
+        }
     }
 }
 

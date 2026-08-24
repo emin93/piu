@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::PathBuf, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime, State};
@@ -114,22 +114,21 @@ impl From<ProjectInboxError> for ProjectCommandError {
 }
 
 #[tauri::command]
-pub fn load_project_inbox(
+pub async fn load_project_inbox(
     core: State<'_, ApplicationCore>,
 ) -> Result<InboxSnapshot, ProjectCommandError> {
-    core.project_inbox().snapshot().map_err(Into::into)
+    load_project_inbox_from(core.project_inbox()).await
 }
 
 #[tauri::command]
-pub fn open_repository<R: Runtime>(
+pub async fn open_repository<R: Runtime>(
     app: AppHandle<R>,
     core: State<'_, ApplicationCore>,
     request: OpenRepositoryRequest,
 ) -> Result<OpenRepositoryResponse, ProjectCommandError> {
-    let opened = core
-        .project_inbox()
-        .open_repository(Path::new(&request.path))
-        .map_err(ProjectCommandError::from)?;
+    let inbox = core.project_inbox();
+    let selected_path = PathBuf::from(request.path);
+    let opened = blocking_project_operation(move || inbox.open_repository(&selected_path)).await?;
     let response = OpenRepositoryResponse {
         focused_project_id: opened.project.id,
         outcome: opened.outcome,
@@ -146,25 +145,23 @@ pub fn open_repository<R: Runtime>(
 }
 
 #[tauri::command]
-pub fn save_project_draft(
+pub async fn save_project_draft(
     core: State<'_, ApplicationCore>,
     request: SaveProjectDraftRequest,
 ) -> Result<DraftSummary, ProjectCommandError> {
-    core.project_inbox()
-        .save_draft(request.project_id, &request.prompt)
-        .map_err(Into::into)
+    let inbox = core.project_inbox();
+    blocking_project_operation(move || inbox.save_draft(request.project_id, &request.prompt)).await
 }
 
 #[tauri::command]
-pub fn remove_project<R: Runtime>(
+pub async fn remove_project<R: Runtime>(
     app: AppHandle<R>,
     core: State<'_, ApplicationCore>,
     request: RemoveProjectRequest,
 ) -> Result<InboxSnapshot, ProjectCommandError> {
-    let snapshot = core
-        .project_inbox()
-        .remove_project(request.project_id)
-        .map_err(ProjectCommandError::from)?;
+    let inbox = core.project_inbox();
+    let snapshot =
+        blocking_project_operation(move || inbox.remove_project(request.project_id)).await?;
     emit_change(
         &app,
         ProjectInboxChangedEvent {
@@ -173,6 +170,27 @@ pub fn remove_project<R: Runtime>(
         },
     )?;
     Ok(snapshot)
+}
+
+async fn load_project_inbox_from(
+    inbox: Arc<crate::project_inbox::ProjectInbox>,
+) -> Result<InboxSnapshot, ProjectCommandError> {
+    blocking_project_operation(move || inbox.snapshot()).await
+}
+
+async fn blocking_project_operation<T>(
+    operation: impl FnOnce() -> Result<T, ProjectInboxError> + Send + 'static,
+) -> Result<T, ProjectCommandError>
+where
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|_| ProjectCommandError {
+            code: ProjectCommandErrorCode::StorageUnavailable,
+            message: "Più couldn’t finish this operation. Try again.".into(),
+        })?
+        .map_err(Into::into)
 }
 
 fn emit_change<R: Runtime>(
@@ -185,4 +203,99 @@ fn emit_change<R: Runtime>(
             message: "Più saved the change but couldn’t refresh the inbox. Reopen Più to continue."
                 .into(),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        future::Future,
+        path::Path,
+        process::Command,
+        sync::{Arc, Mutex, mpsc},
+        task::{Context, Poll, Waker},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use crate::{
+        git_process::GitProcess,
+        project_inbox::{
+            ProjectInbox, RepositoryIdentity, RepositoryInspectionError, RepositoryInspector,
+        },
+    };
+
+    struct DelayedInspector {
+        started: Mutex<Option<mpsc::SyncSender<()>>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl RepositoryInspector for DelayedInspector {
+        fn inspect(
+            &self,
+            _selected_path: &Path,
+        ) -> Result<RepositoryIdentity, RepositoryInspectionError> {
+            if let Some(started) = self.started.lock().unwrap().take() {
+                started.send(()).unwrap();
+            }
+            self.release.lock().unwrap().recv().unwrap();
+            Err(RepositoryInspectionError::Missing)
+        }
+    }
+
+    #[test]
+    fn delayed_git_inspection_yields_the_ipc_executor() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = fixture.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        assert!(
+            Command::new("/usr/bin/git")
+                .args(["init", "--quiet"])
+                .arg(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let database_path = fixture.path().join("piu.sqlite3");
+        let initial = ProjectInbox::with_git(
+            &database_path,
+            GitProcess::with_executable("/usr/bin/git".into()),
+        )
+        .unwrap();
+        initial.open_repository(&repository).unwrap();
+        drop(initial);
+
+        let (started_sender, started_receiver) = mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = mpsc::sync_channel(0);
+        let inbox = Arc::new(
+            ProjectInbox::with_inspector(
+                &database_path,
+                Arc::new(DelayedInspector {
+                    started: Mutex::new(Some(started_sender)),
+                    release: Mutex::new(release_receiver),
+                }),
+            )
+            .unwrap(),
+        );
+        let mut operation = Box::pin(super::load_project_inbox_from(inbox));
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let started = Instant::now();
+
+        assert!(matches!(
+            operation.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking repository inspection should start on its worker");
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            release_sender.send(()).unwrap();
+        });
+
+        let snapshot = tauri::async_runtime::block_on(operation).unwrap();
+        assert_eq!(snapshot.projects.len(), 1);
+    }
 }

@@ -35,10 +35,12 @@ pub fn run() {
     configure_builder(tauri::Builder::default())
         .setup(|app| {
             let default_app_data = app.path().app_data_dir()?;
+            let resource_dir = app.path().resource_dir()?;
             let app_data = env::var_os(TEST_APP_DATA_DIR_ENV)
                 .map(PathBuf::from)
                 .unwrap_or(default_app_data);
-            let core = application::ApplicationCore::deferred(app_data.join("piu.sqlite3"));
+            let git = git_process::GitProcess::from_bundled_runtime(&resource_dir.join("git"));
+            let core = application::ApplicationCore::deferred(app_data.join("piu.sqlite3"), git);
             app.manage(core);
             tracing::info!("application core configured");
             Ok(())
