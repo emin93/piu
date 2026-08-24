@@ -652,6 +652,7 @@ impl ChatWorkspaces {
         if reservation.worktree_path != self.root.join(&reservation.chat_id) {
             return Err(ChatWorkspaceError::InvalidOwnership);
         }
+        let project = self.inbox.project_location(reservation.project.id)?;
         let path_exists = match fs::symlink_metadata(&reservation.worktree_path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(ChatWorkspaceError::InvalidOwnership);
@@ -686,8 +687,7 @@ impl ChatWorkspaces {
                     .worktree_path
                     .canonicalize()
                     .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
-                let expected_git_dir = reservation
-                    .project
+                let expected_git_dir = project
                     .git_dir_path
                     .canonicalize()
                     .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
@@ -729,10 +729,7 @@ impl ChatWorkspaces {
                     return Err(ChatWorkspaceError::InvalidOwnership);
                 }
                 self.git
-                    .remove_worktree(
-                        &reservation.project.canonical_path,
-                        &reservation.worktree_path,
-                    )
+                    .remove_worktree(&project.canonical_path, &reservation.worktree_path)
                     .map_err(|error| ChatWorkspaceError::Reconciliation(error.to_string()))?;
             } else {
                 fs::remove_dir(&reservation.worktree_path)
@@ -742,7 +739,7 @@ impl ChatWorkspaces {
         if owned_branch {
             self.git
                 .delete_branch_if_at(
-                    &reservation.project.canonical_path,
+                    &project.canonical_path,
                     &reservation.branch_name,
                     &reservation.base_commit,
                 )
@@ -1575,6 +1572,51 @@ mod tests {
             moved_branch.inbox.pending_chat_creations().unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn recovery_with_a_missing_worktree_never_mutates_a_replacement_source_repository() {
+        let fixture = WorkspaceFixture::new(RemoteFixture::new());
+        let reservation = leave_interrupted_creation(
+            &fixture,
+            CreationCheckpoint::BranchAttached,
+            "Preserve a replacement source branch",
+        );
+        fixture
+            .manager
+            .git
+            .remove_worktree(
+                &reservation.project.canonical_path,
+                &reservation.worktree_path,
+            )
+            .unwrap();
+        let original_repository = fixture.remote.working.with_extension("original-source");
+        fs::rename(&fixture.remote.working, &original_repository).unwrap();
+        run(Command::new("/usr/bin/git")
+            .arg("clone")
+            .arg(&fixture.remote.remote)
+            .arg(&fixture.remote.working));
+        fixture
+            .remote
+            .git(["branch", &reservation.branch_name, &reservation.base_commit]);
+
+        let error = fixture
+            .manager
+            .reconcile_once()
+            .expect_err("recovery must reject a replaced source repository");
+
+        assert!(matches!(
+            error,
+            ChatWorkspaceError::Inbox(ProjectInboxError::InvalidRepository)
+        ));
+        assert_eq!(
+            fixture
+                .remote
+                .git(["rev-parse", &reservation.branch_name])
+                .trim(),
+            reservation.base_commit
+        );
+        assert_eq!(fixture.inbox.pending_chat_creations().unwrap().len(), 1);
     }
 
     #[test]
