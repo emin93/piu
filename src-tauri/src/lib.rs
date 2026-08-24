@@ -1,13 +1,22 @@
 pub mod application;
 pub mod database;
+pub mod git_process;
 pub mod host_boundary;
+pub mod project_commands;
+pub mod project_inbox;
 
 const TEST_APP_DATA_DIR_ENV: &str = "PIU_TEST_APP_DATA_DIR";
 
 pub fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![host_boundary::host_round_trip])
+        .invoke_handler(tauri::generate_handler![
+            host_boundary::host_round_trip,
+            project_commands::load_project_inbox,
+            project_commands::open_repository,
+            project_commands::save_project_draft,
+            project_commands::remove_project,
+        ])
 }
 
 pub fn run() {

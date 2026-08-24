@@ -30,7 +30,7 @@ fn failed_migration_rolls_back_schema_and_version() {
     let database_path = app_data.path().join("piu.sqlite3");
     drop(Database::open(&database_path).expect("initial migration succeeds"));
     let failing_migration = Migration::new(
-        2,
+        CURRENT_SCHEMA_VERSION + 1,
         "injected failure",
         "CREATE TABLE should_rollback (id INTEGER); SELECT missing_function();",
     );

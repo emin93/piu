@@ -3,12 +3,13 @@ use std::path::Path;
 use rusqlite::{Connection, TransactionBehavior, params};
 use thiserror::Error;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
-const MIGRATIONS: &[Migration] = &[Migration::new(
-    1,
-    "create application metadata",
-    r#"
+const MIGRATIONS: &[Migration] = &[
+    Migration::new(
+        1,
+        "create application metadata",
+        r#"
     CREATE TABLE application_metadata (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         created_at TEXT NOT NULL
@@ -17,7 +18,40 @@ const MIGRATIONS: &[Migration] = &[Migration::new(
     INSERT INTO application_metadata (id, created_at)
     VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 "#,
-)];
+    ),
+    Migration::new(
+        2,
+        "create project inbox",
+        r#"
+    CREATE TABLE projects (
+        id INTEGER PRIMARY KEY,
+        canonical_path TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL
+    );
+
+    CREATE TABLE chat_drafts (
+        project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+        prompt TEXT NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    );
+
+    CREATE TABLE chats (
+        id TEXT PRIMARY KEY,
+        project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+        project_name TEXT NOT NULL,
+        title TEXT NOT NULL,
+        branch_name TEXT NOT NULL,
+        pull_request_number INTEGER,
+        created_at_ms INTEGER NOT NULL,
+        merge_state TEXT NOT NULL CHECK (merge_state IN ('unmerged', 'merged'))
+    );
+
+    CREATE INDEX chats_created_at ON chats(created_at_ms DESC, id ASC);
+    CREATE INDEX chats_project_id ON chats(project_id);
+"#,
+    ),
+];
 
 #[derive(Clone, Copy, Debug)]
 pub struct Migration {
@@ -61,6 +95,9 @@ impl Database {
         migrations: &[Migration],
     ) -> Result<Self, DatabaseError> {
         let mut connection = Connection::open(path).map_err(DatabaseError::Open)?;
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(DatabaseError::Query)?;
         migrate(&mut connection, migrations)?;
         Ok(Self { connection })
     }
@@ -76,6 +113,14 @@ impl Database {
             params![table_name],
             |row| row.get(0),
         )
+    }
+
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    pub(crate) fn connection_mut(&mut self) -> &mut Connection {
+        &mut self.connection
     }
 }
 
