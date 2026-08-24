@@ -1,0 +1,29 @@
+.model-resource-qa {
+  display: grid;
+  width: 100%;
+  gap: 48px;
+  margin-inline: auto;
+  padding-bottom: 64px;
+}
+
+.model-resource-qa__notice {
+  padding: 8px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.model-resource-qa__context {
+  display: flex;
+  gap: 4px;
+  margin-top: -36px;
+}
+
+.model-resource-qa article > h2 {
+  margin: 0 0 12px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 540;
+}

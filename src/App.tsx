@@ -76,6 +76,7 @@ function StartupLoading() {
 
 export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }: AppProps) {
   useSystemAppearance();
+  const [activeSurface, setActiveSurface] = useState<"inbox" | DeferredSurfaceName>(surface);
   const [hostStatus, setHostStatus] = useState<"checking" | "ready" | "failed">("checking");
   const [snapshot, setSnapshot] = useState<InboxSnapshot>(EMPTY_INBOX);
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
@@ -83,6 +84,8 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
   const [query, setQuery] = useState("");
   const [repositoryActionError, setRepositoryActionError] = useState<string>();
   const verificationGeneration = useRef(0);
+  const settingsTriggerRef = useRef<HTMLButtonElement>(null);
+  const restoreSettingsFocus = useRef(false);
   const [setups] = useState(() => new ChatSetupController());
   const [drafts] = useState(() => {
     const controller = new ProjectDraftController(
@@ -123,6 +126,20 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
   }, [completeStartup]);
 
   const flushAllDrafts = useCallback(() => drafts.flushAll(), [drafts]);
+
+  const openSettings = useCallback(() => {
+    void flushAllDrafts().catch(() => undefined);
+    restoreSettingsFocus.current = true;
+    setActiveSurface("settings");
+  }, [flushAllDrafts]);
+
+  const closeDeferredSurface = useCallback(() => setActiveSurface("inbox"), []);
+
+  useEffect(() => {
+    if (activeSurface !== "inbox" || !restoreSettingsFocus.current) return;
+    restoreSettingsFocus.current = false;
+    settingsTriggerRef.current?.focus();
+  }, [activeSurface]);
 
   const openSelectedRepository = useCallback(() => {
     void flushAllDrafts().catch(() => undefined);
@@ -319,6 +336,8 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
   }, [flushAllDrafts]);
 
   const selectedProject = snapshot.projects.find(({ id }) => id === selectedProjectId);
+  const titlebarContext =
+    activeSurface === "settings" ? "Settings" : (selectedProject?.name ?? "All Projects");
 
   return (
     <TooltipProvider>
@@ -330,7 +349,7 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
             </span>
             <span>Più</span>
           </div>
-          <div className="titlebar-context">{selectedProject?.name ?? "All Projects"}</div>
+          <div className="titlebar-context">{titlebarContext}</div>
         </header>
         {hostStatus === "checking" ? (
           <main className="startup-workspace">
@@ -340,7 +359,7 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
           <main className="startup-workspace">
             <StartupFailure onRetry={retryStartup} />
           </main>
-        ) : surface === "inbox" ? (
+        ) : activeSurface === "inbox" ? (
           <InboxWorkspace
             actionError={repositoryActionError}
             drafts={drafts}
@@ -348,6 +367,7 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
             onCreateChat={createProjectChat}
             onOpenRepository={openSelectedRepository}
             onOpenTerminal={openTerminal}
+            onOpenSettings={openSettings}
             onQueryChange={changeQuery}
             onRemoveProject={removeSelectedProject}
             onRetrySetup={retrySetup}
@@ -356,13 +376,14 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
             query={query}
             selectedChatId={selectedChatId}
             selectedProjectId={selectedProjectId}
+            settingsTriggerRef={settingsTriggerRef}
             setups={setups}
             snapshot={snapshot}
           />
         ) : (
           <main className="deferred-workspace">
             <div className="conversation-stage">
-              <DeferredSurface surface={surface} />
+              <DeferredSurface onClose={closeDeferredSurface} surface={activeSurface} />
             </div>
           </main>
         )}

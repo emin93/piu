@@ -64,6 +64,24 @@ if (
   throw new Error(`Expected exactly the two local Latin Geist variable fonts: ${fontFiles}`);
 }
 
+const productionForbidden = [
+  "ModelResourceQaGallery",
+  "model-resource-qa.gallery",
+  "Deterministic build-time QA gallery",
+  "qa-gallery",
+  "Onboarding context",
+  ".model-resource-qa",
+];
+const distFiles = await readdir(resolve("dist"), { recursive: true });
+for (const relative of distFiles) {
+  if (!/\.(?:css|js|map|json)$/.test(relative)) continue;
+  const contents = await readFile(resolve("dist", relative), "utf8");
+  const leaked = productionForbidden.find((needle) => contents.includes(needle));
+  if (leaked) {
+    throw new Error(`Production bundle ${relative} contains QA-only content: ${leaked}`);
+  }
+}
+
 console.log(
   JSON.stringify(
     {

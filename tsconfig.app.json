@@ -13,7 +13,8 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
+      "#model-resource-qa": ["./src/features/model-resources/model-resource-qa.production.tsx"]
     },
     "resolveJsonModule": true,
     "isolatedModules": true,

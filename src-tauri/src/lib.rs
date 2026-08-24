@@ -3,6 +3,8 @@ pub mod chat_workspaces;
 pub mod database;
 pub mod git_process;
 pub mod host_boundary;
+pub mod model_asset_boundary;
+pub mod model_assets;
 pub mod project_commands;
 pub mod project_inbox;
 
@@ -13,6 +15,12 @@ pub fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             host_boundary::host_round_trip,
+            model_asset_boundary::model_asset_status,
+            model_asset_boundary::start_model_download,
+            model_asset_boundary::cancel_model_download,
+            model_asset_boundary::authorize_hugging_face,
+            model_asset_boundary::remove_model_assets,
+            model_asset_boundary::retry_model_asset_recovery,
             project_commands::load_project_inbox,
             project_commands::open_repository,
             project_commands::save_project_draft,
@@ -47,6 +55,10 @@ pub fn run() {
             let git = git_process::GitProcess::from_bundled_runtime(&resource_dir.join("git"));
             let core = application::ApplicationCore::deferred(app_data.join("piu.sqlite3"), git);
             app.manage(core);
+            let model_assets =
+                model_assets::ModelAssetManager::production_or_unavailable(&app_data);
+            model_asset_boundary::forward_status_events(app.handle().clone(), &model_assets);
+            app.manage(model_assets);
             tracing::info!("application core configured");
             Ok(())
         })

@@ -3,9 +3,18 @@ import {
   FolderPlusIcon,
   MoreHorizontalIcon,
   SearchIcon,
+  SettingsIcon,
   Trash2Icon,
 } from "lucide-react";
-import { memo, useCallback, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  memo,
+  type RefObject,
+  useCallback,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 
 import {
   AlertDialog,
@@ -48,6 +57,7 @@ interface InboxWorkspaceProps {
   onCreateChat: (projectId: number, prompt: string) => Promise<string | undefined>;
   onOpenRepository: () => void;
   onOpenTerminal: (chatId: string) => Promise<string | undefined>;
+  onOpenSettings: () => void;
   onQueryChange: (query: string) => void;
   onRemoveProject: (projectId: number) => Promise<string | undefined>;
   onRetrySetup: (chatId: string) => Promise<string | undefined>;
@@ -56,6 +66,7 @@ interface InboxWorkspaceProps {
   query: string;
   selectedProjectId: number | null;
   selectedChatId: string | null;
+  settingsTriggerRef?: RefObject<HTMLButtonElement | null>;
   setups: ChatSetupController;
   snapshot: InboxSnapshot;
 }
@@ -283,6 +294,7 @@ export function InboxWorkspace({
   onCreateChat,
   onOpenRepository,
   onOpenTerminal,
+  onOpenSettings,
   onQueryChange,
   onRemoveProject,
   onRetrySetup,
@@ -291,6 +303,7 @@ export function InboxWorkspace({
   query,
   selectedProjectId,
   selectedChatId,
+  settingsTriggerRef,
   setups,
   snapshot,
 }: InboxWorkspaceProps) {
@@ -479,6 +492,18 @@ export function InboxWorkspace({
             ) : null}
           </div>
         </ScrollArea>
+        <footer className="sidebar-footer">
+          <Button
+            className="sidebar-settings-action"
+            onClick={onOpenSettings}
+            ref={settingsTriggerRef}
+            type="button"
+            variant="ghost"
+          >
+            <SettingsIcon aria-hidden="true" data-icon="inline-start" />
+            Settings
+          </Button>
+        </footer>
       </aside>
 
       <SidebarResizeHandle disabled={snapshot.projects.length === 0} />

@@ -1,0 +1,144 @@
+{
+  "schemaVersion": 1,
+  "manifestId": "qwen3.8-27b-uncensored-mlx-4bit-mtp@0f88c40",
+  "repository": "orcarouter/Qwen3.8-27B-Uncensored-MLX",
+  "revision": "0f88c40e9eff87740295f27654558fcb77e21ae5",
+  "sourceLastModified": "2026-08-24T09:44:01.000Z",
+  "mtpBlockSize": 3,
+  "drafterSelectionNote": "The drafter is the repository's same-revision mtp directory. Its pinned config declares the native speculative block size 3.",
+  "files": [
+    {
+      "asset": "target",
+      "sourcePath": "4-bit/README.md",
+      "installPath": "target/README.md",
+      "sizeBytes": 84,
+      "sha256": "9a272b5949a803ab6eadf0703706dab183229952e2b374501d1069d0f6d16557"
+    },
+    {
+      "asset": "target",
+      "sourcePath": "4-bit/chat_template.jinja",
+      "installPath": "target/chat_template.jinja",
+      "sizeBytes": 8952,
+      "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    },
+    {
+      "asset": "target",
+      "sourcePath": "4-bit/config.json",
+      "installPath": "target/config.json",
+      "sizeBytes": 5187,
+      "sha256": "f238d3a11e8d96b4f688fd09c627879b9b87a067835c83cb7c1c102df7aa4fb0"
+    },
+    {
+      "asset": "target",
+      "sourcePath": "4-bit/generation_config.json",
+      "installPath": "target/generation_config.json",
+      "sizeBytes": 202,
+      "sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+    },
+    {
+      "asset": "target",
+      "sourcePath": "4-bit/model-00001-of-00003.safetensors",
+      "installPath": "target/model-00001-of-00003.safetensors",
+      "sizeBytes": 5343268752,
+      "sha256": "014e69ab23abb0ec453346930260b2f78785c36e23b1922c6992ec6ec9732b37"
+    },
+    {
+      "asset": "target",
+      "sourcePath": "4-bit/model-00002-of-00003.safetensors",
+      "installPath": "target/model-00002-of-00003.safetensors",
+      "sizeBytes": 5354185100,
+      "sha256": "3f275e43480498e0d1d113a726c746066dfab73927a22873c45a238be55cee13"
+    },
+    {
+      "asset": "target",
+      "sourcePath": "4-bit/model-00003-of-00003.safetensors",
+      "installPath": "target/model-00003-of-00003.safetensors",
+      "sizeBytes": 5357087747,
+      "sha256": "ef97c143824615510df09938a188bbdf475f9e41a9475113b3fb07090c842137"
+    },
+    {
+      "asset": "target",
+      "sourcePath": "4-bit/model.safetensors.index.json",
+      "installPath": "target/model.safetensors.index.json",
+      "sizeBytes": 218281,
+      "sha256": "13b840162b4cb35c66fef7df072f7dbb4717908204364f5e5d9f9655a2758fa8"
+    },
+    {
+      "asset": "target",
+      "sourcePath": "4-bit/preprocessor_config.json",
+      "installPath": "target/preprocessor_config.json",
+      "sizeBytes": 390,
+      "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+    },
+    {
+      "asset": "target",
+      "sourcePath": "4-bit/processor_config.json",
+      "installPath": "target/processor_config.json",
+      "sizeBytes": 991,
+      "sha256": "45fc17c8dd2474af6b493b52483c26c0584b0082d368c480f9fa611e73070040"
+    },
+    {
+      "asset": "target",
+      "sourcePath": "4-bit/tokenizer.json",
+      "installPath": "target/tokenizer.json",
+      "sizeBytes": 19989325,
+      "sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+    },
+    {
+      "asset": "target",
+      "sourcePath": "4-bit/tokenizer_config.json",
+      "installPath": "target/tokenizer_config.json",
+      "sizeBytes": 10404,
+      "sha256": "47a7a8371379b07650b22f3c8a78c32fed85c4e35ea88e3da0c4b7a7611e8082"
+    },
+    {
+      "asset": "target",
+      "sourcePath": "4-bit/video_preprocessor_config.json",
+      "installPath": "target/video_preprocessor_config.json",
+      "sizeBytes": 385,
+      "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+    },
+    {
+      "asset": "target",
+      "sourcePath": "4-bit/vocab.json",
+      "installPath": "target/vocab.json",
+      "sizeBytes": 6722759,
+      "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+    },
+    {
+      "asset": "drafter",
+      "sourcePath": "mtp/config.json",
+      "installPath": "drafter/config.json",
+      "sizeBytes": 2976,
+      "sha256": "1d0fae1de88b663ed0daabc8884f8a5dd076011164e4500dda4ebc947079af05"
+    },
+    {
+      "asset": "drafter",
+      "sourcePath": "mtp/model.safetensors",
+      "installPath": "drafter/model.safetensors",
+      "sizeBytes": 849400337,
+      "sha256": "c32e7deb5a95b551be1c24fc8576df7e130fef67e79ff7c4071e4f14d9aa9760"
+    },
+    {
+      "asset": "drafter",
+      "sourcePath": "mtp/tokenizer.json",
+      "installPath": "drafter/tokenizer.json",
+      "sizeBytes": 12809320,
+      "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+    },
+    {
+      "asset": "drafter",
+      "sourcePath": "mtp/tokenizer_config.json",
+      "installPath": "drafter/tokenizer_config.json",
+      "sizeBytes": 17928,
+      "sha256": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"
+    },
+    {
+      "asset": "drafter",
+      "sourcePath": "mtp/vocab.json",
+      "installPath": "drafter/vocab.json",
+      "sizeBytes": 6722759,
+      "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+    }
+  ]
+}

@@ -115,6 +115,7 @@ function WorkspaceHarness({
       onCreateChat={vi.fn().mockResolvedValue(undefined)}
       onOpenRepository={vi.fn()}
       onOpenTerminal={vi.fn().mockResolvedValue(undefined)}
+      onOpenSettings={vi.fn()}
       onQueryChange={setQuery}
       onRemoveProject={onRemove}
       onRetrySetup={vi.fn().mockResolvedValue(undefined)}
@@ -131,6 +132,35 @@ function WorkspaceHarness({
     />
   );
 }
+
+test("exposes Settings as a quiet sidebar footer action", async () => {
+  const openSettings = vi.fn();
+  const user = userEvent.setup();
+  render(
+    <InboxWorkspace
+      actionError={undefined}
+      drafts={new ProjectDraftController(() => Promise.resolve())}
+      onCancelSetup={vi.fn().mockResolvedValue(undefined)}
+      onCreateChat={vi.fn().mockResolvedValue(undefined)}
+      onOpenRepository={vi.fn()}
+      onOpenTerminal={vi.fn().mockResolvedValue(undefined)}
+      onOpenSettings={openSettings}
+      onQueryChange={vi.fn()}
+      onRemoveProject={vi.fn().mockResolvedValue(undefined)}
+      onRetrySetup={vi.fn().mockResolvedValue(undefined)}
+      onSelectChat={vi.fn()}
+      onSelectProject={vi.fn()}
+      query=""
+      selectedChatId={null}
+      selectedProjectId={null}
+      setups={new ChatSetupController()}
+      snapshot={{ projects: [], drafts: [], chats: [] }}
+    />,
+  );
+
+  await user.click(screen.getByRole("button", { name: "Settings" }));
+  expect(openSettings).toHaveBeenCalledOnce();
+});
 
 test("renders stable global rows and composes project filtering with search", async () => {
   const user = userEvent.setup();

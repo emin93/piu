@@ -13,10 +13,25 @@ const surfaces = {
   diff: DiffSurface,
   files: FilesSurface,
   terminal: TerminalSurface,
-  settings: SettingsSurface,
-} satisfies Record<DeferredSurfaceName, React.LazyExoticComponent<() => React.ReactNode>>;
+} satisfies Record<
+  Exclude<DeferredSurfaceName, "settings">,
+  React.LazyExoticComponent<() => React.ReactNode>
+>;
 
-export function DeferredSurface({ surface }: { surface: DeferredSurfaceName }) {
+export function DeferredSurface({
+  onClose,
+  surface,
+}: {
+  onClose?: () => void;
+  surface: DeferredSurfaceName;
+}) {
+  if (surface === "settings") {
+    return (
+      <Suspense fallback={<div className="surface-loading">Loading Settings</div>}>
+        <SettingsSurface onClose={onClose} />
+      </Suspense>
+    );
+  }
   const Surface = surfaces[surface];
   return (
     <Suspense fallback={<div className="surface-loading">Loading view</div>}>

@@ -2,6 +2,7 @@ import { expect, test } from "vitest";
 
 import alertDialogSource from "./components/ui/alert-dialog.tsx?raw";
 import dialogSource from "./components/ui/dialog.tsx?raw";
+import modelResourceSource from "./features/model-resources/ModelResourcePanel.tsx?raw";
 import stylesheet from "./styles.css?raw";
 
 test("the interface uses two local Latin Geist variable faces", () => {
@@ -46,4 +47,14 @@ test("the keyboard splitter uses a short focus indicator rather than a full-heig
   expect(stylesheet).not.toMatch(
     /\.sidebar-resize-handle:focus-visible\s*\{[^}]*background: var\(--ring\)/,
   );
+});
+
+test("model resources compose the shared controls without a second custom control system", () => {
+  expect(modelResourceSource).not.toMatch(/<(?:button|input)\b/);
+  expect(modelResourceSource).toContain("<Button");
+  expect(modelResourceSource).toContain("<Input");
+  expect(modelResourceSource).toContain("<Badge");
+  expect(modelResourceSource).toContain("<AlertDialog");
+  expect(modelResourceSource).toContain("<Skeleton");
+  expect(stylesheet).toMatch(/\.model-resource-panel\s*\{[\s\S]*?gap: 16px/);
 });
