@@ -33,6 +33,42 @@ pub enum ChatMergeState {
     Merged,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub enum ChatSetupPhase {
+    Pending,
+    NotRequired,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub enum ChatSetupFailureKind {
+    NotExecutable,
+    Launch,
+    Exit,
+    Signal,
+    Interrupted,
+    Storage,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct ChatSetupSummary {
+    pub phase: ChatSetupPhase,
+    pub failure: Option<ChatSetupFailureKind>,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub attempt: u32,
+    pub log: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../src/generated/")]
@@ -69,6 +105,7 @@ pub struct ChatSummary {
     #[ts(type = "number")]
     pub created_at_ms: i64,
     pub merge_state: ChatMergeState,
+    pub setup: ChatSetupSummary,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize, TS)]
@@ -105,6 +142,8 @@ pub enum ProjectInboxError {
     RepositoryInaccessible,
     #[error("project {project_id} does not exist")]
     ProjectNotFound { project_id: i64 },
+    #[error("chat {chat_id} does not exist")]
+    ChatNotFound { chat_id: String },
     #[error("project has {count} unmerged chats")]
     ProjectHasUnmergedChats { count: u32 },
     #[error("could not prepare application data: {0}")]
@@ -202,6 +241,47 @@ pub struct ProjectInbox {
     database_path: PathBuf,
     database: Mutex<Option<Database>>,
     repository_inspector: Arc<dyn RepositoryInspector>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectLocation {
+    pub id: i64,
+    pub name: String,
+    pub canonical_path: PathBuf,
+    pub git_dir_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FilesystemIdentity {
+    pub path: PathBuf,
+    pub device: String,
+    pub inode: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChatCreationReservation {
+    pub chat_id: String,
+    pub project: ProjectLocation,
+    pub prompt: String,
+    pub title: String,
+    pub branch_name: String,
+    pub worktree_path: PathBuf,
+    pub worktree_root: FilesystemIdentity,
+    pub worktree_git_dir: Option<FilesystemIdentity>,
+    pub base_commit: String,
+    pub created_at_ms: i64,
+    pub worktree_created: bool,
+    pub branch_attached: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChatWorkspaceOwnership {
+    pub chat_id: String,
+    pub project_id: i64,
+    pub branch_name: String,
+    pub worktree_path: PathBuf,
+    pub worktree_root: FilesystemIdentity,
+    pub worktree_git_dir: FilesystemIdentity,
 }
 
 impl ProjectInbox {
@@ -373,8 +453,10 @@ impl ProjectInbox {
             require_project(&transaction, project_id)?;
             let unmerged_count: u32 = transaction
                 .query_row(
-                    "SELECT COUNT(*) FROM chats
-                     WHERE project_id = ?1 AND merge_state = 'unmerged'",
+                    "SELECT
+                       (SELECT COUNT(*) FROM chats
+                        WHERE project_id = ?1 AND merge_state = 'unmerged') +
+                       (SELECT COUNT(*) FROM chat_workspace_creations WHERE project_id = ?1)",
                     [project_id],
                     |row| row.get(0),
                 )
@@ -402,7 +484,481 @@ impl ProjectInbox {
         Ok(stored.materialize(self.repository_inspector.as_ref()))
     }
 
-    fn with_database<T>(
+    pub(crate) fn project_location(
+        &self,
+        project_id: i64,
+    ) -> Result<ProjectLocation, ProjectInboxError> {
+        let (project, expected) = self.with_database(|database| {
+            database
+                .connection()
+                .query_row(
+                    "SELECT id, name, canonical_path, root_device, root_inode,
+                            git_dir_path, git_dir_device, git_dir_inode
+                     FROM projects WHERE id = ?1",
+                    [project_id],
+                    |row| {
+                        let canonical_path: String = row.get(2)?;
+                        let git_dir_path: String = row.get(5)?;
+                        let expected = RepositoryIdentity {
+                            canonical_path: PathBuf::from(&canonical_path),
+                            root_device: row.get(3)?,
+                            root_inode: row.get(4)?,
+                            git_dir_path: PathBuf::from(&git_dir_path),
+                            git_dir_device: row.get(6)?,
+                            git_dir_inode: row.get(7)?,
+                        };
+                        Ok((
+                            ProjectLocation {
+                                id: row.get(0)?,
+                                name: row.get(1)?,
+                                canonical_path: PathBuf::from(canonical_path),
+                                git_dir_path: PathBuf::from(git_dir_path),
+                            },
+                            expected,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(DatabaseError::Query)?
+                .ok_or(ProjectInboxError::ProjectNotFound { project_id })
+        })?;
+        let actual = self
+            .repository_inspector
+            .inspect(&expected.canonical_path)
+            .map_err(map_admission_error)?;
+        if actual != expected {
+            return Err(ProjectInboxError::InvalidRepository);
+        }
+        Ok(project)
+    }
+
+    pub(crate) fn allocate_chat_id(&self) -> Result<String, ProjectInboxError> {
+        self.with_database(|database| {
+            database
+                .connection()
+                .query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
+                .map_err(DatabaseError::Query)
+                .map_err(ProjectInboxError::Database)
+        })
+    }
+
+    pub(crate) fn reserve_chat_creation(
+        &self,
+        reservation: &ChatCreationReservation,
+    ) -> Result<(), ProjectInboxError> {
+        self.with_database(|database| {
+            database
+                .connection_mut()
+                .execute(
+                    "INSERT INTO chat_workspace_creations (
+                       chat_id, project_id, project_name, prompt, title, branch_name,
+                       worktree_path, worktree_root_path, worktree_root_device, worktree_root_inode,
+                       base_commit, created_at_ms, worktree_created, branch_attached,
+                       worktree_git_dir_path, worktree_git_dir_device, worktree_git_dir_inode
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, 0,
+                               NULL, NULL, NULL)",
+                    params![
+                        reservation.chat_id,
+                        reservation.project.id,
+                        reservation.project.name,
+                        reservation.prompt,
+                        reservation.title,
+                        reservation.branch_name,
+                        reservation.worktree_path.to_string_lossy(),
+                        reservation.worktree_root.path.to_string_lossy(),
+                        reservation.worktree_root.device,
+                        reservation.worktree_root.inode,
+                        reservation.base_commit,
+                        reservation.created_at_ms,
+                    ],
+                )
+                .map_err(DatabaseError::Query)
+                .map_err(ProjectInboxError::Database)?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn mark_creation_worktree_created(
+        &self,
+        chat_id: &str,
+        git_dir: &FilesystemIdentity,
+    ) -> Result<(), ProjectInboxError> {
+        self.with_database(|database| {
+            let changed = database
+                .connection_mut()
+                .execute(
+                    "UPDATE chat_workspace_creations
+                     SET worktree_created = 1, worktree_git_dir_path = ?2,
+                         worktree_git_dir_device = ?3, worktree_git_dir_inode = ?4
+                     WHERE chat_id = ?1 AND worktree_created = 0",
+                    params![
+                        chat_id,
+                        git_dir.path.to_string_lossy(),
+                        git_dir.device,
+                        git_dir.inode,
+                    ],
+                )
+                .map_err(DatabaseError::Query)
+                .map_err(ProjectInboxError::Database)?;
+            if changed == 1 {
+                Ok(())
+            } else {
+                Err(ProjectInboxError::ChatNotFound {
+                    chat_id: chat_id.to_owned(),
+                })
+            }
+        })
+    }
+
+    pub(crate) fn mark_creation_branch_attached(
+        &self,
+        chat_id: &str,
+    ) -> Result<(), ProjectInboxError> {
+        self.update_creation_flag(chat_id, "branch_attached")
+    }
+
+    fn update_creation_flag(&self, chat_id: &str, column: &str) -> Result<(), ProjectInboxError> {
+        debug_assert_eq!(column, "branch_attached");
+        self.with_database(|database| {
+            let changed = database
+                .connection_mut()
+                .execute(
+                    &format!("UPDATE chat_workspace_creations SET {column} = 1 WHERE chat_id = ?1"),
+                    [chat_id],
+                )
+                .map_err(DatabaseError::Query)
+                .map_err(ProjectInboxError::Database)?;
+            if changed == 1 {
+                Ok(())
+            } else {
+                Err(ProjectInboxError::ChatNotFound {
+                    chat_id: chat_id.to_owned(),
+                })
+            }
+        })
+    }
+
+    pub(crate) fn commit_chat_creation(
+        &self,
+        reservation: &ChatCreationReservation,
+    ) -> Result<(), ProjectInboxError> {
+        let worktree_git_dir = reservation.worktree_git_dir.as_ref().ok_or_else(|| {
+            ProjectInboxError::ChatNotFound {
+                chat_id: reservation.chat_id.clone(),
+            }
+        })?;
+        self.with_database(|database| {
+            let transaction = database
+                .connection_mut()
+                .transaction()
+                .map_err(DatabaseError::Query)?;
+            transaction
+                .execute(
+                    "INSERT INTO chats (
+                       id, project_id, project_name, title, branch_name, worktree_path,
+                       worktree_root_path, worktree_root_device, worktree_root_inode,
+                       worktree_git_dir_path, worktree_git_dir_device, worktree_git_dir_inode,
+                       base_commit, pull_request_number, created_at_ms, merge_state,
+                       setup_phase, setup_failure, setup_exit_code, setup_signal,
+                       setup_attempt, setup_log
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                               ?13, NULL, ?14, 'unmerged',
+                               'pending', NULL, NULL, NULL, 0, '')",
+                    params![
+                        reservation.chat_id,
+                        reservation.project.id,
+                        reservation.project.name,
+                        reservation.title,
+                        reservation.branch_name,
+                        reservation.worktree_path.to_string_lossy(),
+                        reservation.worktree_root.path.to_string_lossy(),
+                        reservation.worktree_root.device,
+                        reservation.worktree_root.inode,
+                        worktree_git_dir.path.to_string_lossy(),
+                        worktree_git_dir.device,
+                        worktree_git_dir.inode,
+                        reservation.base_commit,
+                        reservation.created_at_ms,
+                    ],
+                )
+                .map_err(DatabaseError::Query)?;
+            transaction
+                .execute(
+                    "INSERT INTO chat_messages (chat_id, sequence, role, content, created_at_ms)
+                     VALUES (?1, 1, 'user', ?2, ?3)",
+                    params![
+                        reservation.chat_id,
+                        reservation.prompt,
+                        reservation.created_at_ms
+                    ],
+                )
+                .map_err(DatabaseError::Query)?;
+            transaction
+                .execute(
+                    "DELETE FROM chat_drafts WHERE project_id = ?1",
+                    [reservation.project.id],
+                )
+                .map_err(DatabaseError::Query)?;
+            let removed = transaction
+                .execute(
+                    "DELETE FROM chat_workspace_creations WHERE chat_id = ?1",
+                    [&reservation.chat_id],
+                )
+                .map_err(DatabaseError::Query)?;
+            if removed != 1 {
+                return Err(ProjectInboxError::ChatNotFound {
+                    chat_id: reservation.chat_id.clone(),
+                });
+            }
+            transaction.commit().map_err(DatabaseError::Query)?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn pending_chat_creations(
+        &self,
+    ) -> Result<Vec<ChatCreationReservation>, ProjectInboxError> {
+        self.with_database(|database| {
+            let mut statement = database
+                .connection()
+                .prepare(
+                    "SELECT journal.chat_id, journal.project_id, journal.project_name,
+                            projects.canonical_path, projects.git_dir_path,
+                            journal.prompt, journal.title,
+                            journal.branch_name, journal.worktree_path,
+                            journal.worktree_root_path, journal.worktree_root_device,
+                            journal.worktree_root_inode,
+                            journal.base_commit, journal.created_at_ms, journal.worktree_created,
+                            journal.branch_attached, journal.worktree_git_dir_path,
+                            journal.worktree_git_dir_device, journal.worktree_git_dir_inode
+                     FROM chat_workspace_creations AS journal
+                     JOIN projects ON projects.id = journal.project_id
+                     ORDER BY journal.created_at_ms ASC, journal.chat_id ASC",
+                )
+                .map_err(DatabaseError::Query)?;
+            statement
+                .query_map([], |row| {
+                    let canonical_path: String = row.get(3)?;
+                    let project_git_dir_path: String = row.get(4)?;
+                    let worktree_path: String = row.get(8)?;
+                    let worktree_root_path: String = row.get(9)?;
+                    let git_dir_path: Option<String> = row.get(16)?;
+                    let git_dir_device: Option<String> = row.get(17)?;
+                    let git_dir_inode: Option<String> = row.get(18)?;
+                    let worktree_git_dir = match (git_dir_path, git_dir_device, git_dir_inode) {
+                        (Some(path), Some(device), Some(inode)) => Some(FilesystemIdentity {
+                            path: PathBuf::from(path),
+                            device,
+                            inode,
+                        }),
+                        (None, None, None) => None,
+                        _ => return Err(rusqlite::Error::InvalidQuery),
+                    };
+                    Ok(ChatCreationReservation {
+                        chat_id: row.get(0)?,
+                        project: ProjectLocation {
+                            id: row.get(1)?,
+                            name: row.get(2)?,
+                            canonical_path: PathBuf::from(canonical_path),
+                            git_dir_path: PathBuf::from(project_git_dir_path),
+                        },
+                        prompt: row.get(5)?,
+                        title: row.get(6)?,
+                        branch_name: row.get(7)?,
+                        worktree_path: PathBuf::from(&worktree_path),
+                        worktree_root: FilesystemIdentity {
+                            path: PathBuf::from(worktree_root_path),
+                            device: row.get(10)?,
+                            inode: row.get(11)?,
+                        },
+                        worktree_git_dir,
+                        base_commit: row.get(12)?,
+                        created_at_ms: row.get(13)?,
+                        worktree_created: row.get(14)?,
+                        branch_attached: row.get(15)?,
+                    })
+                })
+                .map_err(DatabaseError::Query)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(DatabaseError::Query)
+                .map_err(ProjectInboxError::Database)
+        })
+    }
+
+    pub(crate) fn discard_chat_creation(&self, chat_id: &str) -> Result<(), ProjectInboxError> {
+        self.with_database(|database| {
+            database
+                .connection_mut()
+                .execute(
+                    "DELETE FROM chat_workspace_creations WHERE chat_id = ?1",
+                    [chat_id],
+                )
+                .map_err(DatabaseError::Query)
+                .map_err(ProjectInboxError::Database)?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn chat_workspace_ownership(
+        &self,
+        chat_id: &str,
+    ) -> Result<ChatWorkspaceOwnership, ProjectInboxError> {
+        self.with_database(|database| {
+            database
+                .connection()
+                .query_row(
+                    "SELECT id, project_id, branch_name, worktree_path,
+                            worktree_root_path, worktree_root_device, worktree_root_inode,
+                            worktree_git_dir_path, worktree_git_dir_device, worktree_git_dir_inode
+                     FROM chats WHERE id = ?1",
+                    [chat_id],
+                    |row| {
+                        let worktree_path: String = row.get(3)?;
+                        let worktree_root_path: String = row.get(4)?;
+                        let worktree_git_dir_path: String = row.get(7)?;
+                        Ok(ChatWorkspaceOwnership {
+                            chat_id: row.get(0)?,
+                            project_id: row.get(1)?,
+                            branch_name: row.get(2)?,
+                            worktree_path: PathBuf::from(worktree_path),
+                            worktree_root: FilesystemIdentity {
+                                path: PathBuf::from(worktree_root_path),
+                                device: row.get(5)?,
+                                inode: row.get(6)?,
+                            },
+                            worktree_git_dir: FilesystemIdentity {
+                                path: PathBuf::from(worktree_git_dir_path),
+                                device: row.get(8)?,
+                                inode: row.get(9)?,
+                            },
+                        })
+                    },
+                )
+                .optional()
+                .map_err(DatabaseError::Query)?
+                .ok_or_else(|| ProjectInboxError::ChatNotFound {
+                    chat_id: chat_id.to_owned(),
+                })
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_user_message(&self, chat_id: &str) -> Result<String, ProjectInboxError> {
+        self.with_database(|database| {
+            database
+                .connection()
+                .query_row(
+                    "SELECT content FROM chat_messages
+                     WHERE chat_id = ?1 AND sequence = 1 AND role = 'user'",
+                    [chat_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(DatabaseError::Query)?
+                .ok_or_else(|| ProjectInboxError::ChatNotFound {
+                    chat_id: chat_id.to_owned(),
+                })
+        })
+    }
+
+    pub(crate) fn begin_setup(&self, chat_id: &str) -> Result<ChatSetupSummary, ProjectInboxError> {
+        self.with_database(|database| {
+            let connection = database.connection_mut();
+            let changed = connection
+                .execute(
+                    "UPDATE chats SET setup_phase = 'running', setup_failure = NULL,
+                         setup_exit_code = NULL, setup_signal = NULL,
+                         setup_attempt = setup_attempt + 1, setup_log = ''
+                     WHERE id = ?1 AND setup_phase != 'running'",
+                    [chat_id],
+                )
+                .map_err(DatabaseError::Query)?;
+            if changed != 1 {
+                return Err(ProjectInboxError::ChatNotFound {
+                    chat_id: chat_id.to_owned(),
+                });
+            }
+            load_chat_setup(connection, chat_id)
+        })
+    }
+
+    pub(crate) fn mark_setup_not_required(
+        &self,
+        chat_id: &str,
+    ) -> Result<ChatSetupSummary, ProjectInboxError> {
+        self.finish_setup(chat_id, ChatSetupPhase::NotRequired, None, None, None)
+    }
+
+    pub(crate) fn append_setup_log(
+        &self,
+        chat_id: &str,
+        attempt: u32,
+        chunk: &str,
+    ) -> Result<ChatSetupSummary, ProjectInboxError> {
+        self.with_database(|database| {
+            let connection = database.connection_mut();
+            let changed = connection
+                .execute(
+                    "UPDATE chats SET setup_log = setup_log || ?3
+                     WHERE id = ?1 AND setup_phase = 'running' AND setup_attempt = ?2",
+                    params![chat_id, attempt, chunk],
+                )
+                .map_err(DatabaseError::Query)?;
+            if changed != 1 {
+                return Err(ProjectInboxError::ChatNotFound {
+                    chat_id: chat_id.to_owned(),
+                });
+            }
+            load_chat_setup(connection, chat_id)
+        })
+    }
+
+    pub(crate) fn finish_setup(
+        &self,
+        chat_id: &str,
+        phase: ChatSetupPhase,
+        failure: Option<ChatSetupFailureKind>,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+    ) -> Result<ChatSetupSummary, ProjectInboxError> {
+        let phase = setup_phase_to_storage(phase);
+        let failure = failure.map(setup_failure_to_storage);
+        self.with_database(|database| {
+            let connection = database.connection_mut();
+            let changed = connection
+                .execute(
+                    "UPDATE chats SET setup_phase = ?2, setup_failure = ?3,
+                         setup_exit_code = ?4, setup_signal = ?5
+                     WHERE id = ?1",
+                    params![chat_id, phase, failure, exit_code, signal],
+                )
+                .map_err(DatabaseError::Query)?;
+            if changed != 1 {
+                return Err(ProjectInboxError::ChatNotFound {
+                    chat_id: chat_id.to_owned(),
+                });
+            }
+            load_chat_setup(connection, chat_id)
+        })
+    }
+
+    pub(crate) fn interrupt_incomplete_setups(&self) -> Result<(), ProjectInboxError> {
+        self.with_database(|database| {
+            database
+                .connection_mut()
+                .execute(
+                    "UPDATE chats SET setup_phase = 'failed', setup_failure = 'interrupted',
+                         setup_exit_code = NULL, setup_signal = NULL
+                     WHERE setup_phase IN ('pending', 'running')",
+                    [],
+                )
+                .map_err(DatabaseError::Query)
+                .map_err(ProjectInboxError::Database)?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn with_database<T>(
         &self,
         operation: impl FnOnce(&mut Database) -> Result<T, ProjectInboxError>,
     ) -> Result<T, ProjectInboxError> {
@@ -552,13 +1108,16 @@ fn load_stored_snapshot(connection: &Connection) -> Result<StoredInboxSnapshot, 
     let mut chat_statement = connection
         .prepare(
             "SELECT id, project_id, project_name, title, branch_name,
-                    pull_request_number, created_at_ms, merge_state
+                    pull_request_number, created_at_ms, merge_state, setup_phase,
+                    setup_failure, setup_exit_code, setup_signal, setup_attempt, setup_log
              FROM chats ORDER BY created_at_ms DESC, id ASC",
         )
         .map_err(DatabaseError::Query)?;
     let chats = chat_statement
         .query_map([], |row| {
             let merge_state: String = row.get(7)?;
+            let setup_phase: String = row.get(8)?;
+            let setup_failure: Option<String> = row.get(9)?;
             Ok(ChatSummary {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
@@ -572,6 +1131,14 @@ fn load_stored_snapshot(connection: &Connection) -> Result<StoredInboxSnapshot, 
                 } else {
                     ChatMergeState::Unmerged
                 },
+                setup: ChatSetupSummary {
+                    phase: setup_phase_from_storage(&setup_phase),
+                    failure: setup_failure.as_deref().map(setup_failure_from_storage),
+                    exit_code: row.get(10)?,
+                    signal: row.get(11)?,
+                    attempt: row.get(12)?,
+                    log: row.get(13)?,
+                },
             })
         })
         .map_err(DatabaseError::Query)?
@@ -583,6 +1150,80 @@ fn load_stored_snapshot(connection: &Connection) -> Result<StoredInboxSnapshot, 
         drafts,
         chats,
     })
+}
+
+fn load_chat_setup(
+    connection: &Connection,
+    chat_id: &str,
+) -> Result<ChatSetupSummary, ProjectInboxError> {
+    connection
+        .query_row(
+            "SELECT setup_phase, setup_failure, setup_exit_code, setup_signal,
+                    setup_attempt, setup_log
+             FROM chats WHERE id = ?1",
+            [chat_id],
+            |row| {
+                let phase: String = row.get(0)?;
+                let failure: Option<String> = row.get(1)?;
+                Ok(ChatSetupSummary {
+                    phase: setup_phase_from_storage(&phase),
+                    failure: failure.as_deref().map(setup_failure_from_storage),
+                    exit_code: row.get(2)?,
+                    signal: row.get(3)?,
+                    attempt: row.get(4)?,
+                    log: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(DatabaseError::Query)?
+        .ok_or_else(|| ProjectInboxError::ChatNotFound {
+            chat_id: chat_id.to_owned(),
+        })
+}
+
+fn setup_phase_to_storage(phase: ChatSetupPhase) -> &'static str {
+    match phase {
+        ChatSetupPhase::Pending => "pending",
+        ChatSetupPhase::NotRequired => "not_required",
+        ChatSetupPhase::Running => "running",
+        ChatSetupPhase::Succeeded => "succeeded",
+        ChatSetupPhase::Failed => "failed",
+        ChatSetupPhase::Cancelled => "cancelled",
+    }
+}
+
+fn setup_phase_from_storage(phase: &str) -> ChatSetupPhase {
+    match phase {
+        "pending" => ChatSetupPhase::Pending,
+        "not_required" => ChatSetupPhase::NotRequired,
+        "running" => ChatSetupPhase::Running,
+        "succeeded" => ChatSetupPhase::Succeeded,
+        "cancelled" => ChatSetupPhase::Cancelled,
+        _ => ChatSetupPhase::Failed,
+    }
+}
+
+fn setup_failure_to_storage(failure: ChatSetupFailureKind) -> &'static str {
+    match failure {
+        ChatSetupFailureKind::NotExecutable => "not_executable",
+        ChatSetupFailureKind::Launch => "launch",
+        ChatSetupFailureKind::Exit => "exit",
+        ChatSetupFailureKind::Signal => "signal",
+        ChatSetupFailureKind::Interrupted => "interrupted",
+        ChatSetupFailureKind::Storage => "storage",
+    }
+}
+
+fn setup_failure_from_storage(failure: &str) -> ChatSetupFailureKind {
+    match failure {
+        "not_executable" => ChatSetupFailureKind::NotExecutable,
+        "launch" => ChatSetupFailureKind::Launch,
+        "exit" => ChatSetupFailureKind::Exit,
+        "signal" => ChatSetupFailureKind::Signal,
+        "interrupted" => ChatSetupFailureKind::Interrupted,
+        _ => ChatSetupFailureKind::Storage,
+    }
 }
 
 fn repository_availability(

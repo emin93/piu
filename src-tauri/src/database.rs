@@ -28,13 +28,72 @@ const CURRENT_SCHEMA: &str = r#"
         project_name TEXT NOT NULL,
         title TEXT NOT NULL,
         branch_name TEXT NOT NULL,
+        worktree_path TEXT NOT NULL UNIQUE,
+        worktree_root_path TEXT NOT NULL UNIQUE,
+        worktree_root_device TEXT NOT NULL,
+        worktree_root_inode TEXT NOT NULL,
+        worktree_git_dir_path TEXT NOT NULL UNIQUE,
+        worktree_git_dir_device TEXT NOT NULL,
+        worktree_git_dir_inode TEXT NOT NULL,
+        base_commit TEXT NOT NULL,
         pull_request_number INTEGER,
         created_at_ms INTEGER NOT NULL,
-        merge_state TEXT NOT NULL CHECK (merge_state IN ('unmerged', 'merged'))
+        merge_state TEXT NOT NULL CHECK (merge_state IN ('unmerged', 'merged')),
+        setup_phase TEXT NOT NULL CHECK (
+            setup_phase IN ('pending', 'not_required', 'running', 'succeeded', 'failed', 'cancelled')
+        ),
+        setup_failure TEXT CHECK (
+            setup_failure IS NULL OR setup_failure IN (
+                'not_executable', 'launch', 'exit', 'signal', 'interrupted', 'storage'
+            )
+        ),
+        setup_exit_code INTEGER,
+        setup_signal INTEGER,
+        setup_attempt INTEGER NOT NULL,
+        setup_log TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_messages (
+        chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+        content TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (chat_id, sequence)
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_workspace_creations (
+        chat_id TEXT PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+        project_name TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        title TEXT NOT NULL,
+        branch_name TEXT NOT NULL UNIQUE,
+        worktree_path TEXT NOT NULL UNIQUE,
+        worktree_root_path TEXT NOT NULL UNIQUE,
+        worktree_root_device TEXT NOT NULL,
+        worktree_root_inode TEXT NOT NULL,
+        base_commit TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        worktree_created INTEGER NOT NULL CHECK (worktree_created IN (0, 1)),
+        branch_attached INTEGER NOT NULL CHECK (branch_attached IN (0, 1)),
+        worktree_git_dir_path TEXT,
+        worktree_git_dir_device TEXT,
+        worktree_git_dir_inode TEXT,
+        CHECK (
+            (worktree_created = 0 AND worktree_git_dir_path IS NULL
+                AND worktree_git_dir_device IS NULL AND worktree_git_dir_inode IS NULL)
+            OR
+            (worktree_created = 1 AND worktree_git_dir_path IS NOT NULL
+                AND worktree_git_dir_device IS NOT NULL AND worktree_git_dir_inode IS NOT NULL)
+        )
     );
 
     CREATE INDEX IF NOT EXISTS chats_created_at ON chats(created_at_ms DESC, id ASC);
     CREATE INDEX IF NOT EXISTS chats_project_id ON chats(project_id);
+    CREATE INDEX IF NOT EXISTS chat_messages_chat_id ON chat_messages(chat_id, sequence);
+    CREATE INDEX IF NOT EXISTS chat_workspace_creations_project_id
+        ON chat_workspace_creations(project_id);
 "#;
 
 #[derive(Debug, Error)]

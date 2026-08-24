@@ -3,6 +3,15 @@ import { expect, test } from "vitest";
 import type { ChatSummary, InboxSnapshot } from "../../platform/project-inbox";
 import { projectDraft, selectInbox } from "./inbox-model";
 
+const readySetup = {
+  phase: "succeeded" as const,
+  failure: null,
+  exitCode: 0,
+  signal: null,
+  attempt: 1,
+  log: "",
+};
+
 const chats: ChatSummary[] = [
   {
     id: "older",
@@ -13,6 +22,7 @@ const chats: ChatSummary[] = [
     pullRequestNumber: null,
     createdAtMs: 100,
     mergeState: "unmerged",
+    setup: readySetup,
   },
   {
     id: "newer",
@@ -23,6 +33,7 @@ const chats: ChatSummary[] = [
     pullRequestNumber: 73,
     createdAtMs: 300,
     mergeState: "unmerged",
+    setup: readySetup,
   },
   {
     id: "same-time-b",
@@ -33,6 +44,7 @@ const chats: ChatSummary[] = [
     pullRequestNumber: null,
     createdAtMs: 200,
     mergeState: "merged",
+    setup: readySetup,
   },
   {
     id: "same-time-a",
@@ -43,6 +55,7 @@ const chats: ChatSummary[] = [
     pullRequestNumber: null,
     createdAtMs: 200,
     mergeState: "unmerged",
+    setup: readySetup,
   },
 ];
 

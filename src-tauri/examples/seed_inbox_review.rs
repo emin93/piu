@@ -114,14 +114,29 @@ fn main() {
             .execute(
                 "INSERT INTO chats (
                     id, project_id, project_name, title, branch_name,
-                    pull_request_number, created_at_ms, merge_state
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    worktree_path, worktree_root_path, worktree_root_device,
+                    worktree_root_inode, worktree_git_dir_path, worktree_git_dir_device,
+                    worktree_git_dir_inode, base_commit, pull_request_number, created_at_ms,
+                    merge_state, setup_phase, setup_attempt, setup_log
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 'review-device', ?7,
+                           ?8, 'review-git-device', ?9, 'review-base', ?10, ?11, ?12,
+                           'succeeded', 1, '')",
                 params![
                     fixture.id,
                     fixture.project_id,
                     fixture.project_name,
                     fixture.title,
                     fixture.branch_name,
+                    app_data
+                        .join("worktrees")
+                        .join(fixture.id)
+                        .to_string_lossy(),
+                    format!("review-root-inode-{}", fixture.id),
+                    app_data
+                        .join("worktree-git-dirs")
+                        .join(fixture.id)
+                        .to_string_lossy(),
+                    format!("review-git-inode-{}", fixture.id),
                     fixture.pull_request_number,
                     fixture.created_at_ms,
                     fixture.merge_state,

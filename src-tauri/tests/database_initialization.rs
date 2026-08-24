@@ -11,6 +11,8 @@ fn empty_database_is_initialized_with_the_current_schema() {
     assert!(database.has_table("projects").unwrap());
     assert!(database.has_table("chat_drafts").unwrap());
     assert!(database.has_table("chats").unwrap());
+    assert!(database.has_table("chat_messages").unwrap());
+    assert!(database.has_table("chat_workspace_creations").unwrap());
 }
 
 #[test]
@@ -24,4 +26,6 @@ fn current_database_can_be_opened_repeatedly() {
     assert!(reopened.has_table("projects").unwrap());
     assert!(reopened.has_table("chat_drafts").unwrap());
     assert!(reopened.has_table("chats").unwrap());
+    assert!(reopened.has_table("chat_messages").unwrap());
+    assert!(reopened.has_table("chat_workspace_creations").unwrap());
 }

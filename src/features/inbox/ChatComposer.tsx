@@ -1,5 +1,5 @@
 import { ArrowUpIcon, TriangleAlertIcon } from "lucide-react";
-import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -10,6 +10,7 @@ import { ProjectDraftController, type DraftPersistenceStatus } from "./draft-con
 interface ChatComposerProps {
   drafts: ProjectDraftController;
   layout?: "centered" | "docked";
+  onSubmit?: (projectId: number, prompt: string) => Promise<string | undefined>;
   project: ProjectSummary;
 }
 
@@ -20,7 +21,12 @@ function draftStatusCopy(status: DraftPersistenceStatus) {
   return "Saved as you type";
 }
 
-export function ChatComposer({ drafts, layout = "centered", project }: ChatComposerProps) {
+export function ChatComposer({
+  drafts,
+  layout = "centered",
+  onSubmit,
+  project,
+}: ChatComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const available = project.availability === "available";
   const subscribe = useCallback(
@@ -30,6 +36,18 @@ export function ChatComposer({ drafts, layout = "centered", project }: ChatCompo
   const getSnapshot = useCallback(() => drafts.get(project.id), [drafts, project.id]);
   const draft = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   const hasRetainedDraft = !available && Boolean(draft.prompt.trim());
+  const [submitting, setSubmitting] = useState(false);
+  const [submissionError, setSubmissionError] = useState<string>();
+
+  const submit = useCallback(async () => {
+    const prompt = draft.prompt.trim();
+    if (!onSubmit || !prompt || submitting) return;
+    setSubmitting(true);
+    setSubmissionError(undefined);
+    const error = await onSubmit(project.id, prompt);
+    setSubmitting(false);
+    if (error) setSubmissionError(error);
+  }, [draft.prompt, onSubmit, project.id, submitting]);
 
   useEffect(() => {
     if (!available) return;
@@ -60,7 +78,13 @@ export function ChatComposer({ drafts, layout = "centered", project }: ChatCompo
       </div>
 
       {available ? (
-        <div className="composer-shell">
+        <form
+          className="composer-shell"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submit();
+          }}
+        >
           <Textarea
             aria-describedby="draft-persistence-status"
             aria-label={`Draft for ${project.name}`}
@@ -80,10 +104,10 @@ export function ChatComposer({ drafts, layout = "centered", project }: ChatCompo
               {draftStatusCopy(draft.status)}
             </span>
             <Button
-              aria-label="Send message (available with chat creation)"
-              disabled
+              aria-label="Send message"
+              disabled={!onSubmit || !draft.prompt.trim() || submitting}
               size="icon"
-              type="button"
+              type="submit"
             >
               <ArrowUpIcon aria-hidden="true" />
             </Button>
@@ -96,7 +120,12 @@ export function ChatComposer({ drafts, layout = "centered", project }: ChatCompo
               </Button>
             </div>
           ) : null}
-        </div>
+          {submissionError ? (
+            <div className="composer-error" role="alert">
+              <span>{submissionError}</span>
+            </div>
+          ) : null}
+        </form>
       ) : hasRetainedDraft ? (
         <div className="composer-shell composer-shell-readonly">
           <Textarea

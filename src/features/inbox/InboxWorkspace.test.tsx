@@ -6,6 +6,16 @@ import { expect, test, vi } from "vitest";
 import type { InboxSnapshot } from "../../platform/project-inbox";
 import { ProjectDraftController } from "./draft-controller";
 import { InboxWorkspace } from "./InboxWorkspace";
+import { ChatSetupController } from "./setup-controller";
+
+const readySetup = {
+  phase: "succeeded" as const,
+  failure: null,
+  exitCode: 0,
+  signal: null,
+  attempt: 1,
+  log: "",
+};
 
 const populatedSnapshot: InboxSnapshot = {
   projects: [
@@ -24,6 +34,7 @@ const populatedSnapshot: InboxSnapshot = {
       pullRequestNumber: null,
       createdAtMs: 100,
       mergeState: "unmerged",
+      setup: readySetup,
     },
     {
       id: "newer",
@@ -34,6 +45,7 @@ const populatedSnapshot: InboxSnapshot = {
       pullRequestNumber: 73,
       createdAtMs: 300,
       mergeState: "unmerged",
+      setup: readySetup,
     },
     {
       id: "middle",
@@ -44,6 +56,7 @@ const populatedSnapshot: InboxSnapshot = {
       pullRequestNumber: 62,
       createdAtMs: 200,
       mergeState: "unmerged",
+      setup: readySetup,
     },
     {
       id: "merged",
@@ -54,6 +67,7 @@ const populatedSnapshot: InboxSnapshot = {
       pullRequestNumber: 41,
       createdAtMs: 50,
       mergeState: "merged",
+      setup: readySetup,
     },
   ],
 };
@@ -69,6 +83,7 @@ function WorkspaceHarness({
 }) {
   const [snapshot, setSnapshot] = useState(initialSnapshot);
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
+  const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [drafts] = useState(() => {
     const controller = new ProjectDraftController(async (projectId, prompt) => {
@@ -84,18 +99,34 @@ function WorkspaceHarness({
     controller.reconcile(initialSnapshot);
     return controller;
   });
+  const [setups] = useState(() => {
+    const controller = new ChatSetupController();
+    controller.reconcile(initialSnapshot);
+    return controller;
+  });
   useEffect(() => drafts.reconcile(snapshot), [drafts, snapshot]);
+  useEffect(() => setups.reconcile(snapshot), [setups, snapshot]);
 
   return (
     <InboxWorkspace
       actionError={undefined}
       drafts={drafts}
+      onCancelSetup={vi.fn().mockResolvedValue(undefined)}
+      onCreateChat={vi.fn().mockResolvedValue(undefined)}
       onOpenRepository={vi.fn()}
+      onOpenTerminal={vi.fn().mockResolvedValue(undefined)}
       onQueryChange={setQuery}
       onRemoveProject={onRemove}
-      onSelectProject={setSelectedProjectId}
+      onRetrySetup={vi.fn().mockResolvedValue(undefined)}
+      onSelectChat={setSelectedChatId}
+      onSelectProject={(projectId) => {
+        setSelectedProjectId(projectId);
+        setSelectedChatId(null);
+      }}
       query={query}
+      selectedChatId={selectedChatId}
       selectedProjectId={selectedProjectId}
+      setups={setups}
       snapshot={snapshot}
     />
   );

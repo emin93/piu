@@ -460,44 +460,81 @@
 }
 
 .chat-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
-  align-items: center;
   min-width: 0;
-  min-height: 52px;
-  padding: 8px;
-  border-radius: 8px;
   content-visibility: auto;
   contain-intrinsic-block-size: 52px;
 }
 
-.chat-row:hover {
+.chat-row-select {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  justify-content: initial;
+  width: 100%;
+  min-width: 0;
+  min-height: 52px;
+  padding: 8px;
+  border-radius: 8px;
+  text-align: left;
+}
+
+.chat-row-select:hover,
+.chat-row-select[aria-pressed="true"] {
   background: color-mix(in oklab, var(--sidebar-accent) 68%, transparent);
+}
+
+.chat-setup-indicator {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--muted-foreground);
+}
+
+.chat-setup-indicator[data-phase="pending"],
+.chat-setup-indicator[data-phase="running"] {
+  background: var(--ring);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 16%, transparent);
+}
+
+.chat-setup-indicator[data-phase="succeeded"],
+.chat-setup-indicator[data-phase="notRequired"] {
+  background: var(--success);
+}
+
+.chat-setup-indicator[data-phase="failed"],
+.chat-setup-indicator[data-phase="cancelled"] {
+  background: var(--destructive);
 }
 
 .chat-row-copy {
   min-width: 0;
 }
 
-.chat-row-copy h3 {
-  margin: 0;
+.chat-row-title {
+  display: block;
+  overflow: hidden;
   color: var(--sidebar-foreground);
   font-size: 12px;
   font-weight: 540;
   letter-spacing: -0.01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.chat-row-copy p {
+.chat-row-metadata {
   display: flex;
   gap: 4px;
   min-width: 0;
-  margin: 4px 0 0;
+  margin-top: 4px;
+  overflow: hidden;
   color: var(--muted-foreground);
   font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.chat-row-copy p span:first-child {
+.chat-row-metadata span:first-child {
   flex: none;
   max-width: 42%;
 }
@@ -705,6 +742,133 @@
 
 .composer-error > span {
   min-width: 0;
+}
+
+.setup-stage {
+  display: grid;
+  gap: 20px;
+  align-self: center;
+  width: min(44rem, calc(100% - 64px));
+  transform: translateY(-12px);
+}
+
+.setup-stage-header {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.setup-stage-status {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--muted-foreground);
+}
+
+.setup-stage-status[data-phase="pending"],
+.setup-stage-status[data-phase="running"] {
+  color: var(--ring);
+}
+
+.setup-stage-status[data-phase="notRequired"],
+.setup-stage-status[data-phase="succeeded"] {
+  color: var(--success);
+}
+
+.setup-stage-status[data-phase="failed"],
+.setup-stage-status[data-phase="cancelled"] {
+  color: var(--destructive);
+}
+
+.setup-stage-status svg {
+  width: 16px;
+  height: 16px;
+}
+
+.setup-spinner {
+  animation: setup-spin 900ms linear infinite;
+}
+
+.setup-stage-project {
+  margin: 0 0 4px;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.setup-stage h2 {
+  width: fit-content;
+  margin: 0;
+  font-size: 20px;
+  font-weight: 480;
+  letter-spacing: -0.025em;
+  line-height: 1.22;
+}
+
+.setup-stage h2:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 4px;
+  border-radius: 2px;
+}
+
+.setup-stage-copy {
+  margin: 8px 0 0;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.setup-log-scroll,
+.setup-log-empty {
+  height: min(320px, 38vh);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--card) 74%, var(--background));
+}
+
+.setup-log {
+  min-height: 100%;
+  margin: 0;
+  padding: 12px;
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.setup-log-empty {
+  display: grid;
+  height: 112px;
+  place-items: center;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.setup-stage-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.setup-action-error {
+  margin: -8px 0 0;
+  color: var(--destructive);
+  font-size: 12px;
+}
+
+@keyframes setup-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .empty-inbox,

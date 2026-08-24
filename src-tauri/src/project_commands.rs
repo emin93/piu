@@ -6,10 +6,15 @@ use ts_rs::TS;
 
 use crate::{
     application::ApplicationCore,
+    chat_workspaces::{
+        ChatSetupChangedEvent, ChatTerminalRequest, ChatWorkspaceError, CreatedChat,
+    },
     project_inbox::{DraftSummary, InboxSnapshot, OpenRepositoryOutcome, ProjectInboxError},
 };
 
 pub const PROJECT_INBOX_CHANGED_EVENT: &str = "project-inbox://changed";
+pub const CHAT_SETUP_CHANGED_EVENT: &str = "chat-workspace://setup-changed";
+pub const CHAT_TERMINAL_REQUESTED_EVENT: &str = "chat-workspace://terminal-requested";
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +50,30 @@ pub struct RemoveProjectRequest {
     pub project_id: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct CreateChatRequest {
+    #[ts(type = "number")]
+    pub project_id: i64,
+    pub prompt: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct ChatIdRequest {
+    pub chat_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct CreateChatResponse {
+    pub chat: crate::project_inbox::ChatSummary,
+    pub snapshot: InboxSnapshot,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../src/generated/")]
@@ -62,6 +91,7 @@ pub enum ProjectCommandErrorCode {
     RepositoryInaccessible,
     ProjectHasUnmergedChats,
     ProjectNotFound,
+    ChatNotFound,
     RepositoryInspectionFailed,
     StorageUnavailable,
 }
@@ -72,6 +102,73 @@ pub enum ProjectCommandErrorCode {
 pub struct ProjectCommandError {
     pub code: ProjectCommandErrorCode,
     pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub enum ChatWorkspaceCommandErrorCode {
+    EmptyPrompt,
+    ProjectNotFound,
+    ChatNotFound,
+    FreshMainUnavailable,
+    SetupAlreadyRunning,
+    CreationFailed,
+    StorageUnavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct ChatWorkspaceCommandError {
+    pub code: ChatWorkspaceCommandErrorCode,
+    pub message: String,
+}
+
+impl From<ChatWorkspaceError> for ChatWorkspaceCommandError {
+    fn from(error: ChatWorkspaceError) -> Self {
+        match error {
+            ChatWorkspaceError::EmptyPrompt => Self {
+                code: ChatWorkspaceCommandErrorCode::EmptyPrompt,
+                message: "Write a message before starting the chat.".into(),
+            },
+            ChatWorkspaceError::Inbox(ProjectInboxError::ProjectNotFound { .. }) => Self {
+                code: ChatWorkspaceCommandErrorCode::ProjectNotFound,
+                message: "That project is no longer in Più.".into(),
+            },
+            ChatWorkspaceError::Inbox(ProjectInboxError::ChatNotFound { .. }) => Self {
+                code: ChatWorkspaceCommandErrorCode::ChatNotFound,
+                message: "That chat is no longer in Più.".into(),
+            },
+            ChatWorkspaceError::FreshMain(_) => Self {
+                code: ChatWorkspaceCommandErrorCode::FreshMainUnavailable,
+                message:
+                    "Più couldn’t fetch a fresh origin/main. Check remote access and try again."
+                        .into(),
+            },
+            ChatWorkspaceError::SetupAlreadyRunning => Self {
+                code: ChatWorkspaceCommandErrorCode::SetupAlreadyRunning,
+                message: "Setup is already running for this chat.".into(),
+            },
+            ChatWorkspaceError::WorktreeStorage(_)
+            | ChatWorkspaceError::Inbox(ProjectInboxError::AppData(_))
+            | ChatWorkspaceError::Inbox(ProjectInboxError::Database(_))
+            | ChatWorkspaceError::Inbox(ProjectInboxError::DatabaseLock)
+            | ChatWorkspaceError::Inbox(ProjectInboxError::SystemClock) => Self {
+                code: ChatWorkspaceCommandErrorCode::StorageUnavailable,
+                message: "Più couldn’t save this chat. Try again.".into(),
+            },
+            ChatWorkspaceError::Git(_)
+            | ChatWorkspaceError::InvalidOwnership
+            | ChatWorkspaceError::Reconciliation(_)
+            | ChatWorkspaceError::Interrupted(_)
+            | ChatWorkspaceError::SetupSupervisor(_)
+            | ChatWorkspaceError::Inbox(_) => Self {
+                code: ChatWorkspaceCommandErrorCode::CreationFailed,
+                message: "Più couldn’t prepare this chat. Your repository was not changed.".into(),
+            },
+        }
+    }
 }
 
 impl From<ProjectInboxError> for ProjectCommandError {
@@ -98,6 +195,10 @@ impl From<ProjectInboxError> for ProjectCommandError {
                 code: ProjectCommandErrorCode::ProjectNotFound,
                 message: "That project is no longer in Più.".into(),
             },
+            ProjectInboxError::ChatNotFound { .. } => Self {
+                code: ProjectCommandErrorCode::ChatNotFound,
+                message: "That chat is no longer in Più.".into(),
+            },
             ProjectInboxError::GitProcess(_) => Self {
                 code: ProjectCommandErrorCode::RepositoryInspectionFailed,
                 message: "Più couldn’t inspect that repository. Try again.".into(),
@@ -117,7 +218,7 @@ impl From<ProjectInboxError> for ProjectCommandError {
 pub async fn load_project_inbox(
     core: State<'_, ApplicationCore>,
 ) -> Result<InboxSnapshot, ProjectCommandError> {
-    load_project_inbox_from(core.project_inbox()).await
+    load_project_inbox_from(core.project_inbox(), Some(core.chat_workspaces())).await
 }
 
 #[tauri::command]
@@ -172,10 +273,128 @@ pub async fn remove_project<R: Runtime>(
     Ok(snapshot)
 }
 
+#[tauri::command]
+pub async fn create_chat<R: Runtime>(
+    app: AppHandle<R>,
+    core: State<'_, ApplicationCore>,
+    request: CreateChatRequest,
+) -> Result<CreateChatResponse, ChatWorkspaceCommandError> {
+    let workspaces = core.chat_workspaces();
+    let setup_workspaces = Arc::clone(&workspaces);
+    let CreatedChat { chat, snapshot } = blocking_chat_operation(move || {
+        workspaces.create_chat(request.project_id, &request.prompt)
+    })
+    .await?;
+    let chat_id = chat.id.clone();
+
+    let setup_app = app.clone();
+    let on_change = Arc::new(move |event: ChatSetupChangedEvent| {
+        if let Err(error) = setup_app.emit(CHAT_SETUP_CHANGED_EVENT, event) {
+            tracing::warn!(%error, "could not emit setup change");
+        }
+    });
+    let setup_chat_id = chat_id.clone();
+    if let Err(error) =
+        blocking_chat_operation(move || setup_workspaces.start_setup(&setup_chat_id, on_change))
+            .await
+    {
+        tracing::warn!(?error, %chat_id, "could not start chat setup");
+    }
+
+    let latest_snapshot = {
+        let inbox = core.project_inbox();
+        blocking_project_operation(move || inbox.snapshot())
+            .await
+            .unwrap_or(snapshot)
+    };
+    let latest_chat = latest_snapshot
+        .chats
+        .iter()
+        .find(|candidate| candidate.id == chat_id)
+        .cloned()
+        .unwrap_or(chat);
+    let response = CreateChatResponse {
+        chat: latest_chat,
+        snapshot: latest_snapshot,
+    };
+    emit_change(
+        &app,
+        ProjectInboxChangedEvent {
+            snapshot: response.snapshot.clone(),
+            focused_project_id: response.chat.project_id,
+        },
+    )
+    .map_err(|error| ChatWorkspaceCommandError {
+        code: ChatWorkspaceCommandErrorCode::StorageUnavailable,
+        message: error.message,
+    })?;
+    Ok(response)
+}
+
+#[tauri::command]
+pub async fn retry_chat_setup<R: Runtime>(
+    app: AppHandle<R>,
+    core: State<'_, ApplicationCore>,
+    request: ChatIdRequest,
+) -> Result<crate::project_inbox::ChatSetupSummary, ChatWorkspaceCommandError> {
+    let setup_app = app.clone();
+    let on_change = Arc::new(move |event: ChatSetupChangedEvent| {
+        if let Err(error) = setup_app.emit(CHAT_SETUP_CHANGED_EVENT, event) {
+            tracing::warn!(%error, "could not emit retried setup change");
+        }
+    });
+    let workspaces = core.chat_workspaces();
+    blocking_chat_operation(move || workspaces.start_setup(&request.chat_id, on_change)).await
+}
+
+#[tauri::command]
+pub async fn cancel_chat_setup(
+    core: State<'_, ApplicationCore>,
+    request: ChatIdRequest,
+) -> Result<(), ChatWorkspaceCommandError> {
+    core.chat_workspaces()
+        .cancel_setup(&request.chat_id)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn open_chat_terminal<R: Runtime>(
+    app: AppHandle<R>,
+    core: State<'_, ApplicationCore>,
+    request: ChatIdRequest,
+) -> Result<ChatTerminalRequest, ChatWorkspaceCommandError> {
+    let workspaces = core.chat_workspaces();
+    let request =
+        blocking_chat_operation(move || workspaces.terminal_request(&request.chat_id)).await?;
+    app.emit(CHAT_TERMINAL_REQUESTED_EVENT, &request)
+        .map_err(|_| ChatWorkspaceCommandError {
+            code: ChatWorkspaceCommandErrorCode::StorageUnavailable,
+            message: "Più couldn’t open the chat terminal. Try again.".into(),
+        })?;
+    Ok(request)
+}
+
 async fn load_project_inbox_from(
     inbox: Arc<crate::project_inbox::ProjectInbox>,
+    workspaces: Option<Arc<crate::chat_workspaces::ChatWorkspaces>>,
 ) -> Result<InboxSnapshot, ProjectCommandError> {
-    blocking_project_operation(move || inbox.snapshot()).await
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(workspaces) = workspaces {
+            workspaces
+                .reconcile_once()
+                .map_err(ChatWorkspaceCommandError::from)
+                .map_err(|error| ProjectCommandError {
+                    code: ProjectCommandErrorCode::StorageUnavailable,
+                    message: error.message,
+                })?;
+        }
+        inbox.snapshot().map_err(Into::into)
+    })
+    .await
+    .map_err(|_| ProjectCommandError {
+        code: ProjectCommandErrorCode::StorageUnavailable,
+        message: "Più couldn’t load the inbox. Try again.".into(),
+    })?
 }
 
 async fn blocking_project_operation<T>(
@@ -189,6 +408,21 @@ where
         .map_err(|_| ProjectCommandError {
             code: ProjectCommandErrorCode::StorageUnavailable,
             message: "Più couldn’t finish this operation. Try again.".into(),
+        })?
+        .map_err(Into::into)
+}
+
+async fn blocking_chat_operation<T>(
+    operation: impl FnOnce() -> Result<T, ChatWorkspaceError> + Send + 'static,
+) -> Result<T, ChatWorkspaceCommandError>
+where
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|_| ChatWorkspaceCommandError {
+            code: ChatWorkspaceCommandErrorCode::CreationFailed,
+            message: "Più couldn’t finish creating this chat. Try again.".into(),
         })?
         .map_err(Into::into)
 }
@@ -277,7 +511,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut operation = Box::pin(super::load_project_inbox_from(inbox));
+        let mut operation = Box::pin(super::load_project_inbox_from(inbox, None));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
         let started = Instant::now();
