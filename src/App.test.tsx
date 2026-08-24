@@ -158,6 +158,8 @@ test("the empty inbox action is keyboard reachable", async () => {
   expect(await screen.findByRole("heading", { name: "Open a repository to start" })).toBeVisible();
   const action = screen.getByRole("button", { name: "Open Repository" });
   await user.tab();
+  await user.tab();
+  await user.tab();
   expect(action).toHaveFocus();
   await user.keyboard("{Enter}");
   expect(openRepository).toHaveBeenCalledOnce();
