@@ -275,7 +275,31 @@ impl ProjectInbox {
                 .map_err(DatabaseError::Query)
                 .map_err(ProjectInboxError::Database)?;
             let (project_id, outcome) = match existing_id {
-                Some(project_id) => (project_id, OpenRepositoryOutcome::FocusedExisting),
+                Some(project_id) => {
+                    transaction
+                        .execute(
+                            "UPDATE projects SET
+                                 root_device = ?1,
+                                 root_inode = ?2,
+                                 git_dir_path = ?3,
+                                 git_dir_device = ?4,
+                                 git_dir_inode = ?5,
+                                 name = ?6
+                             WHERE id = ?7",
+                            params![
+                                &identity.root_device,
+                                &identity.root_inode,
+                                &git_dir_path,
+                                &identity.git_dir_device,
+                                &identity.git_dir_inode,
+                                &name,
+                                project_id,
+                            ],
+                        )
+                        .map_err(DatabaseError::Query)
+                        .map_err(ProjectInboxError::Database)?;
+                    (project_id, OpenRepositoryOutcome::FocusedExisting)
+                }
                 None => {
                     transaction
                         .execute(
@@ -404,7 +428,54 @@ impl ProjectInbox {
 
     pub fn snapshot(&self) -> Result<InboxSnapshot, ProjectInboxError> {
         let stored = self.with_database(|database| load_stored_snapshot(database.connection()))?;
-        Ok(stored.materialize(self.repository_inspector.as_ref()))
+        let materialized = stored.materialize(self.repository_inspector.as_ref());
+        if !materialized.identity_backfills.is_empty() {
+            self.persist_identity_backfills(&materialized.identity_backfills)?;
+        }
+        Ok(materialized.snapshot)
+    }
+
+    fn persist_identity_backfills(
+        &self,
+        backfills: &[RepositoryIdentityBackfill],
+    ) -> Result<(), ProjectInboxError> {
+        self.with_database(|database| {
+            let transaction = database
+                .connection_mut()
+                .transaction()
+                .map_err(DatabaseError::Query)?;
+            for backfill in backfills {
+                let identity = &backfill.identity;
+                transaction
+                    .execute(
+                        "UPDATE projects SET
+                             root_device = ?1,
+                             root_inode = ?2,
+                             git_dir_path = ?3,
+                             git_dir_device = ?4,
+                             git_dir_inode = ?5
+                         WHERE id = ?6
+                           AND canonical_path = ?7
+                           AND (
+                               root_device IS NULL OR root_inode IS NULL OR
+                               git_dir_path IS NULL OR git_dir_device IS NULL OR
+                               git_dir_inode IS NULL
+                           )",
+                        params![
+                            identity.root_device,
+                            identity.root_inode,
+                            identity.git_dir_path.to_string_lossy(),
+                            identity.git_dir_device,
+                            identity.git_dir_inode,
+                            backfill.project_id,
+                            identity.canonical_path.to_string_lossy(),
+                        ],
+                    )
+                    .map_err(DatabaseError::Query)?;
+            }
+            transaction.commit().map_err(DatabaseError::Query)?;
+            Ok(())
+        })
     }
 
     fn with_database<T>(
@@ -467,7 +538,8 @@ fn require_project(
 
 struct StoredProject {
     id: i64,
-    identity: RepositoryIdentity,
+    canonical_path: PathBuf,
+    identity: Option<RepositoryIdentity>,
     name: String,
     unmerged_chat_count: u32,
 }
@@ -478,22 +550,57 @@ struct StoredInboxSnapshot {
     chats: Vec<ChatSummary>,
 }
 
+struct RepositoryIdentityBackfill {
+    project_id: i64,
+    identity: RepositoryIdentity,
+}
+
+struct MaterializedInboxSnapshot {
+    snapshot: InboxSnapshot,
+    identity_backfills: Vec<RepositoryIdentityBackfill>,
+}
+
 impl StoredInboxSnapshot {
-    fn materialize(self, inspector: &dyn RepositoryInspector) -> InboxSnapshot {
+    fn materialize(self, inspector: &dyn RepositoryInspector) -> MaterializedInboxSnapshot {
+        let mut identity_backfills = Vec::new();
         let projects = self
             .projects
             .into_iter()
-            .map(|stored| ProjectSummary {
-                id: stored.id,
-                availability: repository_availability(inspector, &stored.identity),
-                name: stored.name,
-                unmerged_chat_count: stored.unmerged_chat_count,
+            .map(|stored| {
+                let availability = match stored.identity {
+                    Some(identity) => repository_availability(inspector, &identity),
+                    None => match inspector.inspect(&stored.canonical_path) {
+                        Ok(identity) if identity.canonical_path == stored.canonical_path => {
+                            identity_backfills.push(RepositoryIdentityBackfill {
+                                project_id: stored.id,
+                                identity,
+                            });
+                            ProjectAvailability::Available
+                        }
+                        Ok(_) | Err(RepositoryInspectionError::Missing) => {
+                            ProjectAvailability::Missing
+                        }
+                        Err(
+                            RepositoryInspectionError::Inaccessible
+                            | RepositoryInspectionError::Git(_),
+                        ) => ProjectAvailability::Inaccessible,
+                    },
+                };
+                ProjectSummary {
+                    id: stored.id,
+                    availability,
+                    name: stored.name,
+                    unmerged_chat_count: stored.unmerged_chat_count,
+                }
             })
             .collect();
-        InboxSnapshot {
-            projects,
-            drafts: self.drafts,
-            chats: self.chats,
+        MaterializedInboxSnapshot {
+            snapshot: InboxSnapshot {
+                projects,
+                drafts: self.drafts,
+                chats: self.chats,
+            },
+            identity_backfills,
         }
     }
 }
@@ -514,17 +621,39 @@ fn load_stored_snapshot(connection: &Connection) -> Result<StoredInboxSnapshot, 
     let project_rows = project_statement
         .query_map([], |row| {
             let canonical_path: String = row.get(1)?;
-            let git_dir_path: String = row.get(4)?;
+            let root_device: Option<String> = row.get(2)?;
+            let root_inode: Option<String> = row.get(3)?;
+            let git_dir_path: Option<String> = row.get(4)?;
+            let git_dir_device: Option<String> = row.get(5)?;
+            let git_dir_inode: Option<String> = row.get(6)?;
+            let canonical_path = PathBuf::from(canonical_path);
+            let identity = match (
+                root_device,
+                root_inode,
+                git_dir_path,
+                git_dir_device,
+                git_dir_inode,
+            ) {
+                (
+                    Some(root_device),
+                    Some(root_inode),
+                    Some(git_dir_path),
+                    Some(git_dir_device),
+                    Some(git_dir_inode),
+                ) => Some(RepositoryIdentity {
+                    canonical_path: canonical_path.clone(),
+                    root_device,
+                    root_inode,
+                    git_dir_path: PathBuf::from(git_dir_path),
+                    git_dir_device,
+                    git_dir_inode,
+                }),
+                _ => None,
+            };
             Ok(StoredProject {
                 id: row.get(0)?,
-                identity: RepositoryIdentity {
-                    canonical_path: PathBuf::from(canonical_path),
-                    root_device: row.get(2)?,
-                    root_inode: row.get(3)?,
-                    git_dir_path: PathBuf::from(git_dir_path),
-                    git_dir_device: row.get(5)?,
-                    git_dir_inode: row.get(6)?,
-                },
+                canonical_path,
+                identity,
                 name: row.get(7)?,
                 unmerged_chat_count: row.get(8)?,
             })
