@@ -2191,26 +2191,17 @@ impl ModelAssetManager {
     }
 
     /// Recovery callers enter through `blocking_phase`, so waiting here never
-    /// occupies an asynchronous executor thread. Publishing while the guard is
-    /// held removes the retry capability for the exact mutation interval.
+    /// occupies an asynchronous executor thread.
     fn serialize_recovery<T>(
         &self,
         operation: impl FnOnce() -> Result<T, ModelAssetError>,
     ) -> Result<T, ModelAssetError> {
-        let guard = self
+        let _guard = self
             .0
             .recovery_serialization
             .lock()
             .expect("model asset recovery lock");
-        if self.0.recovery_required.load(Ordering::Acquire) {
-            self.publish(self.status());
-        }
-        let result = operation();
-        drop(guard);
-        if result.is_err() && self.0.recovery_required.load(Ordering::Acquire) {
-            self.publish(self.status());
-        }
-        result
+        operation()
     }
 
     fn require_recovery(
@@ -3231,13 +3222,7 @@ impl ModelAssetManager {
             return Vec::new();
         }
         if self.0.recovery_required.load(Ordering::Acquire) {
-            return self
-                .0
-                .recovery_serialization
-                .try_lock()
-                .ok()
-                .map(|_| vec![ModelAssetAction::RetryRecovery])
-                .unwrap_or_default();
+            return vec![ModelAssetAction::RetryRecovery];
         }
         if let Some(active) = self
             .0
@@ -4186,6 +4171,7 @@ mod tests {
     struct ContendedRecoveryDisk {
         gate: BlockingFixture,
         armed: AtomicBool,
+        fail_armed_call: AtomicBool,
         calls: AtomicU64,
         in_flight: AtomicU64,
         max_in_flight: AtomicU64,
@@ -4193,8 +4179,17 @@ mod tests {
 
     impl ContendedRecoveryDisk {
         fn arm(&self) {
+            self.arm_with_failure(false);
+        }
+
+        fn arm_failure(&self) {
+            self.arm_with_failure(true);
+        }
+
+        fn arm_with_failure(&self, fail: bool) {
             self.calls.store(0, Ordering::Release);
             self.max_in_flight.store(0, Ordering::Release);
+            self.fail_armed_call.store(fail, Ordering::Release);
             self.armed.store(true, Ordering::Release);
         }
 
@@ -4208,10 +4203,16 @@ mod tests {
             self.calls.fetch_add(1, Ordering::AcqRel);
             let in_flight = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
             self.max_in_flight.fetch_max(in_flight, Ordering::AcqRel);
-            if self.armed.swap(false, Ordering::AcqRel) {
+            let armed = self.armed.swap(false, Ordering::AcqRel);
+            if armed {
                 self.gate.wait();
             }
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            if armed && self.fail_armed_call.swap(false, Ordering::AcqRel) {
+                return Err(ModelAssetError::Unavailable(
+                    "injected first recovery capacity failure".into(),
+                ));
+            }
             Ok(u64::MAX)
         }
     }
@@ -6264,9 +6265,9 @@ mod tests {
         assert!(!manager.0.recovery_required.load(Ordering::Acquire));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_recovery_retries_serialize_and_coalesce_to_one_safe_outcome() {
-        let bytes = b"serialized recovery fixture".to_vec();
+    async fn contended_recovery_manager(
+        bytes: Vec<u8>,
+    ) -> (TempDir, Arc<ContendedRecoveryDisk>, ModelAssetManager) {
         let fixture = Fixture::start(bytes.clone()).await;
         let temporary = TempDir::new().expect("temporary model root");
         let manifest = fixture_manifest(&bytes);
@@ -6292,12 +6293,22 @@ mod tests {
             manager.status().available_actions,
             vec![ModelAssetAction::RetryRecovery]
         );
+        (temporary, disk, manager)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_recovery_retries_serialize_and_coalesce_to_one_safe_outcome() {
+        let (_temporary, disk, manager) =
+            contended_recovery_manager(b"serialized recovery fixture".to_vec()).await;
 
         disk.arm();
         let first_manager = manager.clone();
         let first = tokio::spawn(async move { first_manager.retry_recovery().await });
         wait_for_blocking_fixture(&disk.gate).await;
-        assert!(manager.status().available_actions.is_empty());
+        assert_eq!(
+            manager.status().available_actions,
+            vec![ModelAssetAction::RetryRecovery]
+        );
 
         let second_manager = manager.clone();
         let mut second = tokio::spawn(async move { second_manager.retry_recovery().await });
@@ -6310,7 +6321,10 @@ mod tests {
         assert_async_executor_yields().await;
         assert_eq!(disk.max_in_flight.load(Ordering::Acquire), 1);
         assert_eq!(disk.calls.load(Ordering::Acquire), 1);
-        assert!(manager.status().available_actions.is_empty());
+        assert_eq!(
+            manager.status().available_actions,
+            vec![ModelAssetAction::RetryRecovery]
+        );
 
         disk.release();
         let first_status = first
@@ -6336,6 +6350,50 @@ mod tests {
         );
         assert_eq!(disk.max_in_flight.load(Ordering::Acquire), 1);
         assert_eq!(disk.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_retry_success_cannot_be_overwritten_by_the_preceding_failure() {
+        let (_temporary, disk, manager) =
+            contended_recovery_manager(b"ordered recovery fixture".to_vec()).await;
+        disk.arm_failure();
+
+        let first_manager = manager.clone();
+        let first = tokio::spawn(async move { first_manager.retry_recovery().await });
+        wait_for_blocking_fixture(&disk.gate).await;
+        let second_manager = manager.clone();
+        let mut second = tokio::spawn(async move { second_manager.retry_recovery().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "the successful retry must queue behind the failing journal mutation"
+        );
+        assert_eq!(
+            manager.status().available_actions,
+            vec![ModelAssetAction::RetryRecovery]
+        );
+
+        disk.release();
+        assert!(matches!(
+            first.await.expect("failing retry task"),
+            Err(ModelAssetError::Unavailable(message))
+                if message == "injected first recovery capacity failure"
+        ));
+        let recovered = second
+            .await
+            .expect("successful retry task")
+            .expect("queued recovery result");
+        assert_eq!(recovered.phase, ModelAssetPhase::Missing);
+        assert_eq!(
+            recovered.available_actions,
+            vec![ModelAssetAction::Download]
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(manager.status(), recovered);
+        assert!(!manager.0.recovery_required.load(Ordering::Acquire));
+        assert_eq!(disk.max_in_flight.load(Ordering::Acquire), 1);
+        assert_eq!(disk.calls.load(Ordering::Acquire), 2);
     }
 
     #[cfg(unix)]
