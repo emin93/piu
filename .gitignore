@@ -6,6 +6,7 @@
 node_modules/
 dist/
 coverage/
+src-tauri/gen/
 src-tauri/target/
 
 work/
