@@ -39,6 +39,7 @@ const missing: ModelAssetStatus = {
   currentFile: null,
   operationId: null,
   authenticationConfigured: false,
+  canCancel: false,
   canResume: false,
   errorCode: null,
   message: null,
@@ -138,11 +139,50 @@ test("an active removal closes confirmation and remains cancellable", async () =
     transferredBytes: missing.totalBytes,
     remainingBytes: 0,
     operationId: 2,
+    canCancel: true,
   });
   const cancel = await screen.findByRole("button", { name: "Cancel removal" });
   expect(cancel).toBeEnabled();
   await user.click(cancel);
   expect(assets.cancel).toHaveBeenCalledOnce();
+
+  assets.listener?.({
+    ...missing,
+    phase: "removing",
+    transferredBytes: missing.totalBytes,
+    remainingBytes: 0,
+    operationId: 2,
+    canCancel: false,
+    message: "Finalizing removal. Più will finish this safely.",
+  });
+  await waitFor(() =>
+    expect(screen.queryByRole("button", { name: "Cancel removal" })).not.toBeInTheDocument(),
+  );
+  expect(screen.getByText("Finalizing removal. Più will finish this safely.")).toBeVisible();
+});
+
+test("a rejected stale cancel refreshes the committed removal state", async () => {
+  const removing = {
+    ...missing,
+    phase: "removing" as const,
+    operationId: 2,
+    canCancel: true,
+  };
+  assets.status.mockResolvedValueOnce(removing).mockResolvedValueOnce({
+    ...removing,
+    canCancel: false,
+    message: "Finalizing removal. Più will finish this safely.",
+  });
+  assets.cancel.mockResolvedValue(false);
+  const user = userEvent.setup();
+  render(<ModelResourcePanel context="settings" />);
+
+  await user.click(await screen.findByRole("button", { name: "Cancel removal" }));
+
+  await waitFor(() =>
+    expect(screen.queryByRole("button", { name: "Cancel removal" })).not.toBeInTheDocument(),
+  );
+  expect(assets.status).toHaveBeenCalledTimes(2);
 });
 
 test("the removal dialog traps keyboard focus with the safe action first", async () => {
@@ -209,11 +249,32 @@ test("revision mismatch offers ownership-safe graphical reset and then the pinne
   const user = userEvent.setup();
   render(<ModelResourcePanel context="settings" />);
 
-  await user.click(await screen.findByRole("button", { name: "Remove old model" }));
+  expect(
+    await screen.findByText(
+      "An older Più model revision is installed. Remove it here, then download the pinned revision.",
+    ),
+  ).toBeVisible();
+  expect(screen.queryByText(/manually/i)).not.toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: "Remove old model" }));
   await user.click(screen.getByRole("button", { name: "Confirm removal" }));
 
   expect(assets.remove).toHaveBeenCalledOnce();
   expect(await screen.findByRole("button", { name: "Download model" })).toBeVisible();
+});
+
+test("unsupported ownership fails closed without offering an operation", async () => {
+  assets.status.mockResolvedValue({
+    ...missing,
+    phase: "failed",
+    errorCode: "ownership",
+    message: "Existing model assets are not owned by this Più manifest and were left untouched.",
+  });
+  render(<ModelResourcePanel context="settings" />);
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("were left untouched");
+  expect(screen.queryByRole("button", { name: /download model/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /remove/i })).not.toBeInTheDocument();
 });
 
 test("the build-time QA gallery cannot invoke production model IPC", async () => {

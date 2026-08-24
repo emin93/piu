@@ -19,6 +19,7 @@ const base: ModelAssetStatus = {
   currentFile: null,
   operationId: null,
   authenticationConfigured: false,
+  canCancel: false,
   canResume: false,
   errorCode: null,
   message: null,
@@ -36,6 +37,7 @@ const states: Array<{ label: string; status: ModelAssetStatus }> = [
       currentAsset: "target",
       currentFile: "target/model-00002-of-00003.safetensors",
       operationId: 7,
+      canCancel: true,
       canResume: true,
     },
   },
@@ -50,6 +52,7 @@ const states: Array<{ label: string; status: ModelAssetStatus }> = [
       currentAsset: "drafter",
       currentFile: "drafter/model.safetensors",
       operationId: 7,
+      canCancel: true,
       canResume: true,
     },
   },
@@ -101,8 +104,7 @@ const states: Array<{ label: string; status: ModelAssetStatus }> = [
       ...base,
       phase: "revisionMismatch",
       errorCode: "revisionMismatch",
-      message:
-        "An older Più revision is installed. Remove its verified owned files to install the pinned revision.",
+      message: null,
     },
   },
 ];

@@ -5,7 +5,7 @@ use std::{
     io::{self, Read as _},
     path::{Component, Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -21,11 +21,7 @@ use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::{
-    fs::File,
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::watch,
-};
+use tokio::{fs::File, io::AsyncWriteExt, sync::watch};
 use tokio_util::sync::CancellationToken;
 use ts_rs::TS;
 
@@ -220,6 +216,7 @@ impl Default for NetworkTimeouts {
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../src/generated/")]
 pub enum ModelAssetPhase {
+    Initializing,
     Missing,
     Downloading,
     Verifying,
@@ -269,6 +266,7 @@ pub struct ModelAssetStatus {
     #[ts(type = "number | null")]
     pub operation_id: Option<u64>,
     pub authentication_configured: bool,
+    pub can_cancel: bool,
     pub can_resume: bool,
     pub error_code: Option<ModelAssetErrorCode>,
     pub message: Option<String>,
@@ -291,6 +289,7 @@ impl ModelAssetStatus {
             current_file: None,
             operation_id: None,
             authentication_configured,
+            can_cancel: false,
             can_resume: false,
             error_code: None,
             message: None,
@@ -313,7 +312,7 @@ pub enum ModelAssetError {
     #[error("Hugging Face rejected that token. Check it and try again.")]
     Authentication,
     #[error("could not reach Hugging Face: {0}")]
-    Network(#[from] reqwest::Error),
+    Network(String),
     #[error("Hugging Face timed out while waiting for {0}")]
     NetworkTimeout(&'static str),
     #[error("download was cancelled")]
@@ -323,7 +322,7 @@ pub enum ModelAssetError {
     #[error("model assets are not owned by this Più manifest and were left untouched")]
     NotOwned,
     #[error(
-        "model asset revision differs from the pinned Più revision; remove it manually before downloading"
+        "An older Più model revision is installed. Remove it here, then download the pinned revision."
     )]
     RevisionMismatch,
     #[error("download response for {0} did not support safe resumption")]
@@ -368,6 +367,23 @@ impl ModelAssetError {
             | Self::OperationInProgress => ModelAssetErrorCode::Storage,
             Self::Manifest(_) => ModelAssetErrorCode::Manifest,
         }
+    }
+}
+
+impl From<reqwest::Error> for ModelAssetError {
+    fn from(error: reqwest::Error) -> Self {
+        let message = if let Some(status) = error.status() {
+            format!("Hugging Face returned HTTP {status}")
+        } else if error.is_timeout() {
+            "the request timed out".into()
+        } else if error.is_connect() {
+            "the connection failed".into()
+        } else if error.is_redirect() {
+            "the download redirect could not be followed".into()
+        } else {
+            "the request failed".into()
+        };
+        Self::Network(message)
     }
 }
 
@@ -442,6 +458,7 @@ struct ActiveOperation {
     operation_id: u64,
     cancellation: CancellationToken,
     kind: OperationKind,
+    can_cancel: bool,
 }
 
 struct TransferProgress {
@@ -713,13 +730,13 @@ impl SafeStorage {
         Ok((directory, name))
     }
 
-    fn open_read(&self, relative: &Path) -> io::Result<File> {
+    fn open_read(&self, relative: &Path) -> io::Result<StdFile> {
         let (directory, name) = self.parent_and_name(relative, false)?;
         let mut options = CapOpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         directory
             .open_with(name, &options)
-            .map(|file| File::from_std(file.into_std()))
+            .map(|file| file.into_std())
     }
 
     fn read_bounded(&self, relative: &Path, maximum_bytes: u64) -> io::Result<Vec<u8>> {
@@ -1099,6 +1116,11 @@ impl PrivateWrite {
             .await
     }
 
+    fn write_all_blocking(&mut self, bytes: &[u8]) -> io::Result<()> {
+        drop(self.output.take());
+        std::io::Write::write_all(&mut self.sync_handle, bytes)
+    }
+
     async fn publish(mut self) -> io::Result<()> {
         if let Some(mut output) = self.output.take() {
             output.flush().await?;
@@ -1117,6 +1139,16 @@ impl PrivateWrite {
         tokio::task::spawn_blocking(move || self.remove_unpublished_private_inode())
             .await
             .map_err(|error| io::Error::other(format!("private cleanup task failed: {error}")))?
+    }
+
+    fn discard_blocking(mut self) -> io::Result<()> {
+        drop(self.output.take());
+        self.remove_unpublished_private_inode()
+    }
+
+    fn publish_blocking(mut self) -> io::Result<()> {
+        drop(self.output.take());
+        self.publish_opened_inode()
     }
 
     fn publish_opened_inode(&mut self) -> io::Result<()> {
@@ -1186,7 +1218,7 @@ impl PrivateWrite {
 
 struct ModelAssetManagerInner {
     root: PathBuf,
-    storage: Option<SafeStorage>,
+    storage: OnceLock<SafeStorage>,
     manifest: AssetManifest,
     resolve_base_url: String,
     whoami_url: String,
@@ -1200,7 +1232,6 @@ struct ModelAssetManagerInner {
     invalid_finals: Mutex<HashSet<String>>,
     removal_persistence: Mutex<Arc<dyn RemovalPersistence>>,
     next_operation_id: AtomicU64,
-    initialization_error: Option<String>,
 }
 
 /// Owns the complete lifecycle of Più's one pinned local model resource set.
@@ -1217,7 +1248,7 @@ impl ModelAssetManager {
             "https://huggingface.co/{}/resolve/{}",
             manifest.repository, manifest.revision
         );
-        Self::new(
+        let manager = Self::new_uninitialized(
             app_data.to_path_buf(),
             PathBuf::from("models/qwen3.8-27b-uncensored-mlx"),
             manifest,
@@ -1225,7 +1256,13 @@ impl ModelAssetManager {
             "https://huggingface.co/api/whoami-v2".into(),
             Arc::new(KeychainCredentialStore),
             Arc::new(SystemDiskSpace),
-        )
+            NetworkTimeouts::default(),
+        )?;
+        manager.start_deferred_initialization(
+            app_data.to_path_buf(),
+            PathBuf::from("models/qwen3.8-27b-uncensored-mlx"),
+        );
+        Ok(manager)
     }
 
     pub fn production_or_unavailable(app_data: &Path) -> Self {
@@ -1240,7 +1277,7 @@ impl ModelAssetManager {
             let (status, _) = watch::channel(status);
             Self(Arc::new(ModelAssetManagerInner {
                 root,
-                storage: None,
+                storage: OnceLock::new(),
                 resolve_base_url: format!(
                     "https://huggingface.co/{}/resolve/{}",
                     manifest.repository, manifest.revision
@@ -1257,11 +1294,11 @@ impl ModelAssetManager {
                 invalid_finals: Mutex::new(HashSet::new()),
                 removal_persistence: Mutex::new(Arc::new(DurableRemovalPersistence)),
                 next_operation_id: AtomicU64::new(1),
-                initialization_error: Some(message),
             }))
         })
     }
 
+    #[cfg(test)]
     fn new(
         storage_anchor: PathBuf,
         storage_relative: PathBuf,
@@ -1283,6 +1320,7 @@ impl ModelAssetManager {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn new_with_timeouts(
         storage_anchor: PathBuf,
@@ -1294,23 +1332,43 @@ impl ModelAssetManager {
         disk_space: Arc<dyn DiskSpace>,
         network_timeouts: NetworkTimeouts,
     ) -> Result<Self, ModelAssetError> {
+        let manager = Self::new_uninitialized(
+            storage_anchor.clone(),
+            storage_relative.clone(),
+            manifest,
+            resolve_base_url,
+            whoami_url,
+            credentials,
+            disk_space,
+            network_timeouts,
+        )?;
+        let inspection = manager.initialize_storage(storage_anchor, storage_relative)?;
+        if inspection.requires_validation {
+            manager.start_background_validation();
+        }
+        Ok(manager)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_uninitialized(
+        storage_anchor: PathBuf,
+        storage_relative: PathBuf,
+        manifest: AssetManifest,
+        resolve_base_url: String,
+        whoami_url: String,
+        credentials: Arc<dyn CredentialStore>,
+        disk_space: Arc<dyn DiskSpace>,
+        network_timeouts: NetworkTimeouts,
+    ) -> Result<Self, ModelAssetError> {
         manifest.validate()?;
-        let root = storage_anchor.join(&storage_relative);
-        let storage = SafeStorage::open(storage_anchor, &storage_relative).map_err(|source| {
-            ModelAssetError::Storage {
-                path: root.clone(),
-                source,
-            }
-        })?;
-        Self::recover_staged_removals(&storage)?;
-        Self::recover_private_writes(&storage, &manifest)?;
-        let free_bytes = disk_space.available(&root)?;
-        let has_credentials = credentials.get()?.is_some();
-        let inspection = Self::inspect_install(&storage, &manifest, free_bytes, has_credentials)?;
-        let (status, _) = watch::channel(inspection.status);
-        let manager = Self(Arc::new(ModelAssetManagerInner {
+        let root = storage_anchor.join(storage_relative);
+        let mut initial_status = ModelAssetStatus::missing(&manifest, 0, false);
+        initial_status.phase = ModelAssetPhase::Initializing;
+        initial_status.message = Some("Checking local model resources.".into());
+        let (status, _) = watch::channel(initial_status);
+        Ok(Self(Arc::new(ModelAssetManagerInner {
             root,
-            storage: Some(storage),
+            storage: OnceLock::new(),
             manifest,
             resolve_base_url,
             whoami_url,
@@ -1328,12 +1386,73 @@ impl ModelAssetManager {
             invalid_finals: Mutex::new(HashSet::new()),
             removal_persistence: Mutex::new(Arc::new(DurableRemovalPersistence)),
             next_operation_id: AtomicU64::new(1),
-            initialization_error: None,
-        }));
-        if inspection.requires_validation {
-            manager.start_background_validation();
-        }
-        Ok(manager)
+        })))
+    }
+
+    fn initialize_storage(
+        &self,
+        storage_anchor: PathBuf,
+        storage_relative: PathBuf,
+    ) -> Result<InstallInspection, ModelAssetError> {
+        let storage = SafeStorage::open(storage_anchor, &storage_relative).map_err(|source| {
+            ModelAssetError::Storage {
+                path: self.0.root.clone(),
+                source,
+            }
+        })?;
+        Self::recover_staged_removals(&storage)?;
+        Self::recover_private_writes(&storage, &self.0.manifest)?;
+        let free_bytes = self.0.disk_space.available(&self.0.root)?;
+        let has_credentials = self.0.credentials.get()?.is_some();
+        let inspection =
+            Self::inspect_install(&storage, &self.0.manifest, free_bytes, has_credentials)?;
+        self.0
+            .storage
+            .set(storage)
+            .map_err(|_| ModelAssetError::Unavailable("model storage initialized twice".into()))?;
+        self.publish(inspection.status.clone());
+        Ok(inspection)
+    }
+
+    fn start_deferred_initialization(&self, storage_anchor: PathBuf, storage_relative: PathBuf) {
+        self.start_deferred_initialization_with_hook(storage_anchor, storage_relative, || {});
+    }
+
+    fn start_deferred_initialization_with_hook(
+        &self,
+        storage_anchor: PathBuf,
+        storage_relative: PathBuf,
+        before_recovery: impl FnOnce() + Send + 'static,
+    ) {
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let worker = manager.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                before_recovery();
+                worker.initialize_storage(storage_anchor, storage_relative)
+            })
+            .await
+            .map_err(|_| {
+                ModelAssetError::Unavailable("model resource initialization stopped".into())
+            })
+            .and_then(|result| result);
+            match result {
+                Ok(inspection) if inspection.requires_validation => {
+                    manager.start_background_validation();
+                }
+                Ok(_) => {}
+                Err(error) => manager.publish_initialization_failure(&error),
+            }
+        });
+    }
+
+    fn publish_initialization_failure(&self, error: &ModelAssetError) {
+        let mut status = self.status();
+        status.phase = ModelAssetPhase::Failed;
+        status.message = Some(error.to_string());
+        status.error_code = Some(error.code());
+        status.can_cancel = false;
+        self.publish(status);
     }
 
     fn recover_staged_removals(storage: &SafeStorage) -> Result<(), ModelAssetError> {
@@ -1780,16 +1899,26 @@ impl ModelAssetManager {
             operation_id,
             cancellation: cancellation.clone(),
             kind: OperationKind::Validation,
+            can_cancel: true,
         });
         let mut status = self.status();
         status.operation_id = Some(operation_id);
+        status.can_cancel = true;
         self.publish(status);
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
-            let result = manager
-                .validate_existing_install(operation_id, cancellation)
-                .await;
-            manager.finish_operation(operation_id, result);
+            let worker = manager.clone();
+            let result = blocking_phase(move || {
+                worker.validate_existing_install(operation_id, cancellation)
+            })
+            .await
+            .and_then(|result| result);
+            if let Err(error) = result {
+                let failure = manager.clone();
+                let _ =
+                    blocking_phase(move || failure.publish_operation_failure(operation_id, &error))
+                        .await;
+            }
         });
     }
 
@@ -1808,17 +1937,26 @@ impl ModelAssetManager {
         };
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
-            let result = manager.download_all(operation_id, cancellation).await;
-            manager.finish_operation(operation_id, result);
+            let recovery = manager.clone();
+            let result = blocking_phase(move || recovery.reconcile_download_recovery(operation_id))
+                .await
+                .and_then(|result| result);
+            let result = match result {
+                Ok(()) => manager.download_all(operation_id, cancellation).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                let failure = manager.clone();
+                let _ =
+                    blocking_phase(move || failure.publish_operation_failure(operation_id, &error))
+                        .await;
+            }
         });
         Ok(operation_id)
     }
 
     fn begin_download(&self) -> Result<(u64, Option<CancellationToken>), ModelAssetError> {
-        if let Some(error) = &self.0.initialization_error {
-            return Err(ModelAssetError::Unavailable(error.clone()));
-        }
-        self.reconcile_recovery_required()?;
+        self.ensure_initialized()?;
         let mut active = self.0.active.lock().expect("model asset operation lock");
         if let Some(active) = active.as_ref() {
             return if active.kind == OperationKind::Download {
@@ -1843,6 +1981,7 @@ impl ModelAssetManager {
             operation_id,
             cancellation: cancellation.clone(),
             kind: OperationKind::Download,
+            can_cancel: true,
         });
         drop(active);
         Ok((operation_id, Some(cancellation)))
@@ -1850,7 +1989,7 @@ impl ModelAssetManager {
 
     pub fn cancel_download(&self) -> bool {
         let active = self.0.active.lock().expect("model asset operation lock");
-        if let Some(active) = active.as_ref() {
+        if let Some(active) = active.as_ref().filter(|active| active.can_cancel) {
             active.cancellation.cancel();
             true
         } else {
@@ -1859,10 +1998,8 @@ impl ModelAssetManager {
     }
 
     pub async fn authorize_hugging_face(&self, token: String) -> Result<(), ModelAssetError> {
-        if let Some(error) = &self.0.initialization_error {
-            return Err(ModelAssetError::Unavailable(error.clone()));
-        }
-        let token = token.trim();
+        self.ensure_initialized()?;
+        let token = token.trim().to_owned();
         if token.is_empty() {
             return Err(ModelAssetError::Authentication);
         }
@@ -1871,7 +2008,7 @@ impl ModelAssetManager {
             self.0
                 .client
                 .get(&self.0.whoami_url)
-                .bearer_auth(token)
+                .bearer_auth(&token)
                 .send(),
         )
         .await
@@ -1883,7 +2020,8 @@ impl ModelAssetManager {
             return Err(ModelAssetError::Authentication);
         }
         response.error_for_status()?;
-        self.0.credentials.set(token)?;
+        let credentials = self.0.credentials.clone();
+        blocking_phase(move || credentials.set(&token)).await??;
         let mut status = self.status();
         status.authentication_configured = true;
         status.error_code = None;
@@ -1901,26 +2039,24 @@ impl ModelAssetManager {
 
     async fn remove_owned_assets_with_hook(
         &self,
-        after_verified: impl FnMut(&Path),
+        after_verified: impl FnMut(&Path) + Send + 'static,
     ) -> Result<ModelAssetStatus, ModelAssetError> {
-        if let Some(error) = &self.0.initialization_error {
-            return Err(ModelAssetError::Unavailable(error.clone()));
-        }
+        self.ensure_initialized()?;
+        let recovery_manager = self.clone();
+        blocking_phase(move || recovery_manager.reconcile_recovery_required()).await??;
         let (operation_id, cancellation) = self.begin_removal()?;
-        match self
-            .perform_owned_removal(operation_id, &cancellation, after_verified)
-            .await
-        {
-            Ok(status) => Ok(status),
-            Err(error) => {
-                self.publish_operation_failure(operation_id, &error);
-                Err(error)
+        let manager = self.clone();
+        blocking_phase(move || {
+            let result = manager.perform_owned_removal(operation_id, &cancellation, after_verified);
+            if let Err(error) = &result {
+                manager.publish_operation_failure(operation_id, error);
             }
-        }
+            result
+        })
+        .await?
     }
 
     fn begin_removal(&self) -> Result<(u64, CancellationToken), ModelAssetError> {
-        self.reconcile_recovery_required()?;
         let mut active = self.0.active.lock().expect("model asset operation lock");
         if active.is_some() {
             return Err(ModelAssetError::OperationInProgress);
@@ -1931,6 +2067,7 @@ impl ModelAssetManager {
             operation_id,
             cancellation: cancellation.clone(),
             kind: OperationKind::Removal,
+            can_cancel: true,
         });
         drop(active);
         let mut status = self.status();
@@ -1938,10 +2075,33 @@ impl ModelAssetManager {
         status.operation_id = Some(operation_id);
         status.current_asset = None;
         status.current_file = None;
+        status.can_cancel = true;
         status.error_code = None;
         status.message = Some("Verifying and removing Più-owned model assets.".into());
         self.publish(status);
         Ok((operation_id, cancellation))
+    }
+
+    fn commit_removal(
+        &self,
+        operation_id: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ModelAssetError> {
+        let mut active = self.0.active.lock().expect("model asset operation lock");
+        let Some(operation) = active.as_mut().filter(|operation| {
+            operation.operation_id == operation_id && operation.kind == OperationKind::Removal
+        }) else {
+            return Err(ModelAssetError::Cancelled);
+        };
+        ensure_not_cancelled(cancellation)?;
+        operation.can_cancel = false;
+        drop(active);
+
+        let mut status = self.status();
+        status.can_cancel = false;
+        status.message = Some("Finalizing removal. Più will finish this safely.".into());
+        self.publish(status);
+        Ok(())
     }
 
     fn reconcile_recovery_required(&self) -> Result<(), ModelAssetError> {
@@ -1963,6 +2123,39 @@ impl ModelAssetManager {
         if inspection.requires_validation {
             self.start_background_validation();
         }
+        Ok(())
+    }
+
+    fn reconcile_download_recovery(&self, operation_id: u64) -> Result<(), ModelAssetError> {
+        if !self.0.recovery_required.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Err(error) = Self::recover_staged_removals(self.storage())
+            .and_then(|()| Self::recover_private_writes(self.storage(), &self.0.manifest))
+        {
+            return Err(ModelAssetError::RecoveryRequired(error.to_string()));
+        }
+        let free = self.0.disk_space.available(&self.0.root)?;
+        let has_credentials = self.0.credentials.get()?.is_some();
+        let inspection =
+            Self::inspect_install(self.storage(), &self.0.manifest, free, has_credentials)?;
+        let active_matches = self
+            .0
+            .active
+            .lock()
+            .expect("model asset operation lock")
+            .as_ref()
+            .is_some_and(|active| active.operation_id == operation_id);
+        if !active_matches {
+            return Err(ModelAssetError::Cancelled);
+        }
+        self.0.recovery_required.store(false, Ordering::Release);
+        let mut status = inspection.status;
+        status.phase = ModelAssetPhase::Downloading;
+        status.operation_id = Some(operation_id);
+        status.can_cancel = true;
+        status.message = Some("Recovered model resources. Resuming the download.".into());
+        self.publish(status);
         Ok(())
     }
 
@@ -2026,7 +2219,7 @@ impl ModelAssetManager {
         ModelAssetError::RecoveryRequired(operation.to_string())
     }
 
-    async fn perform_owned_removal(
+    fn perform_owned_removal(
         &self,
         operation_id: u64,
         cancellation: &CancellationToken,
@@ -2093,14 +2286,11 @@ impl ModelAssetManager {
             staging_directory: staging_root.clone(),
             entries: recovery_entries,
         };
-        if let Err(error) = self
-            .write_json_atomic(
-                &staging_root.join(REMOVAL_RECOVERY_FILE),
-                &recovery_plan,
-                cancellation,
-            )
-            .await
-        {
+        if let Err(error) = self.write_json_atomic_blocking(
+            &staging_root.join(REMOVAL_RECOVERY_FILE),
+            &recovery_plan,
+            cancellation,
+        ) {
             return match Self::remove_abandoned_empty_staging(self.storage(), &staging_root) {
                 Ok(()) => Err(error),
                 Err(recovery) => Err(self.require_recovery(&error, &recovery)),
@@ -2155,7 +2345,6 @@ impl ModelAssetManager {
             }
             let hash_result = self
                 .sha256_relative_with_identity(&staged_path, cancellation)
-                .await
                 .map_err(|error| match error {
                     ModelAssetError::Cancelled => ModelAssetError::Cancelled,
                     _ => ModelAssetError::NotOwned,
@@ -2188,7 +2377,7 @@ impl ModelAssetManager {
             after_verified(relative);
         }
 
-        if let Err(error) = ensure_not_cancelled(cancellation) {
+        if let Err(error) = self.commit_removal(operation_id, cancellation) {
             return Err(self.rollback_or_require_recovery(&staging_root, &staged, error));
         }
         let staged_marker = staging_root.join("ownership-marker");
@@ -2252,14 +2441,11 @@ impl ModelAssetManager {
                 ));
             }
         }
-        if let Err(error) = self
-            .write_json_atomic(
-                &staging_root.join(REMOVAL_RECOVERY_FILE),
-                &recovery_plan,
-                cancellation,
-            )
-            .await
-        {
+        if let Err(error) = self.write_json_atomic_blocking(
+            &staging_root.join(REMOVAL_RECOVERY_FILE),
+            &recovery_plan,
+            cancellation,
+        ) {
             return Err(self.rollback_or_require_recovery(&staging_root, &staged, error));
         }
         if let Err(source) = self.removal_persistence().commit_journal(
@@ -2397,11 +2583,18 @@ impl ModelAssetManager {
         operation_id: u64,
         cancellation: CancellationToken,
     ) -> Result<(), ModelAssetError> {
-        let transferred = self.transferred_bytes();
-        let (free, remaining, required) = self.ensure_space(transferred)?;
+        let sampler = self.clone();
+        let (transferred, free, remaining, required) = blocking_phase(move || {
+            let transferred = sampler.transferred_bytes();
+            sampler
+                .ensure_space(transferred)
+                .map(|(free, remaining, required)| (transferred, free, remaining, required))
+        })
+        .await??;
         let mut status = self.status();
         status.phase = ModelAssetPhase::Downloading;
         status.operation_id = Some(operation_id);
+        status.can_cancel = true;
         status.transferred_bytes = transferred;
         status.remaining_bytes = remaining;
         status.current_free_bytes = free;
@@ -2415,17 +2608,29 @@ impl ModelAssetManager {
             if cancellation.is_cancelled() {
                 return Err(ModelAssetError::Cancelled);
             }
-            if self
-                .final_is_valid(file, operation_id, &cancellation)
-                .await?
+            let validator = self.clone();
+            let file_for_validation = file.clone();
+            let validation_cancellation = cancellation.clone();
+            if blocking_phase(move || {
+                validator.final_is_valid(
+                    &file_for_validation,
+                    operation_id,
+                    &validation_cancellation,
+                )
+            })
+            .await??
             {
                 continue;
             }
             // Hash validation may have removed a same-size corrupt final after the
             // optimistic startup sample. Recompute the gate before allocating its
             // replacement so stale bytes can never hide the actual space requirement.
-            let transferred = self.transferred_bytes();
-            let (free, remaining, required) = self.ensure_space(transferred)?;
+            let sampler = self.clone();
+            let (free, remaining, required) = blocking_phase(move || {
+                let transferred = sampler.transferred_bytes();
+                sampler.ensure_space(transferred)
+            })
+            .await??;
             let mut status = self.status();
             status.current_free_bytes = free;
             status.remaining_bytes = remaining;
@@ -2457,7 +2662,7 @@ impl ModelAssetManager {
         Ok((free, remaining, required))
     }
 
-    async fn validate_existing_install(
+    fn validate_existing_install(
         &self,
         operation_id: u64,
         cancellation: CancellationToken,
@@ -2471,10 +2676,7 @@ impl ModelAssetManager {
             status.current_file = Some(file.install_path.clone());
             status.current_free_bytes = self.0.disk_space.available(&self.0.root)?;
             self.publish(status);
-            match self
-                .sha256_relative(Path::new(&file.install_path), &cancellation)
-                .await
-            {
+            match self.sha256_relative(Path::new(&file.install_path), &cancellation) {
                 Ok(hash) if hash == file.sha256 => {}
                 Err(ModelAssetError::Cancelled) => return Err(ModelAssetError::Cancelled),
                 result => {
@@ -2514,10 +2716,10 @@ impl ModelAssetManager {
         status.current_asset = None;
         status.current_file = None;
         status.operation_id = None;
+        status.can_cancel = false;
         status.can_resume = false;
         status.message = Some("The local model and MTP drafter are ready.".into());
         status.error_code = None;
-        status.current_free_bytes = self.0.disk_space.available(&self.0.root)?;
         self.publish(status);
         Ok(())
     }
@@ -2531,31 +2733,44 @@ impl ModelAssetManager {
         let destination = PathBuf::from(&manifest_file.install_path);
         let partial = partial_path(&destination);
         let metadata_path = partial_metadata_path(&partial);
-        Self::recover_private_write(self.storage(), &self.0.manifest, manifest_file)?;
-        let expected_metadata = PartialMetadata::from_manifest(&self.0.manifest, manifest_file);
-        let recorded_metadata = self
-            .storage()
-            .read_bounded(&metadata_path, PARTIAL_METADATA_MAX_BYTES)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PartialMetadata>(&bytes).ok());
-        let partial_metadata = self
-            .storage()
-            .metadata(&partial)
-            .map_err(|source| self.relative_storage_error(&partial, source))?;
-        let safe_bound_partial = partial_metadata.as_ref().is_some_and(|metadata| {
-            metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && recorded_metadata.as_ref() == Some(&expected_metadata)
-                && metadata.len() <= manifest_file.size_bytes
-        });
-        if !safe_bound_partial && (partial_metadata.is_some() || recorded_metadata.is_some()) {
-            self.reset_partial(&partial, &metadata_path)?;
-        }
-        let mut offset = if safe_bound_partial {
-            partial_metadata.expect("bound partial metadata").len()
-        } else {
-            0
-        };
+        let preparation = self.clone();
+        let prepared_file = manifest_file.clone();
+        let prepared_partial = partial.clone();
+        let prepared_metadata_path = metadata_path.clone();
+        let (expected_metadata, mut offset) = blocking_phase(move || {
+            Self::recover_private_write(
+                preparation.storage(),
+                &preparation.0.manifest,
+                &prepared_file,
+            )?;
+            let expected_metadata =
+                PartialMetadata::from_manifest(&preparation.0.manifest, &prepared_file);
+            let recorded_metadata = preparation
+                .storage()
+                .read_bounded(&prepared_metadata_path, PARTIAL_METADATA_MAX_BYTES)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<PartialMetadata>(&bytes).ok());
+            let partial_metadata = preparation
+                .storage()
+                .metadata(&prepared_partial)
+                .map_err(|source| preparation.relative_storage_error(&prepared_partial, source))?;
+            let safe_bound_partial = partial_metadata.as_ref().is_some_and(|metadata| {
+                metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && recorded_metadata.as_ref() == Some(&expected_metadata)
+                    && metadata.len() <= prepared_file.size_bytes
+            });
+            if !safe_bound_partial && (partial_metadata.is_some() || recorded_metadata.is_some()) {
+                preparation.reset_partial(&prepared_partial, &prepared_metadata_path)?;
+            }
+            let offset = if safe_bound_partial {
+                partial_metadata.expect("bound partial metadata").len()
+            } else {
+                0
+            };
+            Ok::<_, ModelAssetError>((expected_metadata, offset))
+        })
+        .await??;
         if offset == 0 {
             self.write_json_atomic(&metadata_path, &expected_metadata, cancellation)
                 .await?;
@@ -2566,22 +2781,55 @@ impl ModelAssetManager {
             status.current_asset = Some(manifest_file.asset);
             status.current_file = Some(manifest_file.install_path.clone());
             self.publish(status);
-            if self.sha256_relative(&partial, cancellation).await? == manifest_file.sha256 {
+            let validator = self.clone();
+            let validation_partial = partial.clone();
+            let validation_cancellation = cancellation.clone();
+            let hash = blocking_phase(move || {
+                validator.sha256_relative(&validation_partial, &validation_cancellation)
+            })
+            .await??;
+            if hash == manifest_file.sha256 {
                 ensure_not_cancelled(cancellation)?;
-                self.storage()
-                    .rename(&partial, &destination)
-                    .map_err(|source| self.relative_storage_error(&destination, source))?;
-                self.remove_if_present(&metadata_path)?;
-                self.clear_invalid_final(&manifest_file.install_path);
+                let finalizer = self.clone();
+                let final_partial = partial.clone();
+                let final_destination = destination.clone();
+                let final_metadata_path = metadata_path.clone();
+                let install_path = manifest_file.install_path.clone();
+                blocking_phase(move || {
+                    finalizer
+                        .storage()
+                        .rename(&final_partial, &final_destination)
+                        .map_err(|source| {
+                            finalizer.relative_storage_error(&final_destination, source)
+                        })?;
+                    finalizer.remove_if_present(&final_metadata_path)?;
+                    finalizer.clear_invalid_final(&install_path);
+                    Ok::<_, ModelAssetError>(())
+                })
+                .await??;
                 return Ok(());
             }
-            self.reset_partial(&partial, &metadata_path)?;
+            let resetter = self.clone();
+            let reset_partial = partial.clone();
+            let reset_metadata = metadata_path.clone();
+            blocking_phase(move || resetter.reset_partial(&reset_partial, &reset_metadata))
+                .await??;
             self.write_json_atomic(&metadata_path, &expected_metadata, cancellation)
                 .await?;
             offset = 0;
         }
-        let token = self.0.credentials.get()?;
-        self.publish_current_work(manifest_file, operation_id, ModelAssetPhase::Downloading);
+        let credentials = self.0.credentials.clone();
+        let token = blocking_phase(move || credentials.get()).await??;
+        let publisher = self.clone();
+        let published_file = manifest_file.clone();
+        blocking_phase(move || {
+            publisher.publish_current_work(
+                &published_file,
+                operation_id,
+                ModelAssetPhase::Downloading,
+            )
+        })
+        .await?;
         let url = format!("{}/{}", self.0.resolve_base_url, manifest_file.source_path);
         let mut request = self.0.client.get(url);
         if offset > 0 {
@@ -2629,10 +2877,15 @@ impl ModelAssetManager {
             }
         }
 
-        let mut output = self
-            .storage()
-            .create_private_write(&partial)
-            .map_err(|source| self.relative_storage_error(&partial, source))?;
+        let output_manager = self.clone();
+        let output_partial = partial.clone();
+        let mut output = blocking_phase(move || {
+            output_manager
+                .storage()
+                .create_private_write(&output_partial)
+                .map_err(|source| output_manager.relative_storage_error(&output_partial, source))
+        })
+        .await??;
         let private_recovery_path = private_write_recovery_path(&partial);
         let private_recovery = PrivateWriteRecovery {
             schema_version: 1,
@@ -2651,32 +2904,40 @@ impl ModelAssetManager {
             return Err(error);
         }
         if offset > 0 {
-            let expected_identity = self
-                .storage()
-                .identity(&partial)
-                .map_err(|source| self.relative_storage_error(&partial, source))?
-                .filter(|identity| identity.links == 1 && identity.size == offset)
-                .ok_or_else(|| {
-                    self.relative_storage_error(
-                        &partial,
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "model asset partial changed before private transfer",
-                        ),
-                    )
-                })?;
-            if let Err(source) = output.adopt_existing(expected_identity) {
-                output
-                    .discard()
-                    .await
-                    .map_err(|source| self.relative_storage_error(&partial, source))?;
-                self.remove_if_present_durable(&private_recovery_path)?;
-                return Err(self.relative_storage_error(&partial, source));
-            }
+            let adopter = self.clone();
+            let adopt_partial = partial.clone();
+            let adopt_recovery = private_recovery_path.clone();
+            output = blocking_phase(move || {
+                let expected_identity = adopter
+                    .storage()
+                    .identity(&adopt_partial)
+                    .map_err(|source| adopter.relative_storage_error(&adopt_partial, source))?
+                    .filter(|identity| identity.links == 1 && identity.size == offset)
+                    .ok_or_else(|| {
+                        adopter.relative_storage_error(
+                            &adopt_partial,
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "model asset partial changed before private transfer",
+                            ),
+                        )
+                    })?;
+                if let Err(source) = output.adopt_existing(expected_identity) {
+                    output.discard_blocking().map_err(|cleanup| {
+                        adopter.relative_storage_error(&adopt_partial, cleanup)
+                    })?;
+                    adopter.remove_if_present_durable(&adopt_recovery)?;
+                    return Err(adopter.relative_storage_error(&adopt_partial, source));
+                }
+                Ok::<_, ModelAssetError>(output)
+            })
+            .await??;
         }
         let mut stream = response.bytes_stream();
         let mut file_bytes = offset;
-        let mut progress = TransferProgress::new(self.transferred_bytes(), offset);
+        let sampler = self.clone();
+        let sampled_total = blocking_phase(move || sampler.transferred_bytes()).await?;
+        let mut progress = TransferProgress::new(sampled_total, offset);
         let transfer_result = async {
             loop {
                 let chunk = tokio::select! {
@@ -2720,35 +2981,60 @@ impl ModelAssetManager {
                 .publish()
                 .await
                 .map_err(|source| self.relative_storage_error(&partial, source))?;
-            self.remove_if_present_durable(&private_recovery_path)?;
+            let cleaner = self.clone();
+            let recovery = private_recovery_path.clone();
+            blocking_phase(move || cleaner.remove_if_present_durable(&recovery)).await??;
             return Err(error);
         }
         output
             .publish()
             .await
             .map_err(|source| self.relative_storage_error(&partial, source))?;
-        self.remove_if_present_durable(&private_recovery_path)?;
+        let cleaner = self.clone();
+        let recovery = private_recovery_path.clone();
+        blocking_phase(move || cleaner.remove_if_present_durable(&recovery)).await??;
         let mut status = self.status();
         status.phase = ModelAssetPhase::Verifying;
         status.current_asset = Some(manifest_file.asset);
         status.current_file = Some(manifest_file.install_path.clone());
         self.publish(status);
-        if self.sha256_relative(&partial, cancellation).await? != manifest_file.sha256 {
-            self.reset_partial(&partial, &metadata_path)?;
+        let verifier = self.clone();
+        let verified_partial = partial.clone();
+        let verification_cancellation = cancellation.clone();
+        let hash = blocking_phase(move || {
+            verifier.sha256_relative(&verified_partial, &verification_cancellation)
+        })
+        .await??;
+        if hash != manifest_file.sha256 {
+            let resetter = self.clone();
+            let reset_partial = partial.clone();
+            let reset_metadata = metadata_path.clone();
+            blocking_phase(move || resetter.reset_partial(&reset_partial, &reset_metadata))
+                .await??;
             return Err(ModelAssetError::Integrity(
                 manifest_file.source_path.clone(),
             ));
         }
         ensure_not_cancelled(cancellation)?;
-        self.storage()
-            .rename(&partial, &destination)
-            .map_err(|source| self.relative_storage_error(&destination, source))?;
-        self.remove_if_present(&metadata_path)?;
-        self.clear_invalid_final(&manifest_file.install_path);
+        let finalizer = self.clone();
+        let final_partial = partial.clone();
+        let final_destination = destination.clone();
+        let final_metadata = metadata_path.clone();
+        let install_path = manifest_file.install_path.clone();
+        blocking_phase(move || {
+            finalizer
+                .storage()
+                .rename(&final_partial, &final_destination)
+                .map_err(|source| finalizer.relative_storage_error(&final_destination, source))?;
+            finalizer.remove_if_present(&final_metadata)?;
+            finalizer.clear_invalid_final(&install_path);
+            Ok::<_, ModelAssetError>(())
+        })
+        .await??;
         Ok(())
     }
 
-    async fn final_is_valid(
+    fn final_is_valid(
         &self,
         file: &ManifestFile,
         operation_id: u64,
@@ -2775,7 +3061,7 @@ impl ModelAssetManager {
             && metadata.len() == file.size_bytes
         {
             self.publish_current_work(file, operation_id, ModelAssetPhase::Verifying);
-            match self.sha256_relative(path, cancellation).await {
+            match self.sha256_relative(path, cancellation) {
                 Ok(hash) if hash == file.sha256 => {
                     self.remove_if_present(&partial_metadata_path(&partial_path(path)))?;
                     return Ok(true);
@@ -2799,6 +3085,7 @@ impl ModelAssetManager {
         Ok(false)
     }
 
+    #[cfg(test)]
     fn finish_operation(&self, operation_id: u64, result: Result<(), ModelAssetError>) {
         let Err(error) = result else { return };
         self.publish_operation_failure(operation_id, &error);
@@ -2817,6 +3104,7 @@ impl ModelAssetManager {
         if !recovery_required {
             status.operation_id = None;
         }
+        status.can_cancel = false;
         status.current_asset = None;
         status.current_file = None;
         status.transferred_bytes = self.transferred_bytes();
@@ -2854,9 +3142,6 @@ impl ModelAssetManager {
         status.current_file = Some(file.install_path.clone());
         status.transferred_bytes = transferred.min(status.total_bytes);
         status.remaining_bytes = status.total_bytes.saturating_sub(status.transferred_bytes);
-        if let Ok(free) = self.0.disk_space.available(&self.0.root) {
-            status.current_free_bytes = free;
-        }
         status.required_free_bytes = status
             .remaining_bytes
             .saturating_add(DISK_SAFETY_RESERVE_BYTES);
@@ -3063,10 +3348,15 @@ impl ModelAssetManager {
     ) -> Result<(), ModelAssetError> {
         ensure_not_cancelled(cancellation)?;
         let bytes = serde_json::to_vec_pretty(value).expect("asset metadata serialization");
-        let mut output = self
-            .storage()
-            .create_private_write(path)
-            .map_err(|source| self.relative_storage_error(path, source))?;
+        let creator = self.clone();
+        let output_path = path.to_path_buf();
+        let mut output = blocking_phase(move || {
+            creator
+                .storage()
+                .create_private_write(&output_path)
+                .map_err(|source| creator.relative_storage_error(&output_path, source))
+        })
+        .await??;
         if let Err(source) = output.write_all(&bytes).await {
             output
                 .discard()
@@ -3087,28 +3377,55 @@ impl ModelAssetManager {
             .map_err(|source| self.relative_storage_error(path, source))
     }
 
-    async fn sha256_relative(
+    fn write_json_atomic_blocking<T: Serialize>(
+        &self,
+        path: &Path,
+        value: &T,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ModelAssetError> {
+        ensure_not_cancelled(cancellation)?;
+        let bytes = serde_json::to_vec_pretty(value).expect("asset metadata serialization");
+        let mut output = self
+            .storage()
+            .create_private_write(path)
+            .map_err(|source| self.relative_storage_error(path, source))?;
+        if let Err(source) = output.write_all_blocking(&bytes) {
+            output
+                .discard_blocking()
+                .map_err(|cleanup| self.relative_storage_error(path, cleanup))?;
+            return Err(self.relative_storage_error(path, source));
+        }
+        if let Err(error) = ensure_not_cancelled(cancellation) {
+            output
+                .discard_blocking()
+                .map_err(|source| self.relative_storage_error(path, source))?;
+            return Err(error);
+        }
+        output
+            .publish_blocking()
+            .map_err(|source| self.relative_storage_error(path, source))
+    }
+
+    fn sha256_relative(
         &self,
         path: &Path,
         cancellation: &CancellationToken,
     ) -> Result<String, ModelAssetError> {
         self.sha256_relative_with_identity(path, cancellation)
-            .await
             .map(|(hash, _)| hash)
     }
 
     #[cfg(unix)]
-    async fn sha256_relative_with_identity(
+    fn sha256_relative_with_identity(
         &self,
         path: &Path,
         cancellation: &CancellationToken,
     ) -> Result<(String, FileIdentity), ModelAssetError> {
         self.sha256_relative_with_identity_and_hook(path, cancellation, || {})
-            .await
     }
 
     #[cfg(unix)]
-    async fn sha256_relative_with_identity_and_hook(
+    fn sha256_relative_with_identity_and_hook(
         &self,
         path: &Path,
         cancellation: &CancellationToken,
@@ -3122,7 +3439,6 @@ impl ModelAssetManager {
             .map_err(|source| self.relative_storage_error(path, source))?;
         let metadata = file
             .metadata()
-            .await
             .map_err(|source| self.relative_storage_error(path, source))?;
         if !metadata.is_file() {
             return Err(self.relative_storage_error(
@@ -3146,11 +3462,10 @@ impl ModelAssetManager {
         let mut hasher = Sha256::new();
         let mut buffer = vec![0_u8; 1024 * 1024];
         loop {
-            let read = tokio::select! {
-                _ = cancellation.cancelled() => return Err(ModelAssetError::Cancelled),
-                read = file.read(&mut buffer) => read,
-            }
-            .map_err(|source| self.relative_storage_error(path, source))?;
+            ensure_not_cancelled(cancellation)?;
+            let read = file
+                .read(&mut buffer)
+                .map_err(|source| self.relative_storage_error(path, source))?;
             if read == 0 {
                 break;
             }
@@ -3160,7 +3475,6 @@ impl ModelAssetManager {
         after_read();
         let metadata_after = file
             .metadata()
-            .await
             .map_err(|source| self.relative_storage_error(path, source))?;
         let opened_after = FileIdentity {
             device: metadata_after.dev(),
@@ -3251,8 +3565,24 @@ impl ModelAssetManager {
     fn storage(&self) -> &SafeStorage {
         self.0
             .storage
-            .as_ref()
+            .get()
             .expect("available model manager has safe storage")
+    }
+
+    fn ensure_initialized(&self) -> Result<(), ModelAssetError> {
+        if self.0.storage.get().is_some() {
+            return Ok(());
+        }
+        let status = self.status();
+        Err(ModelAssetError::Unavailable(status.message.unwrap_or_else(
+            || {
+                if status.phase == ModelAssetPhase::Initializing {
+                    "model resources are still initializing".into()
+                } else {
+                    "model resources could not be initialized".into()
+                }
+            },
+        )))
     }
 
     fn relative_storage_error(&self, path: &Path, source: io::Error) -> ModelAssetError {
@@ -3460,13 +3790,25 @@ fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), ModelAss
     }
 }
 
+async fn blocking_phase<T: Send + 'static>(
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ModelAssetError> {
+    match tokio::task::spawn_blocking(operation).await {
+        Ok(result) => Ok(result),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(_) => Err(ModelAssetError::Unavailable(
+            "the model resource worker stopped unexpectedly".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         convert::Infallible,
         fs,
         sync::{
-            Arc, Mutex,
+            Arc, Condvar, Mutex,
             atomic::{AtomicU8, AtomicU64, Ordering},
         },
         time::Duration,
@@ -3483,6 +3825,8 @@ mod tests {
     use futures_util::stream;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
+
+    use crate::model_asset_boundary::ModelAssetCommandError;
 
     use super::*;
 
@@ -3617,6 +3961,57 @@ mod tests {
         }
     }
 
+    struct BlockingDeleteCommit {
+        reached: AtomicBool,
+        release: (Mutex<bool>, Condvar),
+    }
+
+    impl BlockingDeleteCommit {
+        fn new() -> Self {
+            Self {
+                reached: AtomicBool::new(false),
+                release: (Mutex::new(false), Condvar::new()),
+            }
+        }
+
+        fn release(&self) {
+            let (released, ready) = &self.release;
+            *released.lock().expect("delete commit release") = true;
+            ready.notify_all();
+        }
+    }
+
+    impl RemovalPersistence for BlockingDeleteCommit {
+        fn commit_journal(
+            &self,
+            storage: &SafeStorage,
+            path: &Path,
+            phase: RemovalRecoveryPhase,
+        ) -> io::Result<()> {
+            if phase == RemovalRecoveryPhase::Deleting {
+                self.reached.store(true, Ordering::Release);
+                let (released, ready) = &self.release;
+                let mut released = released.lock().expect("delete commit release");
+                while !*released {
+                    released = ready.wait(released).expect("delete commit wait");
+                }
+            }
+            DurableRemovalPersistence.commit_journal(storage, path, phase)
+        }
+
+        fn stage(&self, storage: &SafeStorage, from: &Path, to: &Path) -> io::Result<()> {
+            DurableRemovalPersistence.stage(storage, from, to)
+        }
+
+        fn delete(&self, storage: &SafeStorage, path: &Path) -> io::Result<()> {
+            DurableRemovalPersistence.delete(storage, path)
+        }
+
+        fn complete_mutations(&self, storage: &SafeStorage, journal: &Path) -> io::Result<()> {
+            DurableRemovalPersistence.complete_mutations(storage, journal)
+        }
+    }
+
     impl CredentialStore for MemoryCredentials {
         fn get(&self) -> Result<Option<String>, ModelAssetError> {
             Ok(self.0.lock().expect("credentials").clone())
@@ -3633,6 +4028,51 @@ mod tests {
     impl DiskSpace for FixedDisk {
         fn available(&self, _path: &std::path::Path) -> Result<u64, ModelAssetError> {
             Ok(self.0.load(Ordering::Relaxed))
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingFixture {
+        entered: AtomicBool,
+        release: (Mutex<bool>, Condvar),
+    }
+
+    impl BlockingFixture {
+        fn wait(&self) {
+            self.entered.store(true, Ordering::Release);
+            let (released, ready) = &self.release;
+            let mut released = released.lock().expect("blocking fixture release");
+            while !*released {
+                released = ready.wait(released).expect("blocking fixture wait");
+            }
+        }
+
+        fn release(&self) {
+            let (released, ready) = &self.release;
+            *released.lock().expect("blocking fixture release") = true;
+            ready.notify_all();
+        }
+    }
+
+    struct SlowCredentials(Arc<BlockingFixture>);
+
+    impl CredentialStore for SlowCredentials {
+        fn get(&self) -> Result<Option<String>, ModelAssetError> {
+            self.0.wait();
+            Ok(None)
+        }
+
+        fn set(&self, _token: &str) -> Result<(), ModelAssetError> {
+            Ok(())
+        }
+    }
+
+    struct SlowDisk(Arc<BlockingFixture>);
+
+    impl DiskSpace for SlowDisk {
+        fn available(&self, _path: &Path) -> Result<u64, ModelAssetError> {
+            self.0.wait();
+            Ok(u64::MAX)
         }
     }
 
@@ -4463,6 +4903,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signed_download_urls_are_reduced_to_safe_errors_at_capture_time() {
+        const SENTINEL: &str = "SIGNED_QUERY_SENTINEL_DO_NOT_LOG";
+        let bytes = b"safe network error fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        let signed_url = format!(
+            "{}/whoami?X-Amz-Credential={SENTINEL}&X-Amz-Signature={SENTINEL}",
+            fixture.base_url
+        );
+        let source = Client::new()
+            .get(&signed_url)
+            .bearer_auth("service-down")
+            .send()
+            .await
+            .expect("fixture response")
+            .error_for_status()
+            .expect_err("fixture status error");
+        let error = ModelAssetError::from(source);
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        manager.publish_operation_failure(99, &error);
+        let status = manager.status();
+        let ipc = ModelAssetCommandError::from(error);
+        let exposed = [
+            display,
+            debug,
+            status.message.clone().unwrap_or_default(),
+            format!("{status:?}"),
+            ipc.message.clone(),
+            format!("{ipc:?}"),
+        ];
+
+        for text in exposed {
+            assert!(!text.contains(SENTINEL), "secret escaped in {text}");
+            assert!(!text.contains(&fixture.base_url), "host escaped in {text}");
+            assert!(!text.contains("X-Amz"), "query name escaped in {text}");
+            assert!(!text.contains("http://"), "URL escaped in {text}");
+        }
+        assert_eq!(ipc.code, ModelAssetErrorCode::Network);
+        assert_eq!(
+            ipc.message,
+            "could not reach Hugging Face: Hugging Face returned HTTP 503 Service Unavailable"
+        );
+    }
+
+    #[tokio::test]
     async fn cancellation_and_disconnect_preserve_safe_partial_for_resume() {
         let bytes = vec![42; 128];
         let fixture = Fixture::start(bytes.clone()).await;
@@ -4756,10 +5249,11 @@ mod tests {
         wait_for_phase(&manager, ModelAssetPhase::Ready).await;
         let root = manager.0.root.clone();
         let replacement = b"unknown replacement";
+        let replacement_root = root.clone();
 
         let missing = manager
-            .remove_owned_assets_with_hook(|relative| {
-                fs::write(root.join(relative), replacement).expect("replacement file");
+            .remove_owned_assets_with_hook(move |relative| {
+                fs::write(replacement_root.join(relative), replacement).expect("replacement file");
             })
             .await
             .expect("remove staged verified file");
@@ -4815,6 +5309,71 @@ mod tests {
         );
         assert!(manager.0.root.join("target/model.bin").exists());
         assert!(manager.0.root.join(OWNERSHIP_FILE).exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_accepted_before_removal_commit_prevents_every_delete() {
+        let bytes = b"pre-commit cancellation fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        manager.start_download().expect("install owned file");
+        wait_for_phase(&manager, ModelAssetPhase::Ready).await;
+        let cancellation_manager = manager.clone();
+
+        let result = manager
+            .remove_owned_assets_with_hook(move |_| {
+                assert!(cancellation_manager.cancel_download());
+            })
+            .await;
+
+        assert!(matches!(result, Err(ModelAssetError::Cancelled)));
+        assert!(manager.0.root.join("target/model.bin").exists());
+        assert!(manager.0.root.join(OWNERSHIP_FILE).exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_after_removal_commit_is_rejected_and_deletion_finishes() {
+        let bytes = b"post-commit cancellation fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        manager.start_download().expect("install owned file");
+        wait_for_phase(&manager, ModelAssetPhase::Ready).await;
+        let commit = Arc::new(BlockingDeleteCommit::new());
+        manager.set_removal_persistence(commit.clone());
+        let removal_manager = manager.clone();
+        let removal = tokio::spawn(async move { removal_manager.remove_owned_assets().await });
+
+        while !commit.reached.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert!(!manager.cancel_download());
+        assert!(!manager.status().can_cancel);
+        commit.release();
+
+        assert_eq!(
+            removal
+                .await
+                .expect("removal task")
+                .expect("committed removal")
+                .phase,
+            ModelAssetPhase::Missing
+        );
+        assert!(!manager.0.root.join("target/model.bin").exists());
+        assert!(!manager.0.root.join(OWNERSHIP_FILE).exists());
     }
 
     #[tokio::test]
@@ -5550,12 +6109,14 @@ mod tests {
         let visible = manager.0.root.join(relative);
         fs::write(&visible, &bytes).expect("hash candidate");
         let retained = manager.0.root.join("target/retained.bin");
-        let replacement = manager
-            .sha256_relative_with_identity_and_hook(relative, &CancellationToken::new(), || {
+        let replacement = manager.sha256_relative_with_identity_and_hook(
+            relative,
+            &CancellationToken::new(),
+            || {
                 fs::rename(&visible, &retained).expect("retain opened file");
                 fs::write(&visible, &bytes).expect("same-byte replacement");
-            })
-            .await;
+            },
+        );
         assert!(matches!(
             replacement,
             Err(ModelAssetError::ChangedDuringVerification(_))
@@ -5565,11 +6126,11 @@ mod tests {
         fs::rename(&retained, &visible).expect("restore candidate");
         let mut changed = bytes.clone();
         changed[0] ^= 0xff;
-        let mutation = manager
-            .sha256_relative_with_identity_and_hook(relative, &CancellationToken::new(), || {
-                fs::write(&visible, changed).expect("same-size mutation")
-            })
-            .await;
+        let mutation = manager.sha256_relative_with_identity_and_hook(
+            relative,
+            &CancellationToken::new(),
+            || fs::write(&visible, changed).expect("same-size mutation"),
+        );
         assert!(matches!(
             mutation,
             Err(ModelAssetError::ChangedDuringVerification(_))
@@ -5860,13 +6421,122 @@ mod tests {
         assert!(matches!(result, Err(ModelAssetError::Storage { .. })));
     }
 
-    #[test]
-    fn storage_initialization_failure_is_contained_in_resource_status() {
+    async fn wait_for_blocking_fixture(fixture: &BlockingFixture) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !fixture.entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking fixture entered");
+    }
+
+    async fn assert_executor_yields_while_initialization_is_blocked() {
+        let (sent, received) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            sent.send(()).expect("executor probe receiver");
+        });
+        tokio::time::timeout(Duration::from_millis(100), received)
+            .await
+            .expect("initialization must not occupy the async executor")
+            .expect("executor probe");
+    }
+
+    fn uninitialized_test_manager(
+        temporary: &TempDir,
+        credentials: Arc<dyn CredentialStore>,
+        disk_space: Arc<dyn DiskSpace>,
+    ) -> ModelAssetManager {
+        let manifest = fixture_manifest(b"deferred initialization fixture");
+        ModelAssetManager::new_uninitialized(
+            temporary.path().to_path_buf(),
+            PathBuf::from("models"),
+            manifest,
+            "http://127.0.0.1/resolve/revision".into(),
+            "http://127.0.0.1/whoami".into(),
+            credentials,
+            disk_space,
+            NetworkTimeouts::default(),
+        )
+        .expect("uninitialized manager")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_storage_recovery_is_deferred_past_the_startup_budget_and_yields() {
+        let temporary = TempDir::new().expect("temporary model root");
+        let gate = Arc::new(BlockingFixture::default());
+        let started = std::time::Instant::now();
+        let manager = uninitialized_test_manager(
+            &temporary,
+            Arc::new(MemoryCredentials::default()),
+            Arc::new(FixedDisk(AtomicU64::new(u64::MAX))),
+        );
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_eq!(manager.status().phase, ModelAssetPhase::Initializing);
+        let hook = gate.clone();
+        manager.start_deferred_initialization_with_hook(
+            temporary.path().to_path_buf(),
+            PathBuf::from("models"),
+            move || hook.wait(),
+        );
+
+        wait_for_blocking_fixture(&gate).await;
+        assert_executor_yields_while_initialization_is_blocked().await;
+        assert_eq!(manager.status().phase, ModelAssetPhase::Initializing);
+        gate.release();
+        assert_eq!(
+            wait_for_phase(&manager, ModelAssetPhase::Missing)
+                .await
+                .phase,
+            ModelAssetPhase::Missing
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_keychain_lookup_runs_off_the_async_executor() {
+        let temporary = TempDir::new().expect("temporary model root");
+        let gate = Arc::new(BlockingFixture::default());
+        let manager = uninitialized_test_manager(
+            &temporary,
+            Arc::new(SlowCredentials(gate.clone())),
+            Arc::new(FixedDisk(AtomicU64::new(u64::MAX))),
+        );
+        manager
+            .start_deferred_initialization(temporary.path().to_path_buf(), PathBuf::from("models"));
+
+        wait_for_blocking_fixture(&gate).await;
+        assert_executor_yields_while_initialization_is_blocked().await;
+        gate.release();
+        wait_for_phase(&manager, ModelAssetPhase::Missing).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_storage_capacity_check_runs_off_the_async_executor() {
+        let temporary = TempDir::new().expect("temporary model root");
+        let gate = Arc::new(BlockingFixture::default());
+        let manager = uninitialized_test_manager(
+            &temporary,
+            Arc::new(MemoryCredentials::default()),
+            Arc::new(SlowDisk(gate.clone())),
+        );
+        manager
+            .start_deferred_initialization(temporary.path().to_path_buf(), PathBuf::from("models"));
+
+        wait_for_blocking_fixture(&gate).await;
+        assert_executor_yields_while_initialization_is_blocked().await;
+        gate.release();
+        wait_for_phase(&manager, ModelAssetPhase::Missing).await;
+    }
+
+    #[tokio::test]
+    async fn storage_initialization_failure_is_contained_in_resource_status() {
         let app_data_file = tempfile::NamedTempFile::new().expect("app data file");
 
         let manager = ModelAssetManager::production_or_unavailable(app_data_file.path());
 
-        assert_eq!(manager.status().phase, ModelAssetPhase::Failed);
+        assert_eq!(manager.status().phase, ModelAssetPhase::Initializing);
+        wait_for_phase(&manager, ModelAssetPhase::Failed).await;
         assert!(
             manager
                 .status()

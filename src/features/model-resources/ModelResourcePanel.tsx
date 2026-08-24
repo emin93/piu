@@ -32,6 +32,7 @@ import {
 } from "@/platform/model-assets";
 
 const phaseLabels: Record<ModelAssetStatus["phase"], string> = {
+  initializing: "Checking",
   missing: "Not downloaded",
   downloading: "Downloading",
   verifying: "Verifying",
@@ -42,6 +43,8 @@ const phaseLabels: Record<ModelAssetStatus["phase"], string> = {
   failed: "Needs attention",
   revisionMismatch: "Revision mismatch",
 };
+export const REVISION_MISMATCH_MESSAGE =
+  "An older Più model revision is installed. Remove it here, then download the pinned revision.";
 const GIGABYTE_FORMATTER = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
 
 function formatBytes(bytes: number): string {
@@ -186,13 +189,16 @@ export function ModelResourcePanel({
 
   const downloading = currentStatus.phase === "downloading" || currentStatus.phase === "verifying";
   const removing = currentStatus.phase === "removing";
+  const initializing = currentStatus.phase === "initializing";
   const authenticationNeeded = currentStatus.phase === "authenticationRequired";
   const mismatch = currentStatus.phase === "revisionMismatch";
+  const ownershipBlocked = currentStatus.errorCode === "ownership";
   const removable = currentStatus.phase === "ready" || mismatch;
   const transferRelevant =
     downloading || currentStatus.canResume || currentStatus.phase === "cancelled";
   const qaMode = statusOverride !== undefined;
   const progressValue = progress(currentStatus);
+  const statusMessage = mismatch ? REVISION_MISMATCH_MESSAGE : currentStatus.message;
 
   return (
     <section aria-labelledby={headingId} className="model-resource-panel">
@@ -295,12 +301,12 @@ export function ModelResourcePanel({
         </form>
       ) : null}
 
-      {currentStatus.message ? (
+      {statusMessage ? (
         <p
           className={currentStatus.errorCode ? "resource-error" : "resource-message"}
           role={currentStatus.errorCode ? "alert" : undefined}
         >
-          {currentStatus.message}
+          {statusMessage}
         </p>
       ) : null}
       {error ? (
@@ -310,14 +316,18 @@ export function ModelResourcePanel({
       ) : null}
 
       <div className="resource-actions">
-        {downloading || removing ? (
+        {(downloading || removing) && currentStatus.canCancel ? (
           <Button
             disabled={(busy && !removing) || qaMode}
             onClick={() => {
               if (removing) {
-                void cancelModelDownload().catch((cause: unknown) => {
-                  setError(cause instanceof Error ? cause.message : String(cause));
-                });
+                void cancelModelDownload()
+                  .then(async (accepted) => {
+                    if (!accepted) setStatus(await getModelAssetStatus());
+                  })
+                  .catch((cause: unknown) => {
+                    setError(cause instanceof Error ? cause.message : String(cause));
+                  });
               } else {
                 void perform(cancelModelDownload);
               }
@@ -327,7 +337,7 @@ export function ModelResourcePanel({
           >
             {removing ? "Cancel removal" : "Cancel download"}
           </Button>
-        ) : removable ? (
+        ) : removing || initializing || ownershipBlocked ? null : removable ? (
           <Button
             disabled={busy}
             onClick={() => setConfirmRemoval(true)}

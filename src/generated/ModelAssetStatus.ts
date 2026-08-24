@@ -3,4 +3,4 @@ import type { ModelAsset } from "./ModelAsset";
 import type { ModelAssetErrorCode } from "./ModelAssetErrorCode";
 import type { ModelAssetPhase } from "./ModelAssetPhase";
 
-export type ModelAssetStatus = { phase: ModelAssetPhase, repository: string, revision: string, manifestId: string, totalBytes: number, transferredBytes: number, remainingBytes: number, currentFreeBytes: number, requiredFreeBytes: number, currentAsset: ModelAsset | null, currentFile: string | null, operationId: number | null, authenticationConfigured: boolean, canResume: boolean, errorCode: ModelAssetErrorCode | null, message: string | null, };
+export type ModelAssetStatus = { phase: ModelAssetPhase, repository: string, revision: string, manifestId: string, totalBytes: number, transferredBytes: number, remainingBytes: number, currentFreeBytes: number, requiredFreeBytes: number, currentAsset: ModelAsset | null, currentFile: string | null, operationId: number | null, authenticationConfigured: boolean, canCancel: boolean, canResume: boolean, errorCode: ModelAssetErrorCode | null, message: string | null, };
