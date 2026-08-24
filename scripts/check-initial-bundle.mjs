@@ -70,10 +70,11 @@ const productionForbidden = [
   "Deterministic build-time QA gallery",
   "qa-gallery",
   "Onboarding context",
+  ".model-resource-qa",
 ];
 const distFiles = await readdir(resolve("dist"), { recursive: true });
 for (const relative of distFiles) {
-  if (!/\.(?:js|map|json)$/.test(relative)) continue;
+  if (!/\.(?:css|js|map|json)$/.test(relative)) continue;
   const contents = await readFile(resolve("dist", relative), "utf8");
   const leaked = productionForbidden.find((needle) => contents.includes(needle));
   if (leaked) {

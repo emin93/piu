@@ -1,7 +1,6 @@
 use std::{
     collections::HashSet,
     ffi::OsString,
-    fs,
     io::{self, Read as _},
     path::{Component, Path, PathBuf},
     sync::{
@@ -149,6 +148,8 @@ const KEYCHAIN_SERVICE: &str = "ch.emin.piu.huggingface";
 const KEYCHAIN_ACCOUNT: &str = "access-token";
 const DISK_SAFETY_RESERVE_BYTES: u64 = 1_073_741_824;
 const PROGRESS_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+const OWNERSHIP_METADATA_MAX_BYTES: u64 = 64 * 1024;
+const PARTIAL_METADATA_MAX_BYTES: u64 = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -356,6 +357,32 @@ struct ActiveDownload {
     cancellation: CancellationToken,
 }
 
+struct TransferProgress {
+    completed_base: u64,
+    last_reported: u64,
+}
+
+impl TransferProgress {
+    fn new(sampled_total: u64, current_file_bytes: u64) -> Self {
+        Self {
+            completed_base: sampled_total.saturating_sub(current_file_bytes),
+            last_reported: sampled_total,
+        }
+    }
+
+    fn observe(&mut self, current_file_bytes: u64, file_size: u64) -> Option<u64> {
+        let total = self.completed_base.saturating_add(current_file_bytes);
+        if total.saturating_sub(self.last_reported) >= PROGRESS_CHUNK_BYTES
+            || current_file_bytes == file_size
+        {
+            self.last_reported = total;
+            Some(total)
+        } else {
+            None
+        }
+    }
+}
+
 struct InstallInspection {
     status: ModelAssetStatus,
     validation: Option<ValidationPlan>,
@@ -373,22 +400,58 @@ struct SafeStorage {
     directory: Dir,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    changed_at_seconds: i64,
+    changed_at_nanoseconds: i64,
+}
+
+struct StagedRemoval {
+    original: PathBuf,
+    staged: PathBuf,
+    identity: FileIdentity,
+}
+
 impl SafeStorage {
     fn open(anchor: PathBuf, relative_root: &Path) -> io::Result<Self> {
-        fs::create_dir_all(&anchor)?;
-        let metadata = fs::symlink_metadata(&anchor)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "model storage anchor must be a real directory",
-            ));
-        }
-        let mut directory = Dir::open_ambient_dir(&anchor, ambient_authority())?;
-        for component in relative_root.components() {
+        let trusted_parent_path = anchor.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "model storage anchor must have a trusted parent",
+            )
+        })?;
+        let anchor_name = anchor
+            .file_name()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "model storage anchor is empty")
+            })?
+            .to_os_string();
+        let trusted_parent = Dir::open_ambient_dir(trusted_parent_path, ambient_authority())?;
+        Self::open_beneath(
+            trusted_parent,
+            Path::new(&anchor_name),
+            anchor,
+            relative_root,
+        )
+    }
+
+    fn open_beneath(
+        mut directory: Dir,
+        relative_anchor: &Path,
+        anchor: PathBuf,
+        relative_root: &Path,
+    ) -> io::Result<Self> {
+        for component in relative_anchor
+            .components()
+            .chain(relative_root.components())
+        {
             let Component::Normal(component) = component else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "model storage root must be relative",
+                    "model storage path must be relative",
                 ));
             };
             match directory.open_dir_nofollow(component) {
@@ -458,14 +521,50 @@ impl SafeStorage {
             .map(|file| File::from_std(file.into_std()))
     }
 
-    fn read(&self, relative: &Path) -> io::Result<Vec<u8>> {
+    fn read_bounded(&self, relative: &Path, maximum_bytes: u64) -> io::Result<Vec<u8>> {
+        self.read_bounded_with_identity(relative, maximum_bytes)
+            .map(|(bytes, _)| bytes)
+    }
+
+    #[cfg(unix)]
+    fn read_bounded_with_identity(
+        &self,
+        relative: &Path,
+        maximum_bytes: u64,
+    ) -> io::Result<(Vec<u8>, FileIdentity)> {
+        use std::os::unix::fs::MetadataExt;
+
         let (directory, name) = self.parent_and_name(relative, false)?;
         let mut options = CapOpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         let mut file = directory.open_with(name, &options)?.into_std();
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        Ok(bytes)
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > maximum_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "model asset metadata exceeds its schema size limit",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.by_ref()
+            .take(maximum_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > maximum_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "model asset metadata exceeds its schema size limit",
+            ));
+        }
+        Ok((
+            bytes,
+            FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                size: metadata.size(),
+                changed_at_seconds: metadata.ctime(),
+                changed_at_nanoseconds: metadata.ctime_nsec(),
+            },
+        ))
     }
 
     fn open_write(&self, relative: &Path, append: bool) -> io::Result<File> {
@@ -500,6 +599,29 @@ impl SafeStorage {
         directory.remove_file(name)
     }
 
+    fn create_dir(&self, relative: &Path) -> io::Result<()> {
+        let (directory, name) = self.parent_and_name(relative, true)?;
+        directory.create_dir(name)
+    }
+
+    fn remove_dir(&self, relative: &Path) -> io::Result<()> {
+        let (directory, name) = self.parent_and_name(relative, false)?;
+        directory.remove_dir(name)
+    }
+
+    #[cfg(unix)]
+    fn identity(&self, relative: &Path) -> io::Result<Option<FileIdentity>> {
+        use cap_std::fs::MetadataExt;
+
+        Ok(self.metadata(relative)?.map(|metadata| FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            changed_at_seconds: metadata.ctime(),
+            changed_at_nanoseconds: metadata.ctime_nsec(),
+        }))
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let (from_directory, from_name) = self.parent_and_name(from, false)?;
         let (to_directory, to_name) = self.parent_and_name(to, true)?;
@@ -522,6 +644,7 @@ struct ModelAssetManagerInner {
     disk_space: Arc<dyn DiskSpace>,
     status: watch::Sender<ModelAssetStatus>,
     active: Mutex<Option<ActiveDownload>>,
+    invalid_finals: Mutex<HashSet<String>>,
     next_operation_id: AtomicU64,
     initialization_error: Option<String>,
 }
@@ -575,6 +698,7 @@ impl ModelAssetManager {
                 disk_space: Arc::new(SystemDiskSpace),
                 status,
                 active: Mutex::new(None),
+                invalid_finals: Mutex::new(HashSet::new()),
                 next_operation_id: AtomicU64::new(1),
                 initialization_error: Some(message),
             }))
@@ -615,6 +739,7 @@ impl ModelAssetManager {
             disk_space,
             status,
             active: Mutex::new(None),
+            invalid_finals: Mutex::new(HashSet::new()),
             next_operation_id: AtomicU64::new(1),
             initialization_error: None,
         }));
@@ -726,6 +851,13 @@ impl ModelAssetManager {
     }
 
     pub async fn remove_owned_assets(&self) -> Result<ModelAssetStatus, ModelAssetError> {
+        self.remove_owned_assets_with_hook(|_| {}).await
+    }
+
+    async fn remove_owned_assets_with_hook(
+        &self,
+        mut after_verified: impl FnMut(&Path),
+    ) -> Result<ModelAssetStatus, ModelAssetError> {
         if let Some(error) = &self.0.initialization_error {
             return Err(ModelAssetError::Unavailable(error.clone()));
         }
@@ -733,21 +865,19 @@ impl ModelAssetManager {
             return Err(ModelAssetError::Cancelled);
         }
         let marker_path = Path::new(OWNERSHIP_FILE);
-        let marker: OwnershipMarker = serde_json::from_slice(
-            &self
-                .storage()
-                .read(marker_path)
-                .map_err(|source| self.relative_storage_error(marker_path, source))?,
-        )
-        .map_err(|_| ModelAssetError::NotOwned)?;
+        let marker_bytes = self
+            .storage()
+            .read_bounded(marker_path, OWNERSHIP_METADATA_MAX_BYTES)
+            .map_err(|source| self.relative_storage_error(marker_path, source))?;
+        let marker: OwnershipMarker =
+            serde_json::from_slice(&marker_bytes).map_err(|_| ModelAssetError::NotOwned)?;
         if !marker.authorizes_removal(&self.0.manifest) {
             return Err(ModelAssetError::NotOwned);
         }
-        // Validate every extant entry before deleting anything. This makes recovery
-        // atomic from an ownership perspective: a tampered or redirected path leaves
-        // the complete old installation and its evidence intact for manual recovery.
         let cancellation = CancellationToken::new();
-        for file in &marker.files {
+        let staging_root = self.create_removal_staging()?;
+        let mut staged = Vec::with_capacity(marker.files.len() + 1);
+        for (index, file) in marker.files.iter().enumerate() {
             let relative = Path::new(&file.install_path);
             let Some(metadata) = self
                 .storage()
@@ -759,36 +889,153 @@ impl ModelAssetManager {
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
                 || metadata.len() != file.size_bytes
-                || self
-                    .sha256_relative(relative, &cancellation)
-                    .await
-                    .map_err(|_| ModelAssetError::NotOwned)?
-                    != file.sha256
             {
+                self.rollback_staged(&staging_root, &staged)?;
                 return Err(ModelAssetError::NotOwned);
             }
+            let staged_path = staging_root.join(format!("asset-{index}"));
+            if let Err(source) = self.storage().rename(relative, &staged_path) {
+                self.rollback_staged(&staging_root, &staged)?;
+                return Err(self.relative_storage_error(relative, source));
+            }
+            let (hash, identity) = self
+                .sha256_relative_with_identity(&staged_path, &cancellation)
+                .await
+                .map_err(|_| ModelAssetError::NotOwned)
+                .or_else(|error| {
+                    self.restore_staged_path(relative, &staged_path)?;
+                    self.rollback_staged(&staging_root, &staged)?;
+                    Err(error)
+                })?;
+            staged.push(StagedRemoval {
+                original: relative.to_path_buf(),
+                staged: staged_path,
+                identity,
+            });
+            if hash != file.sha256 || identity.size != file.size_bytes {
+                self.rollback_staged(&staging_root, &staged)?;
+                return Err(ModelAssetError::NotOwned);
+            }
+            after_verified(relative);
         }
-        for file in &marker.files {
-            let path = Path::new(&file.install_path);
+
+        let staged_marker = staging_root.join("ownership-marker");
+        if let Err(source) = self.storage().rename(marker_path, &staged_marker) {
+            self.rollback_staged(&staging_root, &staged)?;
+            return Err(self.relative_storage_error(marker_path, source));
+        }
+        let (staged_marker_bytes, marker_identity) = self
+            .storage()
+            .read_bounded_with_identity(&staged_marker, OWNERSHIP_METADATA_MAX_BYTES)
+            .map_err(|_| ModelAssetError::NotOwned)
+            .or_else(|error| {
+                self.restore_staged_path(marker_path, &staged_marker)?;
+                self.rollback_staged(&staging_root, &staged)?;
+                Err(error)
+            })?;
+        staged.push(StagedRemoval {
+            original: marker_path.to_path_buf(),
+            staged: staged_marker,
+            identity: marker_identity,
+        });
+        if staged_marker_bytes != marker_bytes || self.staged_identities_match(&staged).is_err() {
+            self.rollback_staged(&staging_root, &staged)?;
+            return Err(ModelAssetError::NotOwned);
+        }
+        for entry in &staged {
             if self
                 .storage()
-                .metadata(path)
-                .map_err(|source| self.relative_storage_error(path, source))?
-                .is_some()
+                .identity(&entry.staged)
+                .map_err(|_| ModelAssetError::NotOwned)?
+                != Some(entry.identity)
             {
-                self.storage()
-                    .remove_file(path)
-                    .map_err(|source| self.relative_storage_error(path, source))?;
+                self.rollback_staged(&staging_root, &staged)?;
+                return Err(ModelAssetError::NotOwned);
             }
+            self.storage()
+                .remove_file(&entry.staged)
+                .map_err(|source| self.relative_storage_error(&entry.staged, source))?;
         }
         self.storage()
-            .remove_file(marker_path)
-            .map_err(|source| self.relative_storage_error(marker_path, source))?;
+            .remove_dir(&staging_root)
+            .map_err(|source| self.relative_storage_error(&staging_root, source))?;
+        self.0
+            .invalid_finals
+            .lock()
+            .expect("invalid model assets lock")
+            .clear();
         let free = self.0.disk_space.available(&self.0.root)?;
         let status =
             ModelAssetStatus::missing(&self.0.manifest, free, self.0.credentials.get()?.is_some());
         self.publish(status.clone());
         Ok(status)
+    }
+
+    fn create_removal_staging(&self) -> Result<PathBuf, ModelAssetError> {
+        let operation_id = self.0.next_operation_id.fetch_add(1, Ordering::Relaxed);
+        for attempt in 0..64 {
+            let path = PathBuf::from(format!(
+                ".piu-removal-{}-{operation_id}-{attempt}",
+                std::process::id()
+            ));
+            match self.storage().create_dir(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(source) => return Err(self.relative_storage_error(&path, source)),
+            }
+        }
+        Err(ModelAssetError::NotOwned)
+    }
+
+    fn staged_identities_match(&self, staged: &[StagedRemoval]) -> Result<(), ModelAssetError> {
+        for entry in staged {
+            if self
+                .storage()
+                .identity(&entry.staged)
+                .map_err(|_| ModelAssetError::NotOwned)?
+                != Some(entry.identity)
+            {
+                return Err(ModelAssetError::NotOwned);
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback_staged(
+        &self,
+        staging_root: &Path,
+        staged: &[StagedRemoval],
+    ) -> Result<(), ModelAssetError> {
+        for entry in staged.iter().rev() {
+            if self
+                .storage()
+                .metadata(&entry.original)
+                .map_err(|_| ModelAssetError::NotOwned)?
+                .is_some()
+            {
+                return Err(ModelAssetError::NotOwned);
+            }
+            self.storage()
+                .rename(&entry.staged, &entry.original)
+                .map_err(|_| ModelAssetError::NotOwned)?;
+        }
+        self.storage()
+            .remove_dir(staging_root)
+            .map_err(|_| ModelAssetError::NotOwned)
+    }
+
+    fn restore_staged_path(&self, original: &Path, staged: &Path) -> Result<(), ModelAssetError> {
+        if self
+            .storage()
+            .metadata(original)
+            .map_err(|_| ModelAssetError::NotOwned)?
+            .is_some()
+        {
+            return Err(ModelAssetError::NotOwned);
+        }
+        self.storage()
+            .rename(staged, original)
+            .map_err(|_| ModelAssetError::NotOwned)
     }
 
     async fn download_all(
@@ -873,6 +1120,11 @@ impl ModelAssetManager {
                 .await?
                 != file.sha256
             {
+                self.0
+                    .invalid_finals
+                    .lock()
+                    .expect("invalid model assets lock")
+                    .insert(file.install_path.clone());
                 return Err(ModelAssetError::Integrity(file.source_path.clone()));
             }
         }
@@ -923,7 +1175,7 @@ impl ModelAssetManager {
         let expected_metadata = PartialMetadata::from_manifest(&self.0.manifest, manifest_file);
         let recorded_metadata = self
             .storage()
-            .read(&metadata_path)
+            .read_bounded(&metadata_path, PARTIAL_METADATA_MAX_BYTES)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<PartialMetadata>(&bytes).ok());
         let partial_metadata = self
@@ -960,6 +1212,7 @@ impl ModelAssetManager {
                     .rename(&partial, &destination)
                     .map_err(|source| self.relative_storage_error(&destination, source))?;
                 self.remove_if_present(&metadata_path)?;
+                self.clear_invalid_final(&manifest_file.install_path);
                 return Ok(());
             }
             self.reset_partial(&partial, &metadata_path)?;
@@ -1015,7 +1268,7 @@ impl ModelAssetManager {
             .map_err(|source| self.relative_storage_error(&partial, source))?;
         let mut stream = response.bytes_stream();
         let mut file_bytes = offset;
-        let mut last_reported = self.status().transferred_bytes;
+        let mut progress = TransferProgress::new(self.transferred_bytes(), offset);
         while let Some(chunk) = tokio::select! {
             _ = cancellation.cancelled() => return Err(ModelAssetError::Cancelled),
             chunk = stream.next() => chunk,
@@ -1026,11 +1279,7 @@ impl ModelAssetManager {
                 .await
                 .map_err(|source| self.relative_storage_error(&partial, source))?;
             file_bytes = file_bytes.saturating_add(chunk.len() as u64);
-            let total = self.transferred_bytes();
-            if total.saturating_sub(last_reported) >= PROGRESS_CHUNK_BYTES
-                || file_bytes == manifest_file.size_bytes
-            {
-                last_reported = total;
+            if let Some(total) = progress.observe(file_bytes, manifest_file.size_bytes) {
                 self.publish_progress(manifest_file, operation_id, total);
             }
         }
@@ -1062,6 +1311,7 @@ impl ModelAssetManager {
             .rename(&partial, &destination)
             .map_err(|source| self.relative_storage_error(&destination, source))?;
         self.remove_if_present(&metadata_path)?;
+        self.clear_invalid_final(&manifest_file.install_path);
         Ok(())
     }
 
@@ -1071,14 +1321,22 @@ impl ModelAssetManager {
         cancellation: &CancellationToken,
     ) -> Result<bool, ModelAssetError> {
         let path = Path::new(&file.install_path);
+        let invalid = self
+            .0
+            .invalid_finals
+            .lock()
+            .expect("invalid model assets lock")
+            .contains(&file.install_path);
         let Some(metadata) = self
             .storage()
             .metadata(path)
             .map_err(|source| self.relative_storage_error(path, source))?
         else {
+            self.clear_invalid_final(&file.install_path);
             return Ok(false);
         };
-        if metadata.is_file()
+        if !invalid
+            && metadata.is_file()
             && !metadata.file_type().is_symlink()
             && metadata.len() == file.size_bytes
             && self.sha256_relative(path, cancellation).await? == file.sha256
@@ -1089,6 +1347,7 @@ impl ModelAssetManager {
         self.storage()
             .remove_file(path)
             .map_err(|source| self.relative_storage_error(path, source))?;
+        self.clear_invalid_final(&file.install_path);
         Ok(false)
     }
 
@@ -1105,6 +1364,9 @@ impl ModelAssetManager {
         status.current_file = None;
         status.transferred_bytes = self.transferred_bytes();
         status.remaining_bytes = status.total_bytes.saturating_sub(status.transferred_bytes);
+        status.required_free_bytes = status
+            .remaining_bytes
+            .saturating_add(DISK_SAFETY_RESERVE_BYTES);
         if let ModelAssetError::InsufficientSpace {
             available,
             required,
@@ -1151,11 +1413,19 @@ impl ModelAssetManager {
 
     fn transferred_bytes(&self) -> u64 {
         let storage = self.storage();
+        let invalid_finals = self
+            .0
+            .invalid_finals
+            .lock()
+            .expect("invalid model assets lock");
         self.0
             .manifest
             .files
             .iter()
             .map(|file| {
+                if invalid_finals.contains(&file.install_path) {
+                    return 0;
+                }
                 storage
                     .metadata(Path::new(&file.install_path))
                     .ok()
@@ -1185,14 +1455,15 @@ impl ModelAssetManager {
             })?
             .is_some()
         {
-            let marker: OwnershipMarker =
-                serde_json::from_slice(&storage.read(marker_relative).map_err(|source| {
-                    ModelAssetError::Storage {
+            let marker: OwnershipMarker = serde_json::from_slice(
+                &storage
+                    .read_bounded(marker_relative, OWNERSHIP_METADATA_MAX_BYTES)
+                    .map_err(|source| ModelAssetError::Storage {
                         path: storage.absolute(marker_relative),
                         source,
-                    }
-                })?)
-                .map_err(|_| ModelAssetError::NotOwned)?;
+                    })?,
+            )
+            .map_err(|_| ModelAssetError::NotOwned)?;
             if marker.repository == manifest.repository && marker.revision != manifest.revision {
                 status.phase = ModelAssetPhase::RevisionMismatch;
                 status.message = Some(ModelAssetError::RevisionMismatch.to_string());
@@ -1267,13 +1538,20 @@ impl ModelAssetManager {
         let partial = partial_path(Path::new(&file.install_path));
         let metadata_relative = partial_metadata_path(&partial);
         let partial_metadata = storage.metadata(&partial).ok().flatten()?;
-        if !partial_metadata.is_file() || partial_metadata.file_type().is_symlink() {
+        if !partial_metadata.is_file()
+            || partial_metadata.file_type().is_symlink()
+            || partial_metadata.len() > file.size_bytes
+        {
             return None;
         }
-        let recorded: PartialMetadata =
-            serde_json::from_slice(&storage.read(&metadata_relative).ok()?).ok()?;
+        let recorded: PartialMetadata = serde_json::from_slice(
+            &storage
+                .read_bounded(&metadata_relative, PARTIAL_METADATA_MAX_BYTES)
+                .ok()?,
+        )
+        .ok()?;
         (recorded == PartialMetadata::from_manifest(manifest, file))
-            .then_some(partial_metadata.len().min(file.size_bytes))
+            .then_some(partial_metadata.len())
     }
 
     async fn write_ownership_marker(
@@ -1320,10 +1598,40 @@ impl ModelAssetManager {
         path: &Path,
         cancellation: &CancellationToken,
     ) -> Result<String, ModelAssetError> {
+        self.sha256_relative_with_identity(path, cancellation)
+            .await
+            .map(|(hash, _)| hash)
+    }
+
+    #[cfg(unix)]
+    async fn sha256_relative_with_identity(
+        &self,
+        path: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(String, FileIdentity), ModelAssetError> {
+        use std::os::unix::fs::MetadataExt;
+
         let mut file = self
             .storage()
             .open_read(path)
             .map_err(|source| self.relative_storage_error(path, source))?;
+        let metadata = file
+            .metadata()
+            .await
+            .map_err(|source| self.relative_storage_error(path, source))?;
+        if !metadata.is_file() {
+            return Err(self.relative_storage_error(
+                path,
+                io::Error::new(io::ErrorKind::InvalidData, "model asset is not a file"),
+            ));
+        }
+        let identity = FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            changed_at_seconds: metadata.ctime(),
+            changed_at_nanoseconds: metadata.ctime_nsec(),
+        };
         let mut hasher = Sha256::new();
         let mut buffer = vec![0_u8; 1024 * 1024];
         loop {
@@ -1338,11 +1646,14 @@ impl ModelAssetManager {
             hasher.update(&buffer[..read]);
         }
         ensure_not_cancelled(cancellation)?;
-        Ok(hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect())
+        Ok((
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            identity,
+        ))
     }
 
     fn reset_partial(&self, partial: &Path, metadata: &Path) -> Result<(), ModelAssetError> {
@@ -1362,6 +1673,14 @@ impl ModelAssetManager {
                 .map_err(|source| self.relative_storage_error(path, source))?;
         }
         Ok(())
+    }
+
+    fn clear_invalid_final(&self, install_path: &str) {
+        self.0
+            .invalid_finals
+            .lock()
+            .expect("invalid model assets lock")
+            .remove(install_path);
     }
 
     fn storage(&self) -> &SafeStorage {
@@ -1535,6 +1854,7 @@ fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), ModelAss
 mod tests {
     use std::{
         convert::Infallible,
+        fs,
         sync::{
             Arc, Mutex,
             atomic::{AtomicU8, AtomicU64, Ordering},
@@ -1825,6 +2145,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn download_progress_is_incremental_and_thresholded_after_one_base_sample() {
+        let existing_assets = 9_000_000_000;
+        let resumed_file_bytes = 4_000_000;
+        let file_size = PROGRESS_CHUNK_BYTES + resumed_file_bytes + 1;
+        let mut progress =
+            TransferProgress::new(existing_assets + resumed_file_bytes, resumed_file_bytes);
+
+        assert_eq!(
+            progress.observe(resumed_file_bytes + PROGRESS_CHUNK_BYTES - 1, file_size),
+            None
+        );
+        assert_eq!(
+            progress.observe(resumed_file_bytes + PROGRESS_CHUNK_BYTES, file_size),
+            Some(existing_assets + resumed_file_bytes + PROGRESS_CHUNK_BYTES)
+        );
+        assert_eq!(
+            progress.observe(file_size, file_size),
+            Some(existing_assets + file_size)
+        );
+    }
+
     #[tokio::test]
     async fn range_resume_redirect_relaunch_and_request_coalescing_reach_ready() {
         let bytes = b"pinned model fixture bytes".to_vec();
@@ -1874,14 +2216,27 @@ mod tests {
         let destination = manager.0.root.join("target/model.bin");
         seed_bound_partial(&manager, b"unsafe-oversized-partial").await;
 
-        manager.start_download().expect("recover oversized partial");
-        wait_for_phase(&manager, ModelAssetPhase::Ready).await;
-
-        assert_eq!(fixture.state.ranged_requests.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            tokio::fs::read(destination).await.expect("installed bytes"),
-            bytes
+        let relaunched = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            DISK_SAFETY_RESERVE_BYTES,
         );
+        assert!(!relaunched.status().can_resume);
+
+        relaunched
+            .start_download()
+            .expect("start guarded oversized recovery");
+        let failed = wait_for_phase(&relaunched, ModelAssetPhase::Failed).await;
+
+        assert_eq!(
+            failed.error_code,
+            Some(ModelAssetErrorCode::InsufficientSpace)
+        );
+        assert_eq!(fixture.state.requests.load(Ordering::Relaxed), 0);
+        assert_eq!(fixture.state.ranged_requests.load(Ordering::Relaxed), 0);
+        assert!(!destination.exists());
     }
 
     #[tokio::test]
@@ -1933,6 +2288,48 @@ mod tests {
         }
 
         assert_eq!(fixture.state.ranged_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_partial_metadata_is_bounded_and_never_resumed() {
+        let bytes = b"bounded sidecar fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        let partial = partial_path(Path::new("target/model.bin"));
+        let metadata = partial_metadata_path(&partial);
+        tokio::fs::create_dir_all(manager.0.root.join("target"))
+            .await
+            .expect("target directory");
+        tokio::fs::write(manager.0.root.join(&partial), &bytes[..7])
+            .await
+            .expect("partial bytes");
+        tokio::fs::write(
+            manager.0.root.join(&metadata),
+            vec![b'x'; PARTIAL_METADATA_MAX_BYTES as usize + 1],
+        )
+        .await
+        .expect("oversized sidecar");
+
+        let relaunched = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        assert!(!relaunched.status().can_resume);
+        relaunched.start_download().expect("restart clean download");
+        wait_for_phase(&relaunched, ModelAssetPhase::Ready).await;
+
+        assert_eq!(fixture.state.ranged_requests.load(Ordering::Relaxed), 0);
+        assert!(!manager.0.root.join(metadata).exists());
     }
 
     #[tokio::test]
@@ -2185,6 +2582,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_between_verification_and_removal_is_never_deleted() {
+        let bytes = b"owned race fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        manager.start_download().expect("install owned file");
+        wait_for_phase(&manager, ModelAssetPhase::Ready).await;
+        let root = manager.0.root.clone();
+        let replacement = b"unknown replacement";
+
+        let missing = manager
+            .remove_owned_assets_with_hook(|relative| {
+                fs::write(root.join(relative), replacement).expect("replacement file");
+            })
+            .await
+            .expect("remove staged verified file");
+
+        assert_eq!(missing.phase, ModelAssetPhase::Missing);
+        assert_eq!(
+            fs::read(root.join("target/model.bin")).expect("preserved replacement"),
+            replacement
+        );
+        assert!(!root.join(OWNERSHIP_FILE).exists());
+        assert!(fs::read_dir(&root).expect("model root").all(|entry| {
+            !entry
+                .expect("model root entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".piu-removal-")
+        }));
+    }
+
+    #[tokio::test]
     async fn adversarial_old_marker_paths_and_tampered_files_are_never_removed() {
         let bytes = b"safe fixture bytes".to_vec();
         let fixture = Fixture::start(bytes.clone()).await;
@@ -2402,6 +2838,82 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn intermediate_app_data_components_cannot_redirect_to_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDir::new().expect("temporary storage parent");
+        let trusted = temporary.path().join("trusted");
+        let outside = temporary.path().join("outside");
+        fs::create_dir(&trusted).expect("trusted directory");
+        fs::create_dir(&outside).expect("outside directory");
+        symlink(&outside, trusted.join("intermediate")).expect("intermediate symlink");
+        let trusted_directory =
+            Dir::open_ambient_dir(&trusted, ambient_authority()).expect("trusted capability");
+
+        let result = SafeStorage::open_beneath(
+            trusted_directory,
+            Path::new("intermediate/app-data"),
+            trusted.join("intermediate/app-data"),
+            Path::new("models"),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            fs::read_dir(&outside)
+                .expect("outside directory")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn swapping_visible_app_data_path_cannot_redirect_bound_storage() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDir::new().expect("temporary storage parent");
+        let trusted = temporary.path().join("trusted");
+        let app_data = trusted.join("app-data");
+        let retained = trusted.join("retained-app-data");
+        let outside = temporary.path().join("outside");
+        fs::create_dir(&trusted).expect("trusted directory");
+        fs::create_dir(&app_data).expect("app data directory");
+        fs::create_dir(&outside).expect("outside directory");
+        let trusted_directory =
+            Dir::open_ambient_dir(&trusted, ambient_authority()).expect("trusted capability");
+        let storage = SafeStorage::open_beneath(
+            trusted_directory,
+            Path::new("app-data"),
+            app_data.clone(),
+            Path::new("models"),
+        )
+        .expect("bound storage");
+
+        fs::rename(&app_data, &retained).expect("retain original app data");
+        symlink(&outside, &app_data).expect("replace visible app data path");
+        let relative = Path::new("target/probe.bin");
+        let mut file = storage
+            .open_write(relative, false)
+            .expect("write through retained capability");
+        file.write_all(b"capability-bound")
+            .await
+            .expect("write retained file");
+        file.flush().await.expect("flush retained file");
+
+        assert_eq!(
+            fs::read(retained.join("models/target/probe.bin")).expect("retained bytes"),
+            b"capability-bound"
+        );
+        assert!(
+            fs::read_dir(&outside)
+                .expect("outside directory")
+                .next()
+                .is_none()
+        );
+    }
+
     #[test]
     fn mismatched_owned_revision_is_never_treated_as_ready() {
         let bytes = b"old revision fixture";
@@ -2490,6 +3002,42 @@ mod tests {
         assert_eq!(manager.status().phase, ModelAssetPhase::Verifying);
         let failed = wait_for_phase(&manager, ModelAssetPhase::Failed).await;
         assert_eq!(failed.error_code, Some(ModelAssetErrorCode::Integrity));
+        assert_eq!(failed.transferred_bytes, 0);
+        assert_eq!(failed.remaining_bytes, bytes.len() as u64);
+        assert_eq!(
+            failed.required_free_bytes,
+            bytes.len() as u64 + DISK_SAFETY_RESERVE_BYTES
+        );
+        assert!(!failed.can_resume);
+    }
+
+    #[tokio::test]
+    async fn oversized_ownership_marker_fails_startup_inspection_without_unbounded_reading() {
+        let bytes = b"bounded marker fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let root = temporary.path().join("models");
+        fs::create_dir(&root).expect("model root");
+        fs::write(
+            root.join(OWNERSHIP_FILE),
+            vec![b'x'; OWNERSHIP_METADATA_MAX_BYTES as usize + 1],
+        )
+        .expect("oversized marker");
+        let manifest = fixture_manifest(&bytes);
+
+        let started = std::time::Instant::now();
+        let result = ModelAssetManager::new(
+            temporary.path().to_path_buf(),
+            PathBuf::from("models"),
+            manifest.clone(),
+            format!("{}/resolve/{}", fixture.base_url, manifest.revision),
+            format!("{}/whoami", fixture.base_url),
+            Arc::new(MemoryCredentials::default()),
+            Arc::new(FixedDisk(AtomicU64::new(u64::MAX))),
+        );
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(matches!(result, Err(ModelAssetError::Storage { .. })));
     }
 
     #[tokio::test(flavor = "current_thread")]
