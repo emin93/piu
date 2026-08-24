@@ -71,7 +71,8 @@ test("settings explains the pinned target, disk requirement, and manual download
 
   expect(await screen.findByRole("heading", { name: "Local model" })).toBeVisible();
   expect(screen.getByText("Qwen 3.8 27B · 4-bit")).toBeVisible();
-  expect(screen.getByText(/MTP drafter · block 3/i)).toBeVisible();
+  expect(screen.getByText("MTP drafter")).toBeVisible();
+  expect(screen.queryByText(/block 3/i)).not.toBeInTheDocument();
   expect(screen.getByText("Download size").parentElement).toHaveTextContent("17 GB");
   expect(screen.getByText("Space needed").parentElement).toHaveTextContent("18 GB");
   await userEvent.click(screen.getByRole("button", { name: "Download model" }));

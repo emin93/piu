@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     ffi::OsString,
+    fs::File as StdFile,
     io::{self, Read as _},
     path::{Component, Path, PathBuf},
     sync::{
@@ -189,10 +190,13 @@ const DISK_SAFETY_RESERVE_BYTES: u64 = 1_073_741_824;
 const PROGRESS_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const OWNERSHIP_METADATA_MAX_BYTES: u64 = 64 * 1024;
 const PARTIAL_METADATA_MAX_BYTES: u64 = 8 * 1024;
+const PRIVATE_WRITE_RECOVERY_MAX_BYTES: u64 = 16 * 1024;
+const PRIVATE_WRITE_RECOVERY_SUFFIX: &str = ".piu-work.json";
 const REMOVAL_STAGING_PREFIX: &str = ".piu-removal-";
 const REMOVAL_RECOVERY_FILE: &str = "recovery.json";
 const REMOVAL_RECOVERY_MAX_BYTES: u64 = 128 * 1024;
 const REMOVAL_RECOVERY_MAX_ENTRIES: usize = 64;
+static PRIVATE_WRITE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
 struct NetworkTimeouts {
@@ -479,6 +483,63 @@ struct SafeStorage {
     directory: Dir,
 }
 
+/// A file that stays under an operation-private name until its opened inode has
+/// been flushed and revalidated. Replacing the private pathname cannot redirect
+/// writes because all bytes go through the already-open file description.
+struct PrivateWrite {
+    output: Option<File>,
+    sync_handle: StdFile,
+    directory: Dir,
+    temporary_name: OsString,
+    destination_name: OsString,
+    temporary_path: PathBuf,
+    opened_device: u64,
+    opened_inode: u64,
+    publish_on_drop: bool,
+    published: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrivateWriteRecovery {
+    schema_version: u32,
+    owner: String,
+    temporary_path: PathBuf,
+    partial: PartialMetadata,
+}
+
+trait RemovalPersistence: Send + Sync {
+    fn commit_journal(
+        &self,
+        storage: &SafeStorage,
+        path: &Path,
+        phase: RemovalRecoveryPhase,
+    ) -> io::Result<()>;
+    fn stage(&self, storage: &SafeStorage, from: &Path, to: &Path) -> io::Result<()>;
+    fn delete(&self, storage: &SafeStorage, path: &Path) -> io::Result<()>;
+}
+
+struct DurableRemovalPersistence;
+
+impl RemovalPersistence for DurableRemovalPersistence {
+    fn commit_journal(
+        &self,
+        storage: &SafeStorage,
+        path: &Path,
+        _phase: RemovalRecoveryPhase,
+    ) -> io::Result<()> {
+        storage.sync_parent(path)
+    }
+
+    fn stage(&self, storage: &SafeStorage, from: &Path, to: &Path) -> io::Result<()> {
+        storage.rename_durable(from, to)
+    }
+
+    fn delete(&self, storage: &SafeStorage, path: &Path) -> io::Result<()> {
+        storage.remove_file_durable(path)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FileIdentity {
@@ -705,28 +766,85 @@ impl SafeStorage {
         ))
     }
 
-    fn open_write(&self, relative: &Path, append: bool) -> io::Result<File> {
-        use std::os::unix::fs::MetadataExt;
+    fn create_private_write(
+        &self,
+        destination: &Path,
+        publish_on_drop: bool,
+    ) -> io::Result<PrivateWrite> {
+        let (directory, destination_name, temporary_name, temporary_path, file) =
+            self.create_private_slot(destination)?;
+        PrivateWrite::new(
+            file,
+            directory,
+            temporary_name,
+            destination_name,
+            temporary_path,
+            publish_on_drop,
+        )
+    }
 
-        let (directory, name) = self.parent_and_name(relative, true)?;
-        let mut options = CapOpenOptions::new();
-        options
-            .write(true)
-            .create(true)
-            .append(append)
-            .follow(FollowSymlinks::No);
-        let file = directory.open_with(name, &options)?.into_std();
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.nlink() != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "model asset writes require a private single-link file",
-            ));
+    fn create_private_slot(
+        &self,
+        destination: &Path,
+    ) -> io::Result<(Dir, OsString, OsString, PathBuf, StdFile)> {
+        let (directory, destination_name) = self.parent_and_name(destination, true)?;
+        for _ in 0..64 {
+            let identifier = PRIVATE_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+            let mut temporary_name = OsString::from(".");
+            temporary_name.push(&destination_name);
+            temporary_name.push(format!(".piu-write-{}-{identifier}", std::process::id()));
+            let mut options = CapOpenOptions::new();
+            options
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .follow(FollowSymlinks::No);
+            match directory.open_with(&temporary_name, &options) {
+                Ok(file) => {
+                    let temporary_path = destination
+                        .parent()
+                        .unwrap_or_else(|| Path::new(""))
+                        .join(&temporary_name);
+                    return Ok((
+                        directory,
+                        destination_name,
+                        temporary_name,
+                        temporary_path,
+                        file.into_std(),
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
         }
-        if !append {
-            file.set_len(0)?;
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate an operation-private model asset file",
+        ))
+    }
+
+    fn sync_parent(&self, relative: &Path) -> io::Result<()> {
+        let (directory, _) = self.parent_and_name(relative, false)?;
+        directory.into_std_file().sync_all()
+    }
+
+    fn rename_durable(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.rename(from, to)?;
+        self.sync_parent(from)?;
+        if from.parent() != to.parent() {
+            self.sync_parent(to)?;
         }
-        Ok(File::from_std(file))
+        Ok(())
+    }
+
+    fn remove_file_durable(&self, relative: &Path) -> io::Result<()> {
+        self.remove_file(relative)?;
+        self.sync_parent(relative)
+    }
+
+    fn remove_dir_durable(&self, relative: &Path) -> io::Result<()> {
+        self.remove_dir(relative)?;
+        self.sync_parent(relative)
     }
 
     fn metadata(&self, relative: &Path) -> io::Result<Option<cap_std::fs::Metadata>> {
@@ -795,6 +913,203 @@ impl SafeStorage {
     }
 }
 
+#[cfg(unix)]
+fn std_file_identity(file: &StdFile) -> io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        links: metadata.nlink(),
+        changed_at_seconds: metadata.ctime(),
+        changed_at_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+impl PrivateWrite {
+    fn new(
+        file: StdFile,
+        directory: Dir,
+        temporary_name: OsString,
+        destination_name: OsString,
+        temporary_path: PathBuf,
+        publish_on_drop: bool,
+    ) -> io::Result<Self> {
+        let identity = std_file_identity(&file)?;
+        if identity.links != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "operation-private model asset file has multiple links",
+            ));
+        }
+        let output = File::from_std(file.try_clone()?);
+        Ok(Self {
+            output: Some(output),
+            sync_handle: file,
+            directory,
+            temporary_name,
+            destination_name,
+            temporary_path,
+            opened_device: identity.device,
+            opened_inode: identity.inode,
+            publish_on_drop,
+            published: false,
+        })
+    }
+
+    fn temporary_path(&self) -> &Path {
+        &self.temporary_path
+    }
+
+    fn enable_publish_on_drop(&mut self) {
+        self.publish_on_drop = true;
+    }
+
+    fn adopt_existing(&mut self, expected: FileIdentity) -> io::Result<()> {
+        drop(self.output.take());
+        self.publish_on_drop = false;
+        self.directory.rename(
+            &self.destination_name,
+            &self.directory,
+            &self.temporary_name,
+        )?;
+        let mut options = CapOpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .append(true)
+            .follow(FollowSymlinks::No);
+        let opened = match self.directory.open_with(&self.temporary_name, &options) {
+            Ok(file) => file.into_std(),
+            Err(error) => {
+                let _ = self.directory.rename(
+                    &self.temporary_name,
+                    &self.directory,
+                    &self.destination_name,
+                );
+                return Err(error);
+            }
+        };
+        let actual = std_file_identity(&opened)?;
+        if actual.device != expected.device
+            || actual.inode != expected.inode
+            || actual.size != expected.size
+            || actual.links != 1
+        {
+            drop(opened);
+            let _ = self.directory.rename(
+                &self.temporary_name,
+                &self.directory,
+                &self.destination_name,
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "model asset partial changed while it became operation-private",
+            ));
+        }
+        self.output = Some(File::from_std(opened.try_clone()?));
+        self.sync_handle = opened;
+        self.opened_device = actual.device;
+        self.opened_inode = actual.inode;
+        self.publish_on_drop = true;
+        Ok(())
+    }
+
+    async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.output
+            .as_mut()
+            .expect("private output is open")
+            .write_all(bytes)
+            .await
+    }
+
+    async fn publish(mut self) -> io::Result<()> {
+        if let Some(mut output) = self.output.take() {
+            output.flush().await?;
+            output.sync_all().await?;
+            drop(output);
+        }
+        self.publish_on_drop = false;
+        self.publish_opened_inode()
+    }
+
+    fn publish_opened_inode(&mut self) -> io::Result<()> {
+        use cap_std::fs::MetadataExt as CapMetadataExt;
+        use std::os::unix::fs::MetadataExt as StdMetadataExt;
+
+        self.sync_handle.sync_all()?;
+        let opened = self.sync_handle.metadata()?;
+        let visible = self.directory.symlink_metadata(&self.temporary_name)?;
+        let same_opened_inode = StdMetadataExt::dev(&opened) == self.opened_device
+            && StdMetadataExt::ino(&opened) == self.opened_inode
+            && StdMetadataExt::nlink(&opened) == 1;
+        let same_visible_inode = visible.is_file()
+            && !visible.file_type().is_symlink()
+            && CapMetadataExt::dev(&visible) == self.opened_device
+            && CapMetadataExt::ino(&visible) == self.opened_inode
+            && CapMetadataExt::nlink(&visible) == 1
+            && CapMetadataExt::size(&visible) == StdMetadataExt::size(&opened);
+        if !same_opened_inode || !same_visible_inode {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "operation-private model asset path changed before publication",
+            ));
+        }
+        self.directory.rename(
+            &self.temporary_name,
+            &self.directory,
+            &self.destination_name,
+        )?;
+        self.directory.try_clone()?.into_std_file().sync_all()?;
+        let published = self.directory.symlink_metadata(&self.destination_name)?;
+        if CapMetadataExt::dev(&published) != self.opened_device
+            || CapMetadataExt::ino(&published) != self.opened_inode
+            || CapMetadataExt::nlink(&published) != 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "published model asset does not match its private inode",
+            ));
+        }
+        self.published = true;
+        Ok(())
+    }
+
+    fn remove_unpublished_private_inode(&self) {
+        use cap_std::fs::MetadataExt;
+
+        let Ok(metadata) = self.directory.symlink_metadata(&self.temporary_name) else {
+            return;
+        };
+        if metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.dev() == self.opened_device
+            && metadata.ino() == self.opened_inode
+            && metadata.nlink() == 1
+        {
+            let _ = self.directory.remove_file(&self.temporary_name);
+            let _ = self
+                .directory
+                .try_clone()
+                .and_then(|directory| directory.into_std_file().sync_all());
+        }
+    }
+}
+
+impl Drop for PrivateWrite {
+    fn drop(&mut self) {
+        drop(self.output.take());
+        if self.publish_on_drop && !self.published {
+            let _ = self.publish_opened_inode();
+        }
+        if !self.published {
+            self.remove_unpublished_private_inode();
+        }
+    }
+}
+
 struct ModelAssetManagerInner {
     root: PathBuf,
     storage: Option<SafeStorage>,
@@ -808,6 +1123,7 @@ struct ModelAssetManagerInner {
     status: watch::Sender<ModelAssetStatus>,
     active: Mutex<Option<ActiveOperation>>,
     invalid_finals: Mutex<HashSet<String>>,
+    removal_persistence: Mutex<Arc<dyn RemovalPersistence>>,
     next_operation_id: AtomicU64,
     initialization_error: Option<String>,
 }
@@ -863,6 +1179,7 @@ impl ModelAssetManager {
                 status,
                 active: Mutex::new(None),
                 invalid_finals: Mutex::new(HashSet::new()),
+                removal_persistence: Mutex::new(Arc::new(DurableRemovalPersistence)),
                 next_operation_id: AtomicU64::new(1),
                 initialization_error: Some(message),
             }))
@@ -910,6 +1227,7 @@ impl ModelAssetManager {
             }
         })?;
         Self::recover_staged_removals(&storage)?;
+        Self::recover_private_writes(&storage, &manifest)?;
         let free_bytes = disk_space.available(&root)?;
         let has_credentials = credentials.get()?.is_some();
         let inspection = Self::inspect_install(&storage, &manifest, free_bytes, has_credentials)?;
@@ -931,6 +1249,7 @@ impl ModelAssetManager {
             status,
             active: Mutex::new(None),
             invalid_finals: Mutex::new(HashSet::new()),
+            removal_persistence: Mutex::new(Arc::new(DurableRemovalPersistence)),
             next_operation_id: AtomicU64::new(1),
             initialization_error: None,
         }));
@@ -959,6 +1278,152 @@ impl ModelAssetManager {
             Self::recover_staged_removal(storage, &staging_directory)?;
         }
         Ok(())
+    }
+
+    fn recover_private_writes(
+        storage: &SafeStorage,
+        manifest: &AssetManifest,
+    ) -> Result<(), ModelAssetError> {
+        for file in &manifest.files {
+            Self::recover_private_write(storage, manifest, file)?;
+        }
+        Ok(())
+    }
+
+    fn recover_private_write(
+        storage: &SafeStorage,
+        manifest: &AssetManifest,
+        file: &ManifestFile,
+    ) -> Result<(), ModelAssetError> {
+        let partial = partial_path(Path::new(&file.install_path));
+        let recovery = private_write_recovery_path(&partial);
+        let parent = partial.parent().unwrap_or_else(|| Path::new(""));
+        let entries = match storage.entry_names(Some(parent)) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(ModelAssetError::Storage {
+                    path: storage.absolute(parent),
+                    source,
+                });
+            }
+        };
+        let partial_name = partial.file_name().expect("manifest partial file name");
+        let recovery_name = recovery.file_name().expect("recovery file name");
+        let mut candidates = entries
+            .iter()
+            .filter(|name| is_private_write_name_for(name, partial_name))
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort();
+        for name in entries
+            .iter()
+            .filter(|name| is_private_write_name_for(name, recovery_name))
+        {
+            let path = parent.join(name);
+            let identity = storage
+                .identity(&path)
+                .map_err(|_| ModelAssetError::NotOwned)?
+                .ok_or(ModelAssetError::NotOwned)?;
+            if identity.links != 1 || identity.size > PRIVATE_WRITE_RECOVERY_MAX_BYTES {
+                return Err(ModelAssetError::NotOwned);
+            }
+            storage
+                .remove_file_durable(&path)
+                .map_err(|_| ModelAssetError::NotOwned)?;
+        }
+        let recovery_identity = storage
+            .identity(&recovery)
+            .map_err(|_| ModelAssetError::NotOwned)?;
+        let Some(recovery_identity) = recovery_identity else {
+            for candidate in candidates {
+                let path = parent.join(candidate);
+                let identity = storage
+                    .identity(&path)
+                    .map_err(|_| ModelAssetError::NotOwned)?
+                    .ok_or(ModelAssetError::NotOwned)?;
+                if identity.links != 1 || identity.size != 0 {
+                    return Err(ModelAssetError::NotOwned);
+                }
+                storage
+                    .remove_file_durable(&path)
+                    .map_err(|_| ModelAssetError::NotOwned)?;
+            }
+            return Ok(());
+        };
+        if recovery_identity.links != 1 || recovery_identity.size > PRIVATE_WRITE_RECOVERY_MAX_BYTES
+        {
+            return Err(ModelAssetError::NotOwned);
+        }
+        let bytes = storage
+            .read_bounded(&recovery, PRIVATE_WRITE_RECOVERY_MAX_BYTES)
+            .map_err(|_| ModelAssetError::NotOwned)?;
+        let plan: PrivateWriteRecovery =
+            serde_json::from_slice(&bytes).map_err(|_| ModelAssetError::NotOwned)?;
+        let expected = PartialMetadata::from_manifest(manifest, file);
+        if plan.schema_version != 1
+            || plan.owner != "ch.emin.piu"
+            || plan.partial != expected
+            || !safe_relative_path(&plan.temporary_path)
+            || plan.temporary_path.parent() != Some(parent)
+            || plan
+                .temporary_path
+                .file_name()
+                .is_none_or(|name| !is_private_write_name_for(name, partial_name))
+        {
+            return Err(ModelAssetError::NotOwned);
+        }
+        let planned_name = plan
+            .temporary_path
+            .file_name()
+            .expect("validated private write name");
+        for candidate in &candidates {
+            if candidate != planned_name {
+                let path = parent.join(candidate);
+                let identity = storage
+                    .identity(&path)
+                    .map_err(|_| ModelAssetError::NotOwned)?
+                    .ok_or(ModelAssetError::NotOwned)?;
+                if identity.links != 1 || identity.size != 0 {
+                    return Err(ModelAssetError::NotOwned);
+                }
+                storage
+                    .remove_file_durable(&path)
+                    .map_err(|_| ModelAssetError::NotOwned)?;
+            }
+        }
+        let planned_path = &plan.temporary_path;
+        if let Some(candidate_identity) = storage
+            .identity(planned_path)
+            .map_err(|_| ModelAssetError::NotOwned)?
+        {
+            if candidate_identity.links != 1 || candidate_identity.size > file.size_bytes {
+                return Err(ModelAssetError::NotOwned);
+            }
+            let existing_size = Self::bound_partial_size(storage, manifest, file);
+            if storage
+                .metadata(&partial)
+                .map_err(|_| ModelAssetError::NotOwned)?
+                .is_some()
+                && existing_size.is_none()
+            {
+                return Err(ModelAssetError::NotOwned);
+            }
+            if candidate_identity.size == 0
+                || existing_size.is_some_and(|size| size >= candidate_identity.size)
+            {
+                storage
+                    .remove_file_durable(planned_path)
+                    .map_err(|_| ModelAssetError::NotOwned)?;
+            } else {
+                storage
+                    .rename_durable(planned_path, &partial)
+                    .map_err(|_| ModelAssetError::NotOwned)?;
+            }
+        }
+        storage
+            .remove_file_durable(&recovery)
+            .map_err(|_| ModelAssetError::NotOwned)
     }
 
     fn recover_staged_removal(
@@ -1016,7 +1481,7 @@ impl ModelAssetManager {
                 source,
             })?
             .iter()
-            .any(|name| !allowed_names.contains(name))
+            .any(|name| !allowed_names.contains(name) && !is_recovery_private_write_name(name))
         {
             return Err(ModelAssetError::NotOwned);
         }
@@ -1036,7 +1501,7 @@ impl ModelAssetManager {
                             if identity.links == 1 && identity.size == entry.size_bytes =>
                         {
                             storage
-                                .rename(&entry.staged, &entry.original)
+                                .rename_durable(&entry.staged, &entry.original)
                                 .map_err(|_| ModelAssetError::NotOwned)?;
                         }
                         (true, None) => {}
@@ -1056,14 +1521,14 @@ impl ModelAssetManager {
                         return Err(ModelAssetError::NotOwned);
                     }
                     storage
-                        .remove_file(&entry.staged)
+                        .remove_file_durable(&entry.staged)
                         .map_err(|_| ModelAssetError::NotOwned)?;
                 }
             }
         }
         Self::remove_recovery_metadata(storage, staging_directory)?;
         storage
-            .remove_dir(staging_directory)
+            .remove_dir_durable(staging_directory)
             .map_err(|_| ModelAssetError::NotOwned)
     }
 
@@ -1071,29 +1536,33 @@ impl ModelAssetManager {
         storage: &SafeStorage,
         staging_directory: &Path,
     ) -> Result<(), ModelAssetError> {
-        let temporary = staging_directory.join(format!("{REMOVAL_RECOVERY_FILE}.tmp"));
         let entries = storage
             .entry_names(Some(staging_directory))
             .map_err(|_| ModelAssetError::NotOwned)?;
         if entries.is_empty() {
             return storage
-                .remove_dir(staging_directory)
+                .remove_dir_durable(staging_directory)
                 .map_err(|_| ModelAssetError::NotOwned);
         }
-        if entries == [OsString::from(format!("{REMOVAL_RECOVERY_FILE}.tmp"))]
-            && storage
+        if entries.len() == 1
+            && (entries[0] == OsString::from(format!("{REMOVAL_RECOVERY_FILE}.tmp"))
+                || is_recovery_private_write_name(&entries[0]))
+        {
+            let temporary = staging_directory.join(&entries[0]);
+            if storage
                 .identity(&temporary)
                 .map_err(|_| ModelAssetError::NotOwned)?
                 .is_some_and(|identity| {
                     identity.links == 1 && identity.size <= REMOVAL_RECOVERY_MAX_BYTES
                 })
-        {
-            storage
-                .remove_file(&temporary)
-                .map_err(|_| ModelAssetError::NotOwned)?;
-            return storage
-                .remove_dir(staging_directory)
-                .map_err(|_| ModelAssetError::NotOwned);
+            {
+                storage
+                    .remove_file_durable(&temporary)
+                    .map_err(|_| ModelAssetError::NotOwned)?;
+                return storage
+                    .remove_dir_durable(staging_directory)
+                    .map_err(|_| ModelAssetError::NotOwned);
+            }
         }
         Err(ModelAssetError::NotOwned)
     }
@@ -1102,10 +1571,14 @@ impl ModelAssetManager {
         storage: &SafeStorage,
         staging_directory: &Path,
     ) -> Result<(), ModelAssetError> {
-        for name in [
-            format!("{REMOVAL_RECOVERY_FILE}.tmp"),
-            REMOVAL_RECOVERY_FILE.into(),
-        ] {
+        let names = storage
+            .entry_names(Some(staging_directory))
+            .map_err(|_| ModelAssetError::NotOwned)?;
+        for name in names.into_iter().filter(|name| {
+            name == REMOVAL_RECOVERY_FILE
+                || *name == OsString::from(format!("{REMOVAL_RECOVERY_FILE}.tmp"))
+                || is_recovery_private_write_name(name)
+        }) {
             let path = staging_directory.join(name);
             let Some(identity) = storage
                 .identity(&path)
@@ -1117,7 +1590,7 @@ impl ModelAssetManager {
                 return Err(ModelAssetError::NotOwned);
             }
             storage
-                .remove_file(&path)
+                .remove_file_durable(&path)
                 .map_err(|_| ModelAssetError::NotOwned)?;
         }
         Ok(())
@@ -1366,6 +1839,15 @@ impl ModelAssetManager {
             let _ = Self::remove_abandoned_empty_staging(self.storage(), &staging_root);
             return Err(error);
         }
+        self.removal_persistence()
+            .commit_journal(
+                self.storage(),
+                &staging_root.join(REMOVAL_RECOVERY_FILE),
+                RemovalRecoveryPhase::Staging,
+            )
+            .map_err(|source| {
+                self.relative_storage_error(&staging_root.join(REMOVAL_RECOVERY_FILE), source)
+            })?;
         let mut staged = Vec::with_capacity(marker.files.len() + 1);
         for (index, file) in marker.files.iter().enumerate() {
             ensure_not_cancelled(cancellation).inspect_err(|_| {
@@ -1387,7 +1869,10 @@ impl ModelAssetManager {
                 return Err(ModelAssetError::NotOwned);
             }
             let staged_path = staging_root.join(format!("asset-{index}"));
-            if let Err(source) = self.storage().rename(relative, &staged_path) {
+            if let Err(source) =
+                self.removal_persistence()
+                    .stage(self.storage(), relative, &staged_path)
+            {
                 self.rollback_staged(&staging_root, &staged)?;
                 return Err(self.relative_storage_error(relative, source));
             }
@@ -1419,7 +1904,10 @@ impl ModelAssetManager {
             let _ = self.rollback_staged(&staging_root, &staged);
         })?;
         let staged_marker = staging_root.join("ownership-marker");
-        if let Err(source) = self.storage().rename(marker_path, &staged_marker) {
+        if let Err(source) =
+            self.removal_persistence()
+                .stage(self.storage(), marker_path, &staged_marker)
+        {
             self.rollback_staged(&staging_root, &staged)?;
             return Err(self.relative_storage_error(marker_path, source));
         }
@@ -1466,6 +1954,15 @@ impl ModelAssetManager {
             self.rollback_staged(&staging_root, &staged)?;
             return Err(error);
         }
+        self.removal_persistence()
+            .commit_journal(
+                self.storage(),
+                &staging_root.join(REMOVAL_RECOVERY_FILE),
+                RemovalRecoveryPhase::Deleting,
+            )
+            .map_err(|source| {
+                self.relative_storage_error(&staging_root.join(REMOVAL_RECOVERY_FILE), source)
+            })?;
         for entry in &staged {
             if self
                 .storage()
@@ -1476,13 +1973,13 @@ impl ModelAssetManager {
                 self.rollback_staged(&staging_root, &staged)?;
                 return Err(ModelAssetError::NotOwned);
             }
-            self.storage()
-                .remove_file(&entry.staged)
+            self.removal_persistence()
+                .delete(self.storage(), &entry.staged)
                 .map_err(|source| self.relative_storage_error(&entry.staged, source))?;
         }
         Self::remove_recovery_metadata(self.storage(), &staging_root)?;
         self.storage()
-            .remove_dir(&staging_root)
+            .remove_dir_durable(&staging_root)
             .map_err(|source| self.relative_storage_error(&staging_root, source))?;
         self.0
             .invalid_finals
@@ -1510,7 +2007,12 @@ impl ModelAssetManager {
                 std::process::id()
             ));
             match self.storage().create_dir(&path) {
-                Ok(()) => return Ok(path),
+                Ok(()) => {
+                    self.storage()
+                        .sync_parent(&path)
+                        .map_err(|source| self.relative_storage_error(&path, source))?;
+                    return Ok(path);
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(source) => return Err(self.relative_storage_error(&path, source)),
             }
@@ -1547,12 +2049,12 @@ impl ModelAssetManager {
                 return Err(ModelAssetError::NotOwned);
             }
             self.storage()
-                .rename(&entry.staged, &entry.original)
+                .rename_durable(&entry.staged, &entry.original)
                 .map_err(|_| ModelAssetError::NotOwned)?;
         }
         Self::remove_recovery_metadata(self.storage(), staging_root)?;
         self.storage()
-            .remove_dir(staging_root)
+            .remove_dir_durable(staging_root)
             .map_err(|_| ModelAssetError::NotOwned)
     }
 
@@ -1566,7 +2068,7 @@ impl ModelAssetManager {
             return Err(ModelAssetError::NotOwned);
         }
         self.storage()
-            .rename(staged, original)
+            .rename_durable(staged, original)
             .map_err(|_| ModelAssetError::NotOwned)
     }
 
@@ -1713,6 +2215,7 @@ impl ModelAssetManager {
         let destination = PathBuf::from(&manifest_file.install_path);
         let partial = partial_path(&destination);
         let metadata_path = partial_metadata_path(&partial);
+        Self::recover_private_write(self.storage(), &self.0.manifest, manifest_file)?;
         let expected_metadata = PartialMetadata::from_manifest(&self.0.manifest, manifest_file);
         let recorded_metadata = self
             .storage()
@@ -1812,8 +2315,38 @@ impl ModelAssetManager {
 
         let mut output = self
             .storage()
-            .open_write(&partial, offset > 0)
+            .create_private_write(&partial, false)
             .map_err(|source| self.relative_storage_error(&partial, source))?;
+        let private_recovery_path = private_write_recovery_path(&partial);
+        let private_recovery = PrivateWriteRecovery {
+            schema_version: 1,
+            owner: "ch.emin.piu".into(),
+            temporary_path: output.temporary_path().to_path_buf(),
+            partial: PartialMetadata::from_manifest(&self.0.manifest, manifest_file),
+        };
+        self.write_json_atomic(&private_recovery_path, &private_recovery, cancellation)
+            .await?;
+        if offset > 0 {
+            let expected_identity = self
+                .storage()
+                .identity(&partial)
+                .map_err(|source| self.relative_storage_error(&partial, source))?
+                .filter(|identity| identity.links == 1 && identity.size == offset)
+                .ok_or_else(|| {
+                    self.relative_storage_error(
+                        &partial,
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "model asset partial changed before private transfer",
+                        ),
+                    )
+                })?;
+            output
+                .adopt_existing(expected_identity)
+                .map_err(|source| self.relative_storage_error(&partial, source))?;
+        } else {
+            output.enable_publish_on_drop();
+        }
         let mut stream = response.bytes_stream();
         let mut file_bytes = offset;
         let mut progress = TransferProgress::new(self.transferred_bytes(), offset);
@@ -1844,11 +2377,6 @@ impl ModelAssetManager {
                 self.publish_progress(manifest_file, operation_id, total);
             }
         }
-        output
-            .flush()
-            .await
-            .map_err(|source| self.relative_storage_error(&partial, source))?;
-        drop(output);
         if file_bytes != manifest_file.size_bytes {
             return Err(ModelAssetError::SizeMismatch {
                 path: manifest_file.source_path.clone(),
@@ -1856,6 +2384,11 @@ impl ModelAssetManager {
                 expected: manifest_file.size_bytes,
             });
         }
+        output
+            .publish()
+            .await
+            .map_err(|source| self.relative_storage_error(&partial, source))?;
+        self.remove_if_present(&private_recovery_path)?;
         let mut status = self.status();
         status.phase = ModelAssetPhase::Verifying;
         status.current_asset = Some(manifest_file.asset);
@@ -2140,6 +2673,11 @@ impl ModelAssetManager {
         if !partial_metadata.is_file()
             || partial_metadata.file_type().is_symlink()
             || partial_metadata.len() > file.size_bytes
+            || storage
+                .identity(&partial)
+                .ok()
+                .flatten()
+                .is_none_or(|identity| identity.links != 1)
         {
             return None;
         }
@@ -2169,50 +2707,19 @@ impl ModelAssetManager {
         cancellation: &CancellationToken,
     ) -> Result<(), ModelAssetError> {
         ensure_not_cancelled(cancellation)?;
-        let mut temporary = path.as_os_str().to_os_string();
-        temporary.push(".tmp");
-        let temporary = PathBuf::from(temporary);
         let bytes = serde_json::to_vec_pretty(value).expect("asset metadata serialization");
         let mut output = self
             .storage()
-            .open_write(&temporary, false)
-            .map_err(|source| self.relative_storage_error(&temporary, source))?;
+            .create_private_write(path, false)
+            .map_err(|source| self.relative_storage_error(path, source))?;
         output
             .write_all(&bytes)
             .await
-            .map_err(|source| self.relative_storage_error(&temporary, source))?;
-        output
-            .flush()
-            .await
-            .map_err(|source| self.relative_storage_error(&temporary, source))?;
-        output
-            .sync_all()
-            .await
-            .map_err(|source| self.relative_storage_error(&temporary, source))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-
-            if output
-                .metadata()
-                .await
-                .map_err(|source| self.relative_storage_error(&temporary, source))?
-                .nlink()
-                != 1
-            {
-                return Err(self.relative_storage_error(
-                    &temporary,
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "model asset metadata gained an unsafe hard link",
-                    ),
-                ));
-            }
-        }
-        drop(output);
+            .map_err(|source| self.relative_storage_error(path, source))?;
         ensure_not_cancelled(cancellation)?;
-        self.storage()
-            .rename(&temporary, path)
+        output
+            .publish()
+            .await
             .map_err(|source| self.relative_storage_error(path, source))
     }
 
@@ -2344,6 +2851,23 @@ impl ModelAssetManager {
             .lock()
             .expect("invalid model assets lock")
             .remove(install_path);
+    }
+
+    fn removal_persistence(&self) -> Arc<dyn RemovalPersistence> {
+        self.0
+            .removal_persistence
+            .lock()
+            .expect("model asset removal persistence")
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn set_removal_persistence(&self, persistence: Arc<dyn RemovalPersistence>) {
+        *self
+            .0
+            .removal_persistence
+            .lock()
+            .expect("model asset removal persistence") = persistence;
     }
 
     fn storage(&self) -> &SafeStorage {
@@ -2505,12 +3029,52 @@ fn partial_metadata_path(partial: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn private_write_recovery_path(partial: &Path) -> PathBuf {
+    let mut path = partial.as_os_str().to_os_string();
+    path.push(PRIVATE_WRITE_RECOVERY_SUFFIX);
+    PathBuf::from(path)
+}
+
+fn is_private_write_name_for(name: &std::ffi::OsStr, destination: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(destination) = destination.to_str() else {
+        return false;
+    };
+    let prefix = format!(".{destination}.piu-write-");
+    let Some(suffix) = name.strip_prefix(&prefix) else {
+        return false;
+    };
+    suffix.split_once('-').is_some_and(|(process, identifier)| {
+        !process.is_empty()
+            && process.bytes().all(|byte| byte.is_ascii_digit())
+            && !identifier.is_empty()
+            && identifier.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 fn safe_relative_path(path: &Path) -> bool {
     !path.as_os_str().is_empty()
         && !path.is_absolute()
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn is_recovery_private_write_name(name: &std::ffi::OsStr) -> bool {
+    let Some(suffix) = name
+        .to_str()
+        .and_then(|name| name.strip_prefix(".recovery.json.piu-write-"))
+    else {
+        return false;
+    };
+    suffix.split_once('-').is_some_and(|(process, identifier)| {
+        !process.is_empty()
+            && process.bytes().all(|byte| byte.is_ascii_digit())
+            && !identifier.is_empty()
+            && identifier.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), ModelAssetError> {
@@ -2557,6 +3121,49 @@ mod tests {
 
     #[derive(Default)]
     struct MemoryCredentials(Mutex<Option<String>>);
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum PersistenceEvent {
+        JournalCommitted(RemovalRecoveryPhase),
+        AssetStaged(PathBuf),
+        AssetDeleted(PathBuf),
+    }
+
+    struct RecordingPersistenceObserver(Arc<Mutex<Vec<PersistenceEvent>>>);
+
+    impl RemovalPersistence for RecordingPersistenceObserver {
+        fn commit_journal(
+            &self,
+            storage: &SafeStorage,
+            path: &Path,
+            phase: RemovalRecoveryPhase,
+        ) -> io::Result<()> {
+            DurableRemovalPersistence.commit_journal(storage, path, phase)?;
+            self.0
+                .lock()
+                .expect("persistence events")
+                .push(PersistenceEvent::JournalCommitted(phase));
+            Ok(())
+        }
+
+        fn stage(&self, storage: &SafeStorage, from: &Path, to: &Path) -> io::Result<()> {
+            DurableRemovalPersistence.stage(storage, from, to)?;
+            self.0
+                .lock()
+                .expect("persistence events")
+                .push(PersistenceEvent::AssetStaged(from.to_path_buf()));
+            Ok(())
+        }
+
+        fn delete(&self, storage: &SafeStorage, path: &Path) -> io::Result<()> {
+            DurableRemovalPersistence.delete(storage, path)?;
+            self.0
+                .lock()
+                .expect("persistence events")
+                .push(PersistenceEvent::AssetDeleted(path.to_path_buf()));
+            Ok(())
+        }
+    }
 
     impl CredentialStore for MemoryCredentials {
         fn get(&self) -> Result<Option<String>, ModelAssetError> {
@@ -2842,6 +3449,28 @@ mod tests {
         .expect("current file timeout")
     }
 
+    async fn wait_for_private_partial_bytes(manager: &ModelAssetManager) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let has_bytes = fs::read_dir(manager.0.root.join("target"))
+                    .expect("target directory")
+                    .filter_map(Result::ok)
+                    .any(|entry| {
+                        is_private_write_name_for(
+                            &entry.file_name(),
+                            std::ffi::OsStr::new("model.bin.part"),
+                        ) && entry.metadata().is_ok_and(|metadata| metadata.len() > 0)
+                    });
+                if has_bytes {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("private partial progress");
+    }
+
     #[test]
     fn production_manifest_is_an_exact_complete_revision_pin() {
         let manifest = production_manifest().expect("valid embedded manifest");
@@ -2948,18 +3577,7 @@ mod tests {
         });
         wait_for_current_file(&manager, ModelAssetPhase::Downloading).await;
         let partial = partial_path(Path::new("target/model.bin"));
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if fs::metadata(manager.0.root.join(&partial))
-                    .is_ok_and(|metadata| metadata.len() >= 4)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("partial progress");
+        wait_for_private_partial_bytes(&manager).await;
         running.abort();
         assert!(running.await.is_err());
         let stopped_bytes = fs::metadata(manager.0.root.join(&partial))
@@ -2979,6 +3597,59 @@ mod tests {
             fs::read(relaunched.0.root.join("target/model.bin")).expect("installed bytes"),
             bytes
         );
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_a_private_download_inode_left_by_process_crash() {
+        let bytes = b"process crash recovery fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let credentials = Arc::new(MemoryCredentials::default());
+        let manager = test_manager(&temporary, &fixture, &bytes, credentials.clone(), u64::MAX);
+        let file = manager.0.manifest.files.first().expect("fixture file");
+        let partial = partial_path(Path::new(&file.install_path));
+        let partial_metadata = partial_metadata_path(&partial);
+        let expected = PartialMetadata::from_manifest(&manager.0.manifest, file);
+        manager
+            .write_json_atomic(&partial_metadata, &expected, &CancellationToken::new())
+            .await
+            .expect("partial provenance");
+        let mut private = manager
+            .storage()
+            .create_private_write(&partial, false)
+            .expect("private download inode");
+        let recovery = private_write_recovery_path(&partial);
+        manager
+            .write_json_atomic(
+                &recovery,
+                &PrivateWriteRecovery {
+                    schema_version: 1,
+                    owner: "ch.emin.piu".into(),
+                    temporary_path: private.temporary_path().to_path_buf(),
+                    partial: expected,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("private write recovery record");
+        private
+            .write_all(&bytes[..9])
+            .await
+            .expect("crash-time partial bytes");
+        let private_path = private.temporary_path().to_path_buf();
+        std::mem::forget(private);
+        drop(manager);
+
+        let relaunched = test_manager(&temporary, &fixture, &bytes, credentials, u64::MAX);
+
+        assert!(relaunched.status().can_resume);
+        assert_eq!(relaunched.status().transferred_bytes, 9);
+        assert_eq!(
+            fs::read(relaunched.0.root.join(&partial)).expect("recovered partial"),
+            &bytes[..9]
+        );
+        assert!(!relaunched.0.root.join(private_path).exists());
+        assert!(!relaunched.0.root.join(recovery).exists());
     }
 
     #[tokio::test]
@@ -3243,8 +3914,8 @@ mod tests {
         );
 
         manager.start_download().expect("start slow download");
-        wait_for_phase(&manager, ModelAssetPhase::Downloading).await;
-        tokio::time::sleep(Duration::from_millis(55)).await;
+        wait_for_current_file(&manager, ModelAssetPhase::Downloading).await;
+        wait_for_private_partial_bytes(&manager).await;
         assert!(manager.cancel_download());
         let cancelled = wait_for_phase(&manager, ModelAssetPhase::Cancelled).await;
         assert!(cancelled.can_resume);
@@ -3756,6 +4427,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relaunch_cleans_a_crash_left_private_removal_journal_before_asset_mutation() {
+        let bytes = b"private removal journal fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        let staging = Path::new(".piu-removal-crashed-journal");
+        manager
+            .storage()
+            .create_dir(staging)
+            .expect("removal staging");
+        let mut journal = manager
+            .storage()
+            .create_private_write(&staging.join(REMOVAL_RECOVERY_FILE), false)
+            .expect("private recovery journal");
+        journal
+            .write_all(b"{\"schemaVersion\":")
+            .await
+            .expect("incomplete recovery journal");
+        std::mem::forget(journal);
+        drop(manager);
+
+        let relaunched = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+
+        assert_eq!(relaunched.status().phase, ModelAssetPhase::Missing);
+        assert!(!relaunched.0.root.join(staging).exists());
+    }
+
+    #[tokio::test]
     async fn relaunch_fails_closed_on_unjournaled_staging_and_preserves_every_byte() {
         let bytes = b"fail closed fixture".to_vec();
         let fixture = Fixture::start(bytes.clone()).await;
@@ -4011,16 +4722,102 @@ mod tests {
         )
         .expect("marker temp hard link");
 
-        assert!(
-            manager
-                .write_ownership_marker(&CancellationToken::new())
-                .await
-                .is_err()
-        );
+        manager
+            .write_ownership_marker(&CancellationToken::new())
+            .await
+            .expect("private marker publication");
         assert_eq!(
             fs::read(&outside_marker).expect("outside marker"),
             b"outside marker remains"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relinking_a_private_write_path_after_open_never_modifies_the_outside_file() {
+        let temporary = TempDir::new().expect("temporary storage parent");
+        let storage = SafeStorage::open(temporary.path().to_path_buf(), Path::new("models"))
+            .expect("safe storage");
+        let destination = Path::new("target/model.bin.part");
+        let outside = temporary.path().join("outside");
+        fs::write(&outside, b"outside remains unchanged").expect("outside sentinel");
+        let mut private = storage
+            .create_private_write(destination, false)
+            .expect("private write");
+        let retained = storage.absolute(Path::new("retained-private-write"));
+        fs::rename(storage.absolute(private.temporary_path()), &retained)
+            .expect("retain private inode");
+        fs::hard_link(&outside, storage.absolute(private.temporary_path()))
+            .expect("replace private path with outside hard link");
+
+        private
+            .write_all(b"new model bytes")
+            .await
+            .expect("write opened private inode");
+        assert!(private.publish().await.is_err());
+
+        assert_eq!(
+            fs::read(&outside).expect("outside sentinel"),
+            b"outside remains unchanged"
+        );
+        assert!(!storage.absolute(destination).exists());
+        assert_eq!(
+            fs::read(retained).expect("retained private inode"),
+            b"new model bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn removal_commits_each_recovery_phase_before_its_durable_mutations() {
+        let bytes = b"durable removal fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        manager.start_download().expect("install fixture");
+        wait_for_phase(&manager, ModelAssetPhase::Ready).await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        manager.set_removal_persistence(Arc::new(RecordingPersistenceObserver(events.clone())));
+
+        manager
+            .remove_owned_assets()
+            .await
+            .expect("durable removal");
+
+        let events = events.lock().expect("recorded persistence events");
+        let staging_commit = events
+            .iter()
+            .position(|event| {
+                *event == PersistenceEvent::JournalCommitted(RemovalRecoveryPhase::Staging)
+            })
+            .expect("staging journal commit");
+        let deleting_commit = events
+            .iter()
+            .position(|event| {
+                *event == PersistenceEvent::JournalCommitted(RemovalRecoveryPhase::Deleting)
+            })
+            .expect("deleting journal commit");
+        let first_stage = events
+            .iter()
+            .position(|event| matches!(event, PersistenceEvent::AssetStaged(_)))
+            .expect("staged asset");
+        let first_delete = events
+            .iter()
+            .position(|event| matches!(event, PersistenceEvent::AssetDeleted(_)))
+            .expect("deleted asset");
+        let last_stage = events
+            .iter()
+            .rposition(|event| matches!(event, PersistenceEvent::AssetStaged(_)))
+            .expect("last staged asset");
+
+        assert!(staging_commit < first_stage);
+        assert!(last_stage < deleting_commit);
+        assert!(deleting_commit < first_delete);
     }
 
     #[cfg(unix)]
@@ -4161,12 +4958,12 @@ mod tests {
         symlink(&outside, &app_data).expect("replace visible app data path");
         let relative = Path::new("target/probe.bin");
         let mut file = storage
-            .open_write(relative, false)
+            .create_private_write(relative, false)
             .expect("write through retained capability");
         file.write_all(b"capability-bound")
             .await
             .expect("write retained file");
-        file.flush().await.expect("flush retained file");
+        file.publish().await.expect("publish retained file");
 
         assert_eq!(
             fs::read(retained.join("models/target/probe.bin")).expect("retained bytes"),

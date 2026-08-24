@@ -197,7 +197,7 @@ export function ModelResourcePanel({
 
       <div className="model-resource-card__identity">
         <strong>Qwen 3.8 27B · 4-bit</strong>
-        <span>MTP drafter · block 3</span>
+        <span>MTP drafter</span>
       </div>
       <p className="model-resource-card__copy">
         Più installs this exact pinned model and drafter in managed application storage. Local
