@@ -1,5 +1,7 @@
+import { useState } from "react";
 import type { ModelAssetStatus } from "../../generated/ModelAssetStatus";
 import { ModelResourcePanel } from "./ModelResourcePanel";
+import { OnboardingModelResourceStep } from "./OnboardingModelResourceStep";
 
 const totalBytes = 16_950_451_879;
 const base: ModelAssetStatus = {
@@ -105,15 +107,36 @@ const states: Array<{ label: string; status: ModelAssetStatus }> = [
 ];
 
 export function ModelResourceQaGallery() {
+  const [context, setContext] = useState<"settings" | "onboarding">("settings");
   return (
     <section className="model-resource-qa" aria-label="Model resource QA states">
       <div className="model-resource-qa__notice">
         Deterministic build-time QA gallery · production IPC disabled
       </div>
+      <div className="model-resource-qa__context" aria-label="QA context">
+        <button
+          type="button"
+          aria-pressed={context === "settings"}
+          onClick={() => setContext("settings")}
+        >
+          Settings context
+        </button>
+        <button
+          type="button"
+          aria-pressed={context === "onboarding"}
+          onClick={() => setContext("onboarding")}
+        >
+          Onboarding context
+        </button>
+      </div>
       {states.map(({ label, status }) => (
         <article key={label} aria-label={label}>
           <h2>{label}</h2>
-          <ModelResourcePanel context="settings" statusOverride={status} />
+          {context === "settings" ? (
+            <ModelResourcePanel context="settings" statusOverride={status} />
+          ) : (
+            <OnboardingModelResourceStep status={status} />
+          )}
         </article>
       ))}
     </section>

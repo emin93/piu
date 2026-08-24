@@ -201,6 +201,11 @@ test("the build-time QA gallery cannot invoke production model IPC", async () =>
   }
   expect(screen.getByLabelText("Hugging Face access token")).toBeDisabled();
 
+  await user.click(screen.getByRole("button", { name: "Onboarding context" }));
+  expect(screen.getAllByLabelText("Local model onboarding")).toHaveLength(7);
+  expect(assets.status).not.toHaveBeenCalled();
+  await user.click(screen.getByRole("button", { name: "Settings context" }));
+
   await user.click(screen.getByRole("button", { name: "Remove old model" }));
   expect(screen.getByRole("button", { name: "Confirm removal" })).toBeDisabled();
   await user.keyboard("{Escape}");

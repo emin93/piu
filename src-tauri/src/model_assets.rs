@@ -1,6 +1,8 @@
 use std::{
     collections::HashSet,
-    fs, io,
+    ffi::OsString,
+    fs,
+    io::{self, Read as _},
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -8,13 +10,18 @@ use std::{
     },
 };
 
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions as CapOpenOptions},
+};
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::{AsyncReadExt, AsyncWriteExt},
     sync::watch,
 };
@@ -137,6 +144,7 @@ pub fn production_manifest() -> Result<AssetManifest, ManifestError> {
 
 const OWNERSHIP_FILE: &str = ".piu-model-assets.json";
 const PART_SUFFIX: &str = ".part";
+const PART_METADATA_SUFFIX: &str = ".metadata.json";
 const KEYCHAIN_SERVICE: &str = "ch.emin.piu.huggingface";
 const KEYCHAIN_ACCOUNT: &str = "access-token";
 const DISK_SAFETY_RESERVE_BYTES: u64 = 1_073_741_824;
@@ -348,8 +356,164 @@ struct ActiveDownload {
     cancellation: CancellationToken,
 }
 
+struct InstallInspection {
+    status: ModelAssetStatus,
+    validation: Option<ValidationPlan>,
+}
+
+struct ValidationPlan {
+    migrate_legacy_marker: bool,
+}
+
+/// Capability-anchors every asset operation at the application-owned model root.
+/// Parent directories and final components are opened without following symlinks,
+/// so a concurrent path replacement cannot redirect reads or writes outside the root.
+struct SafeStorage {
+    root: PathBuf,
+    directory: Dir,
+}
+
+impl SafeStorage {
+    fn open(anchor: PathBuf, relative_root: &Path) -> io::Result<Self> {
+        fs::create_dir_all(&anchor)?;
+        let metadata = fs::symlink_metadata(&anchor)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "model storage anchor must be a real directory",
+            ));
+        }
+        let mut directory = Dir::open_ambient_dir(&anchor, ambient_authority())?;
+        for component in relative_root.components() {
+            let Component::Normal(component) = component else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "model storage root must be relative",
+                ));
+            };
+            match directory.open_dir_nofollow(component) {
+                Ok(next) => directory = next,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match directory.create_dir(component) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error),
+                    }
+                    directory = directory.open_dir_nofollow(component)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let root = anchor.join(relative_root);
+        Ok(Self { root, directory })
+    }
+
+    fn parent_and_name(&self, relative: &Path, create: bool) -> io::Result<(Dir, OsString)> {
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "asset path must contain only relative normal components",
+            ));
+        }
+        let name = relative
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "asset path is empty"))?
+            .to_os_string();
+        let mut directory = self.directory.try_clone()?;
+        if let Some(parent) = relative.parent() {
+            for component in parent.components() {
+                let Component::Normal(component) = component else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unsafe asset path",
+                    ));
+                };
+                match directory.open_dir_nofollow(component) {
+                    Ok(next) => directory = next,
+                    Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
+                        match directory.create_dir(component) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                            Err(error) => return Err(error),
+                        }
+                        directory = directory.open_dir_nofollow(component)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok((directory, name))
+    }
+
+    fn open_read(&self, relative: &Path) -> io::Result<File> {
+        let (directory, name) = self.parent_and_name(relative, false)?;
+        let mut options = CapOpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        directory
+            .open_with(name, &options)
+            .map(|file| File::from_std(file.into_std()))
+    }
+
+    fn read(&self, relative: &Path) -> io::Result<Vec<u8>> {
+        let (directory, name) = self.parent_and_name(relative, false)?;
+        let mut options = CapOpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = directory.open_with(name, &options)?.into_std();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn open_write(&self, relative: &Path, append: bool) -> io::Result<File> {
+        let (directory, name) = self.parent_and_name(relative, true)?;
+        let mut options = CapOpenOptions::new();
+        options
+            .write(true)
+            .create(true)
+            .append(append)
+            .truncate(!append)
+            .follow(FollowSymlinks::No);
+        directory
+            .open_with(name, &options)
+            .map(|file| File::from_std(file.into_std()))
+    }
+
+    fn metadata(&self, relative: &Path) -> io::Result<Option<cap_std::fs::Metadata>> {
+        let (directory, name) = match self.parent_and_name(relative, false) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match directory.symlink_metadata(name) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn remove_file(&self, relative: &Path) -> io::Result<()> {
+        let (directory, name) = self.parent_and_name(relative, false)?;
+        directory.remove_file(name)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let (from_directory, from_name) = self.parent_and_name(from, false)?;
+        let (to_directory, to_name) = self.parent_and_name(to, true)?;
+        from_directory.rename(from_name, &to_directory, to_name)
+    }
+
+    fn absolute(&self, relative: &Path) -> PathBuf {
+        self.root.join(relative)
+    }
+}
+
 struct ModelAssetManagerInner {
     root: PathBuf,
+    storage: Option<SafeStorage>,
     manifest: AssetManifest,
     resolve_base_url: String,
     whoami_url: String,
@@ -377,7 +541,8 @@ impl ModelAssetManager {
             manifest.repository, manifest.revision
         );
         Self::new(
-            app_data.join("models/qwen3.8-27b-uncensored-mlx"),
+            app_data.to_path_buf(),
+            PathBuf::from("models/qwen3.8-27b-uncensored-mlx"),
             manifest,
             resolve_base_url,
             "https://huggingface.co/api/whoami-v2".into(),
@@ -398,6 +563,7 @@ impl ModelAssetManager {
             let (status, _) = watch::channel(status);
             Self(Arc::new(ModelAssetManagerInner {
                 root,
+                storage: None,
                 resolve_base_url: format!(
                     "https://huggingface.co/{}/resolve/{}",
                     manifest.repository, manifest.revision
@@ -416,7 +582,8 @@ impl ModelAssetManager {
     }
 
     fn new(
-        root: PathBuf,
+        storage_anchor: PathBuf,
+        storage_relative: PathBuf,
         manifest: AssetManifest,
         resolve_base_url: String,
         whoami_url: String,
@@ -424,16 +591,20 @@ impl ModelAssetManager {
         disk_space: Arc<dyn DiskSpace>,
     ) -> Result<Self, ModelAssetError> {
         manifest.validate()?;
-        fs::create_dir_all(&root).map_err(|source| ModelAssetError::Storage {
-            path: root.clone(),
-            source,
+        let root = storage_anchor.join(&storage_relative);
+        let storage = SafeStorage::open(storage_anchor, &storage_relative).map_err(|source| {
+            ModelAssetError::Storage {
+                path: root.clone(),
+                source,
+            }
         })?;
         let free_bytes = disk_space.available(&root)?;
         let has_credentials = credentials.get()?.is_some();
-        let status = Self::inspect_install(&root, &manifest, free_bytes, has_credentials)?;
-        let (status, _) = watch::channel(status);
-        Ok(Self(Arc::new(ModelAssetManagerInner {
+        let inspection = Self::inspect_install(&storage, &manifest, free_bytes, has_credentials)?;
+        let (status, _) = watch::channel(inspection.status);
+        let manager = Self(Arc::new(ModelAssetManagerInner {
             root,
+            storage: Some(storage),
             manifest,
             resolve_base_url,
             whoami_url,
@@ -446,7 +617,30 @@ impl ModelAssetManager {
             active: Mutex::new(None),
             next_operation_id: AtomicU64::new(1),
             initialization_error: None,
-        })))
+        }));
+        if let Some(plan) = inspection.validation {
+            manager.start_background_validation(plan);
+        }
+        Ok(manager)
+    }
+
+    fn start_background_validation(&self, plan: ValidationPlan) {
+        let operation_id = self.0.next_operation_id.fetch_add(1, Ordering::Relaxed);
+        let cancellation = CancellationToken::new();
+        *self.0.active.lock().expect("model asset download lock") = Some(ActiveDownload {
+            operation_id,
+            cancellation: cancellation.clone(),
+        });
+        let mut status = self.status();
+        status.operation_id = Some(operation_id);
+        self.publish(status);
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let result = manager
+                .validate_existing_install(operation_id, cancellation, plan)
+                .await;
+            manager.finish_operation(operation_id, result);
+        });
     }
 
     pub fn subscribe(&self) -> watch::Receiver<ModelAssetStatus> {
@@ -512,12 +706,17 @@ impl ModelAssetManager {
             .bearer_auth(token)
             .send()
             .await?;
-        if !response.status().is_success() {
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
             return Err(ModelAssetError::Authentication);
         }
+        response.error_for_status()?;
         self.0.credentials.set(token)?;
         let mut status = self.status();
         status.authentication_configured = true;
+        status.error_code = None;
         if status.phase == ModelAssetPhase::AuthenticationRequired {
             status.phase = ModelAssetPhase::Missing;
             status.message = Some("Hugging Face access is connected. Resume the download.".into());
@@ -533,11 +732,12 @@ impl ModelAssetManager {
         if self.cancel_download() {
             return Err(ModelAssetError::Cancelled);
         }
-        let marker_path = self.0.root.join(OWNERSHIP_FILE);
+        let marker_path = Path::new(OWNERSHIP_FILE);
         let marker: OwnershipMarker = serde_json::from_slice(
-            &tokio::fs::read(&marker_path)
-                .await
-                .map_err(|source| self.storage_error(&marker_path, source))?,
+            &self
+                .storage()
+                .read(marker_path)
+                .map_err(|source| self.relative_storage_error(marker_path, source))?,
         )
         .map_err(|_| ModelAssetError::NotOwned)?;
         if !marker.authorizes_removal(&self.0.manifest) {
@@ -546,35 +746,44 @@ impl ModelAssetManager {
         // Validate every extant entry before deleting anything. This makes recovery
         // atomic from an ownership perspective: a tampered or redirected path leaves
         // the complete old installation and its evidence intact for manual recovery.
+        let cancellation = CancellationToken::new();
         for file in &marker.files {
             let relative = Path::new(&file.install_path);
-            let path = self.0.root.join(relative);
-            let Ok(metadata) = tokio::fs::symlink_metadata(&path).await else {
+            let Some(metadata) = self
+                .storage()
+                .metadata(relative)
+                .map_err(|_| ModelAssetError::NotOwned)?
+            else {
                 continue;
             };
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
                 || metadata.len() != file.size_bytes
-                || has_symlink_ancestor(&self.0.root, relative).await?
-                || sha256_file(&path).await? != file.sha256
+                || self
+                    .sha256_relative(relative, &cancellation)
+                    .await
+                    .map_err(|_| ModelAssetError::NotOwned)?
+                    != file.sha256
             {
                 return Err(ModelAssetError::NotOwned);
             }
         }
         for file in &marker.files {
-            let path = self.0.root.join(&file.install_path);
-            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-                tokio::fs::remove_file(&path)
-                    .await
-                    .map_err(|source| self.storage_error(&path, source))?;
+            let path = Path::new(&file.install_path);
+            if self
+                .storage()
+                .metadata(path)
+                .map_err(|source| self.relative_storage_error(path, source))?
+                .is_some()
+            {
+                self.storage()
+                    .remove_file(path)
+                    .map_err(|source| self.relative_storage_error(path, source))?;
             }
         }
-        tokio::fs::remove_file(&marker_path)
-            .await
-            .map_err(|source| self.storage_error(&marker_path, source))?;
-        for directory in [self.0.root.join("target"), self.0.root.join("drafter")] {
-            let _ = tokio::fs::remove_dir(directory).await;
-        }
+        self.storage()
+            .remove_file(marker_path)
+            .map_err(|source| self.relative_storage_error(marker_path, source))?;
         let free = self.0.disk_space.available(&self.0.root)?;
         let status =
             ModelAssetStatus::missing(&self.0.manifest, free, self.0.credentials.get()?.is_some());
@@ -588,19 +797,7 @@ impl ModelAssetManager {
         cancellation: CancellationToken,
     ) -> Result<(), ModelAssetError> {
         let transferred = self.transferred_bytes();
-        let remaining = self
-            .0
-            .manifest
-            .total_size_bytes()
-            .saturating_sub(transferred);
-        let free = self.0.disk_space.available(&self.0.root)?;
-        let required = remaining.saturating_add(DISK_SAFETY_RESERVE_BYTES);
-        if free < required {
-            return Err(ModelAssetError::InsufficientSpace {
-                available: free,
-                required,
-            });
-        }
+        let (free, remaining, required) = self.ensure_space(transferred)?;
         let mut status = self.status();
         status.phase = ModelAssetPhase::Downloading;
         status.operation_id = Some(operation_id);
@@ -617,13 +814,87 @@ impl ModelAssetManager {
             if cancellation.is_cancelled() {
                 return Err(ModelAssetError::Cancelled);
             }
-            if self.final_is_valid(file).await? {
+            if self.final_is_valid(file, &cancellation).await? {
                 continue;
             }
+            // Hash validation may have removed a same-size corrupt final after the
+            // optimistic startup sample. Recompute the gate before allocating its
+            // replacement so stale bytes can never hide the actual space requirement.
+            let transferred = self.transferred_bytes();
+            let (free, remaining, required) = self.ensure_space(transferred)?;
+            let mut status = self.status();
+            status.current_free_bytes = free;
+            status.remaining_bytes = remaining;
+            status.required_free_bytes = required;
+            self.publish(status);
             self.download_file(file, operation_id, &cancellation)
                 .await?;
         }
-        self.write_ownership_marker().await?;
+        ensure_not_cancelled(&cancellation)?;
+        self.write_ownership_marker(&cancellation).await?;
+        self.publish_ready(operation_id, &cancellation)?;
+        Ok(())
+    }
+
+    fn ensure_space(&self, transferred: u64) -> Result<(u64, u64, u64), ModelAssetError> {
+        let remaining = self
+            .0
+            .manifest
+            .total_size_bytes()
+            .saturating_sub(transferred);
+        let free = self.0.disk_space.available(&self.0.root)?;
+        let required = remaining.saturating_add(DISK_SAFETY_RESERVE_BYTES);
+        if free < required {
+            return Err(ModelAssetError::InsufficientSpace {
+                available: free,
+                required,
+            });
+        }
+        Ok((free, remaining, required))
+    }
+
+    async fn validate_existing_install(
+        &self,
+        operation_id: u64,
+        cancellation: CancellationToken,
+        plan: ValidationPlan,
+    ) -> Result<(), ModelAssetError> {
+        for file in &self.0.manifest.files {
+            ensure_not_cancelled(&cancellation)?;
+            let mut status = self.status();
+            status.phase = ModelAssetPhase::Verifying;
+            status.operation_id = Some(operation_id);
+            status.current_asset = Some(file.asset);
+            status.current_file = Some(file.install_path.clone());
+            status.current_free_bytes = self.0.disk_space.available(&self.0.root)?;
+            self.publish(status);
+            if self
+                .sha256_relative(Path::new(&file.install_path), &cancellation)
+                .await?
+                != file.sha256
+            {
+                return Err(ModelAssetError::Integrity(file.source_path.clone()));
+            }
+        }
+        ensure_not_cancelled(&cancellation)?;
+        if plan.migrate_legacy_marker {
+            self.write_ownership_marker(&cancellation).await?;
+        }
+        self.publish_ready(operation_id, &cancellation)
+    }
+
+    fn publish_ready(
+        &self,
+        operation_id: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ModelAssetError> {
+        let mut active = self.0.active.lock().expect("model asset download lock");
+        if cancellation.is_cancelled()
+            || active.as_ref().map(|active| active.operation_id) != Some(operation_id)
+        {
+            return Err(ModelAssetError::Cancelled);
+        }
+        *active = None;
         let mut status = self.status();
         status.phase = ModelAssetPhase::Ready;
         status.transferred_bytes = status.total_bytes;
@@ -635,6 +906,7 @@ impl ModelAssetManager {
         status.can_resume = false;
         status.message = Some("The local model and MTP drafter are ready.".into());
         status.error_code = None;
+        status.current_free_bytes = self.0.disk_space.available(&self.0.root)?;
         self.publish(status);
         Ok(())
     }
@@ -645,42 +917,54 @@ impl ModelAssetManager {
         operation_id: u64,
         cancellation: &CancellationToken,
     ) -> Result<(), ModelAssetError> {
-        let destination = self.0.root.join(&manifest_file.install_path);
+        let destination = PathBuf::from(&manifest_file.install_path);
         let partial = partial_path(&destination);
-        if let Some(parent) = destination.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|source| self.storage_error(parent, source))?;
+        let metadata_path = partial_metadata_path(&partial);
+        let expected_metadata = PartialMetadata::from_manifest(&self.0.manifest, manifest_file);
+        let recorded_metadata = self
+            .storage()
+            .read(&metadata_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PartialMetadata>(&bytes).ok());
+        let partial_metadata = self
+            .storage()
+            .metadata(&partial)
+            .map_err(|source| self.relative_storage_error(&partial, source))?;
+        let safe_bound_partial = partial_metadata.as_ref().is_some_and(|metadata| {
+            metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && recorded_metadata.as_ref() == Some(&expected_metadata)
+                && metadata.len() <= manifest_file.size_bytes
+        });
+        if !safe_bound_partial && (partial_metadata.is_some() || recorded_metadata.is_some()) {
+            self.reset_partial(&partial, &metadata_path)?;
         }
-        let partial_size = tokio::fs::metadata(&partial)
-            .await
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        // A partial beyond the immutable pinned size cannot be a valid prefix. Reset it
-        // before constructing the Range request so relaunch cannot enter an append loop.
-        let mut offset = if partial_size > manifest_file.size_bytes {
-            tokio::fs::write(&partial, &[])
-                .await
-                .map_err(|source| self.storage_error(&partial, source))?;
-            0
+        let mut offset = if safe_bound_partial {
+            partial_metadata.expect("bound partial metadata").len()
         } else {
-            partial_size
+            0
         };
+        if offset == 0 {
+            self.write_json_atomic(&metadata_path, &expected_metadata, cancellation)
+                .await?;
+        }
         if offset == manifest_file.size_bytes {
             let mut status = self.status();
             status.phase = ModelAssetPhase::Verifying;
             status.current_asset = Some(manifest_file.asset);
             status.current_file = Some(manifest_file.install_path.clone());
             self.publish(status);
-            if sha256_file(&partial).await? == manifest_file.sha256 {
-                tokio::fs::rename(&partial, &destination)
-                    .await
-                    .map_err(|source| self.storage_error(&destination, source))?;
+            if self.sha256_relative(&partial, cancellation).await? == manifest_file.sha256 {
+                ensure_not_cancelled(cancellation)?;
+                self.storage()
+                    .rename(&partial, &destination)
+                    .map_err(|source| self.relative_storage_error(&destination, source))?;
+                self.remove_if_present(&metadata_path)?;
                 return Ok(());
             }
-            tokio::fs::write(&partial, &[])
-                .await
-                .map_err(|source| self.storage_error(&partial, source))?;
+            self.reset_partial(&partial, &metadata_path)?;
+            self.write_json_atomic(&metadata_path, &expected_metadata, cancellation)
+                .await?;
             offset = 0;
         }
         let token = self.0.credentials.get()?;
@@ -725,14 +1009,10 @@ impl ModelAssetManager {
             }
         }
 
-        let mut output = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(offset > 0)
-            .truncate(offset == 0)
-            .open(&partial)
-            .await
-            .map_err(|source| self.storage_error(&partial, source))?;
+        let mut output = self
+            .storage()
+            .open_write(&partial, offset > 0)
+            .map_err(|source| self.relative_storage_error(&partial, source))?;
         let mut stream = response.bytes_stream();
         let mut file_bytes = offset;
         let mut last_reported = self.status().transferred_bytes;
@@ -744,7 +1024,7 @@ impl ModelAssetManager {
             output
                 .write_all(&chunk)
                 .await
-                .map_err(|source| self.storage_error(&partial, source))?;
+                .map_err(|source| self.relative_storage_error(&partial, source))?;
             file_bytes = file_bytes.saturating_add(chunk.len() as u64);
             let total = self.transferred_bytes();
             if total.saturating_sub(last_reported) >= PROGRESS_CHUNK_BYTES
@@ -757,7 +1037,7 @@ impl ModelAssetManager {
         output
             .flush()
             .await
-            .map_err(|source| self.storage_error(&partial, source))?;
+            .map_err(|source| self.relative_storage_error(&partial, source))?;
         drop(output);
         if file_bytes != manifest_file.size_bytes {
             return Err(ModelAssetError::SizeMismatch {
@@ -771,31 +1051,44 @@ impl ModelAssetManager {
         status.current_asset = Some(manifest_file.asset);
         status.current_file = Some(manifest_file.install_path.clone());
         self.publish(status);
-        if sha256_file(&partial).await? != manifest_file.sha256 {
-            tokio::fs::remove_file(&partial)
-                .await
-                .map_err(|source| self.storage_error(&partial, source))?;
+        if self.sha256_relative(&partial, cancellation).await? != manifest_file.sha256 {
+            self.reset_partial(&partial, &metadata_path)?;
             return Err(ModelAssetError::Integrity(
                 manifest_file.source_path.clone(),
             ));
         }
-        tokio::fs::rename(&partial, &destination)
-            .await
-            .map_err(|source| self.storage_error(&destination, source))?;
+        ensure_not_cancelled(cancellation)?;
+        self.storage()
+            .rename(&partial, &destination)
+            .map_err(|source| self.relative_storage_error(&destination, source))?;
+        self.remove_if_present(&metadata_path)?;
         Ok(())
     }
 
-    async fn final_is_valid(&self, file: &ManifestFile) -> Result<bool, ModelAssetError> {
-        let path = self.0.root.join(&file.install_path);
-        let Ok(metadata) = tokio::fs::metadata(&path).await else {
+    async fn final_is_valid(
+        &self,
+        file: &ManifestFile,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, ModelAssetError> {
+        let path = Path::new(&file.install_path);
+        let Some(metadata) = self
+            .storage()
+            .metadata(path)
+            .map_err(|source| self.relative_storage_error(path, source))?
+        else {
             return Ok(false);
         };
-        if metadata.len() == file.size_bytes && sha256_file(&path).await? == file.sha256 {
+        if metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.len() == file.size_bytes
+            && self.sha256_relative(path, cancellation).await? == file.sha256
+        {
+            self.remove_if_present(&partial_metadata_path(&partial_path(path)))?;
             return Ok(true);
         }
-        tokio::fs::remove_file(&path)
-            .await
-            .map_err(|source| self.storage_error(&path, source))?;
+        self.storage()
+            .remove_file(path)
+            .map_err(|source| self.relative_storage_error(path, source))?;
         Ok(false)
     }
 
@@ -812,6 +1105,16 @@ impl ModelAssetManager {
         status.current_file = None;
         status.transferred_bytes = self.transferred_bytes();
         status.remaining_bytes = status.total_bytes.saturating_sub(status.transferred_bytes);
+        if let ModelAssetError::InsufficientSpace {
+            available,
+            required,
+        } = &error
+        {
+            status.current_free_bytes = *available;
+            status.required_free_bytes = *required;
+        } else if let Ok(free) = self.0.disk_space.available(&self.0.root) {
+            status.current_free_bytes = free;
+        }
         status.can_resume = status.transferred_bytes > 0;
         status.message = Some(error.to_string());
         status.error_code = Some(error.code());
@@ -832,6 +1135,12 @@ impl ModelAssetManager {
         status.current_file = Some(file.install_path.clone());
         status.transferred_bytes = transferred.min(status.total_bytes);
         status.remaining_bytes = status.total_bytes.saturating_sub(status.transferred_bytes);
+        if let Ok(free) = self.0.disk_space.available(&self.0.root) {
+            status.current_free_bytes = free;
+        }
+        status.required_free_bytes = status
+            .remaining_bytes
+            .saturating_add(DISK_SAFETY_RESERVE_BYTES);
         status.can_resume = status.transferred_bytes > 0;
         self.publish(status);
     }
@@ -841,37 +1150,45 @@ impl ModelAssetManager {
     }
 
     fn transferred_bytes(&self) -> u64 {
+        let storage = self.storage();
         self.0
             .manifest
             .files
             .iter()
             .map(|file| {
-                let final_path = self.0.root.join(&file.install_path);
-                let partial_path = partial_path(&final_path);
-                fs::metadata(&final_path)
+                storage
+                    .metadata(Path::new(&file.install_path))
+                    .ok()
+                    .flatten()
+                    .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
                     .map(|metadata| metadata.len().min(file.size_bytes))
-                    .or_else(|_| {
-                        fs::metadata(partial_path)
-                            .map(|metadata| metadata.len().min(file.size_bytes))
+                    .unwrap_or_else(|| {
+                        Self::bound_partial_size(storage, &self.0.manifest, file).unwrap_or(0)
                     })
-                    .unwrap_or(0)
             })
             .sum()
     }
 
     fn inspect_install(
-        root: &Path,
+        storage: &SafeStorage,
         manifest: &AssetManifest,
         free_bytes: u64,
         authentication_configured: bool,
-    ) -> Result<ModelAssetStatus, ModelAssetError> {
+    ) -> Result<InstallInspection, ModelAssetError> {
         let mut status = ModelAssetStatus::missing(manifest, free_bytes, authentication_configured);
-        let marker_path = root.join(OWNERSHIP_FILE);
-        if marker_path.exists() {
+        let marker_relative = Path::new(OWNERSHIP_FILE);
+        if storage
+            .metadata(marker_relative)
+            .map_err(|source| ModelAssetError::Storage {
+                path: storage.absolute(marker_relative),
+                source,
+            })?
+            .is_some()
+        {
             let marker: OwnershipMarker =
-                serde_json::from_slice(&fs::read(&marker_path).map_err(|source| {
+                serde_json::from_slice(&storage.read(marker_relative).map_err(|source| {
                     ModelAssetError::Storage {
-                        path: marker_path.clone(),
+                        path: storage.absolute(marker_relative),
                         source,
                     }
                 })?)
@@ -880,61 +1197,55 @@ impl ModelAssetManager {
                 status.phase = ModelAssetPhase::RevisionMismatch;
                 status.message = Some(ModelAssetError::RevisionMismatch.to_string());
                 status.error_code = Some(ModelAssetErrorCode::RevisionMismatch);
-                return Ok(status);
+                return Ok(InstallInspection {
+                    status,
+                    validation: None,
+                });
             }
-            if marker.schema_version == 0
-                && marker.matches_payload(manifest)
-                && manifest.files.iter().all(|file| {
-                    fs::metadata(root.join(&file.install_path))
-                        .map(|metadata| metadata.len() == file.size_bytes)
-                        .unwrap_or(false)
-                })
-            {
-                let upgraded = OwnershipMarker::from_manifest(manifest);
-                let temporary = root.join(format!("{OWNERSHIP_FILE}.tmp"));
-                fs::write(
-                    &temporary,
-                    serde_json::to_vec_pretty(&upgraded).expect("marker serialization"),
-                )
-                .map_err(|source| ModelAssetError::Storage {
-                    path: temporary.clone(),
-                    source,
-                })?;
-                fs::rename(&temporary, &marker_path).map_err(|source| {
-                    ModelAssetError::Storage {
-                        path: marker_path.clone(),
-                        source,
-                    }
-                })?;
-                status.phase = ModelAssetPhase::Ready;
+            let marker_is_legacy = marker.schema_version == 0 && marker.matches_payload(manifest);
+            let marker_is_current = marker.matches(manifest);
+            let all_files_have_pinned_size = manifest.files.iter().all(|file| {
+                storage
+                    .metadata(Path::new(&file.install_path))
+                    .ok()
+                    .flatten()
+                    .map(|metadata| {
+                        metadata.is_file()
+                            && !metadata.file_type().is_symlink()
+                            && metadata.len() == file.size_bytes
+                    })
+                    .unwrap_or(false)
+            });
+            if (marker_is_legacy || marker_is_current) && all_files_have_pinned_size {
+                // Size is only a cheap candidate check. The model remains unavailable
+                // until cancellation-aware background SHA-256 validation completes.
+                status.phase = ModelAssetPhase::Verifying;
                 status.transferred_bytes = status.total_bytes;
                 status.remaining_bytes = 0;
                 status.required_free_bytes = 0;
-                return Ok(status);
-            }
-            if marker.matches(manifest)
-                && manifest.files.iter().all(|file| {
-                    fs::metadata(root.join(&file.install_path))
-                        .map(|metadata| metadata.len() == file.size_bytes)
-                        .unwrap_or(false)
-                })
-            {
-                status.phase = ModelAssetPhase::Ready;
-                status.transferred_bytes = status.total_bytes;
-                status.remaining_bytes = 0;
-                status.required_free_bytes = 0;
-                return Ok(status);
+                status.message = Some("Verifying installed model assets before use.".into());
+                return Ok(InstallInspection {
+                    status,
+                    validation: Some(ValidationPlan {
+                        migrate_legacy_marker: marker_is_legacy,
+                    }),
+                });
             }
         }
         status.transferred_bytes = manifest
             .files
             .iter()
             .map(|file| {
-                let final_path = root.join(&file.install_path);
-                fs::metadata(&final_path)
-                    .or_else(|_| fs::metadata(partial_path(&final_path)))
-                    .map(|metadata| metadata.len().min(file.size_bytes))
-                    .unwrap_or(0)
+                let final_relative = Path::new(&file.install_path);
+                let final_size = storage
+                    .metadata(final_relative)
+                    .ok()
+                    .flatten()
+                    .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                    .map(|metadata| metadata.len().min(file.size_bytes));
+                final_size.unwrap_or_else(|| {
+                    Self::bound_partial_size(storage, manifest, file).unwrap_or(0)
+                })
             })
             .sum();
         status.remaining_bytes = status.total_bytes.saturating_sub(status.transferred_bytes);
@@ -942,22 +1253,126 @@ impl ModelAssetManager {
             .remaining_bytes
             .saturating_add(DISK_SAFETY_RESERVE_BYTES);
         status.can_resume = status.transferred_bytes > 0;
-        Ok(status)
+        Ok(InstallInspection {
+            status,
+            validation: None,
+        })
     }
 
-    async fn write_ownership_marker(&self) -> Result<(), ModelAssetError> {
+    fn bound_partial_size(
+        storage: &SafeStorage,
+        manifest: &AssetManifest,
+        file: &ManifestFile,
+    ) -> Option<u64> {
+        let partial = partial_path(Path::new(&file.install_path));
+        let metadata_relative = partial_metadata_path(&partial);
+        let partial_metadata = storage.metadata(&partial).ok().flatten()?;
+        if !partial_metadata.is_file() || partial_metadata.file_type().is_symlink() {
+            return None;
+        }
+        let recorded: PartialMetadata =
+            serde_json::from_slice(&storage.read(&metadata_relative).ok()?).ok()?;
+        (recorded == PartialMetadata::from_manifest(manifest, file))
+            .then_some(partial_metadata.len().min(file.size_bytes))
+    }
+
+    async fn write_ownership_marker(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ModelAssetError> {
         let marker = OwnershipMarker::from_manifest(&self.0.manifest);
-        let path = self.0.root.join(OWNERSHIP_FILE);
-        let temporary = self.0.root.join(format!("{OWNERSHIP_FILE}.tmp"));
-        tokio::fs::write(
-            &temporary,
-            serde_json::to_vec_pretty(&marker).expect("marker serialization"),
-        )
-        .await
-        .map_err(|source| self.storage_error(&temporary, source))?;
-        tokio::fs::rename(&temporary, &path)
+        self.write_json_atomic(Path::new(OWNERSHIP_FILE), &marker, cancellation)
             .await
-            .map_err(|source| self.storage_error(&path, source))
+    }
+
+    async fn write_json_atomic<T: Serialize>(
+        &self,
+        path: &Path,
+        value: &T,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ModelAssetError> {
+        ensure_not_cancelled(cancellation)?;
+        let mut temporary = path.as_os_str().to_os_string();
+        temporary.push(".tmp");
+        let temporary = PathBuf::from(temporary);
+        let bytes = serde_json::to_vec_pretty(value).expect("asset metadata serialization");
+        let mut output = self
+            .storage()
+            .open_write(&temporary, false)
+            .map_err(|source| self.relative_storage_error(&temporary, source))?;
+        output
+            .write_all(&bytes)
+            .await
+            .map_err(|source| self.relative_storage_error(&temporary, source))?;
+        output
+            .flush()
+            .await
+            .map_err(|source| self.relative_storage_error(&temporary, source))?;
+        drop(output);
+        ensure_not_cancelled(cancellation)?;
+        self.storage()
+            .rename(&temporary, path)
+            .map_err(|source| self.relative_storage_error(path, source))
+    }
+
+    async fn sha256_relative(
+        &self,
+        path: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<String, ModelAssetError> {
+        let mut file = self
+            .storage()
+            .open_read(path)
+            .map_err(|source| self.relative_storage_error(path, source))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let read = tokio::select! {
+                _ = cancellation.cancelled() => return Err(ModelAssetError::Cancelled),
+                read = file.read(&mut buffer) => read,
+            }
+            .map_err(|source| self.relative_storage_error(path, source))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        ensure_not_cancelled(cancellation)?;
+        Ok(hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
+    fn reset_partial(&self, partial: &Path, metadata: &Path) -> Result<(), ModelAssetError> {
+        self.remove_if_present(partial)?;
+        self.remove_if_present(metadata)
+    }
+
+    fn remove_if_present(&self, path: &Path) -> Result<(), ModelAssetError> {
+        if self
+            .storage()
+            .metadata(path)
+            .map_err(|source| self.relative_storage_error(path, source))?
+            .is_some()
+        {
+            self.storage()
+                .remove_file(path)
+                .map_err(|source| self.relative_storage_error(path, source))?;
+        }
+        Ok(())
+    }
+
+    fn storage(&self) -> &SafeStorage {
+        self.0
+            .storage
+            .as_ref()
+            .expect("available model manager has safe storage")
+    }
+
+    fn relative_storage_error(&self, path: &Path, source: io::Error) -> ModelAssetError {
+        self.storage_error(&self.0.root.join(path), source)
     }
 
     fn storage_error(&self, path: &Path, source: io::Error) -> ModelAssetError {
@@ -1058,6 +1473,34 @@ struct OwnedFile {
     sha256: String,
 }
 
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PartialMetadata {
+    schema_version: u32,
+    manifest_id: String,
+    repository: String,
+    revision: String,
+    source_path: String,
+    install_path: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
+impl PartialMetadata {
+    fn from_manifest(manifest: &AssetManifest, file: &ManifestFile) -> Self {
+        Self {
+            schema_version: 1,
+            manifest_id: manifest.manifest_id.clone(),
+            repository: manifest.repository.clone(),
+            revision: manifest.revision.clone(),
+            source_path: file.source_path.clone(),
+            install_path: file.install_path.clone(),
+            size_bytes: file.size_bytes,
+            sha256: file.sha256.clone(),
+        }
+    }
+}
+
 impl From<&ManifestFile> for OwnedFile {
     fn from(file: &ManifestFile) -> Self {
         Self {
@@ -1074,58 +1517,18 @@ fn partial_path(destination: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-async fn sha256_file(path: &Path) -> Result<String, ModelAssetError> {
-    let mut file = File::open(path)
-        .await
-        .map_err(|source| ModelAssetError::Storage {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .await
-            .map_err(|source| ModelAssetError::Storage {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+fn partial_metadata_path(partial: &Path) -> PathBuf {
+    let mut path = partial.as_os_str().to_os_string();
+    path.push(PART_METADATA_SUFFIX);
+    PathBuf::from(path)
 }
 
-async fn has_symlink_ancestor(root: &Path, relative: &Path) -> Result<bool, ModelAssetError> {
-    let mut current = root.to_path_buf();
-    let Some(parent) = relative.parent() else {
-        return Ok(false);
-    };
-    for component in parent.components() {
-        let Component::Normal(component) = component else {
-            return Ok(true);
-        };
-        current.push(component);
-        match tokio::fs::symlink_metadata(&current).await {
-            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(source) => {
-                return Err(ModelAssetError::Storage {
-                    path: current,
-                    source,
-                });
-            }
-        }
+fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), ModelAssetError> {
+    if cancellation.is_cancelled() {
+        Err(ModelAssetError::Cancelled)
+    } else {
+        Ok(())
     }
-    Ok(false)
 }
 
 #[cfg(test)]
@@ -1230,11 +1633,14 @@ mod tests {
         State(state): State<Arc<FixtureState>>,
         headers: HeaderMap,
     ) -> impl IntoResponse {
-        if bearer(&headers) == Some("valid-token") {
-            (StatusCode::OK, "{}")
-        } else {
-            state.mode.store(AUTH_REQUIRED, Ordering::Relaxed);
-            (StatusCode::UNAUTHORIZED, "invalid token")
+        match bearer(&headers) {
+            Some("valid-token") => (StatusCode::OK, "{}"),
+            Some("rate-limited") => (StatusCode::TOO_MANY_REQUESTS, "try later"),
+            Some("service-down") => (StatusCode::SERVICE_UNAVAILABLE, "try later"),
+            _ => {
+                state.mode.store(AUTH_REQUIRED, Ordering::Relaxed);
+                (StatusCode::UNAUTHORIZED, "invalid token")
+            }
         }
     }
 
@@ -1348,7 +1754,8 @@ mod tests {
     ) -> ModelAssetManager {
         let manifest = fixture_manifest(bytes);
         ModelAssetManager::new(
-            temporary.path().join("models"),
+            temporary.path().to_path_buf(),
+            PathBuf::from("models"),
             manifest.clone(),
             format!("{}/resolve/{}", fixture.base_url, manifest.revision),
             format!("{}/whoami", fixture.base_url),
@@ -1356,6 +1763,28 @@ mod tests {
             Arc::new(FixedDisk(AtomicU64::new(free_bytes))),
         )
         .expect("test manager")
+    }
+
+    async fn seed_bound_partial(manager: &ModelAssetManager, bytes: &[u8]) {
+        let destination = Path::new("target/model.bin");
+        let partial = partial_path(destination);
+        let metadata = partial_metadata_path(&partial);
+        let expected = PartialMetadata::from_manifest(
+            &manager.0.manifest,
+            manager.0.manifest.files.first().expect("fixture file"),
+        );
+        tokio::fs::create_dir_all(manager.0.root.join("target"))
+            .await
+            .expect("target directory");
+        tokio::fs::write(manager.0.root.join(&partial), bytes)
+            .await
+            .expect("partial bytes");
+        tokio::fs::write(
+            manager.0.root.join(metadata),
+            serde_json::to_vec(&expected).expect("partial metadata JSON"),
+        )
+        .await
+        .expect("partial metadata");
     }
 
     async fn wait_for_phase(
@@ -1404,12 +1833,7 @@ mod tests {
         let credentials = Arc::new(MemoryCredentials::default());
         let manager = test_manager(&temporary, &fixture, &bytes, credentials.clone(), u64::MAX);
         let destination = manager.0.root.join("target/model.bin");
-        tokio::fs::create_dir_all(destination.parent().expect("target directory"))
-            .await
-            .expect("create target directory");
-        tokio::fs::write(partial_path(&destination), &bytes[..7])
-            .await
-            .expect("seed interrupted download");
+        seed_bound_partial(&manager, &bytes[..7]).await;
 
         let relaunched = test_manager(&temporary, &fixture, &bytes, credentials, u64::MAX);
         assert!(relaunched.status().can_resume);
@@ -1422,6 +1846,15 @@ mod tests {
         assert_eq!(
             tokio::fs::read(destination).await.expect("installed bytes"),
             bytes
+        );
+        assert!(
+            !manager
+                .0
+                .root
+                .join(partial_metadata_path(&partial_path(Path::new(
+                    "target/model.bin"
+                ))))
+                .exists()
         );
         assert_eq!(fixture.state.ranged_requests.load(Ordering::Relaxed), 1);
     }
@@ -1439,12 +1872,7 @@ mod tests {
             u64::MAX,
         );
         let destination = manager.0.root.join("target/model.bin");
-        tokio::fs::create_dir_all(destination.parent().expect("target directory"))
-            .await
-            .expect("create target directory");
-        tokio::fs::write(partial_path(&destination), b"unsafe-oversized-partial")
-            .await
-            .expect("oversized partial");
+        seed_bound_partial(&manager, b"unsafe-oversized-partial").await;
 
         manager.start_download().expect("recover oversized partial");
         wait_for_phase(&manager, ModelAssetPhase::Ready).await;
@@ -1454,6 +1882,57 @@ mod tests {
             tokio::fs::read(destination).await.expect("installed bytes"),
             bytes
         );
+    }
+
+    #[tokio::test]
+    async fn unbound_or_old_revision_partial_is_never_used_for_range_resume() {
+        let bytes = b"new immutable revision bytes".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+
+        for metadata_case in ["missing", "old-revision"] {
+            let temporary = TempDir::new().expect("temporary model root");
+            let manager = test_manager(
+                &temporary,
+                &fixture,
+                &bytes,
+                Arc::new(MemoryCredentials::default()),
+                u64::MAX,
+            );
+            seed_bound_partial(&manager, &bytes[..8]).await;
+            let partial = partial_path(Path::new("target/model.bin"));
+            let metadata_path = partial_metadata_path(&partial);
+            if metadata_case == "missing" {
+                tokio::fs::remove_file(manager.0.root.join(&metadata_path))
+                    .await
+                    .expect("remove companion metadata");
+            } else {
+                let mut old = PartialMetadata::from_manifest(
+                    &manager.0.manifest,
+                    manager.0.manifest.files.first().expect("fixture file"),
+                );
+                old.revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+                tokio::fs::write(
+                    manager.0.root.join(&metadata_path),
+                    serde_json::to_vec(&old).expect("old partial metadata JSON"),
+                )
+                .await
+                .expect("old partial metadata");
+            }
+
+            let relaunched = test_manager(
+                &temporary,
+                &fixture,
+                &bytes,
+                Arc::new(MemoryCredentials::default()),
+                u64::MAX,
+            );
+            assert!(!relaunched.status().can_resume);
+            relaunched.start_download().expect("restart clean download");
+            wait_for_phase(&relaunched, ModelAssetPhase::Ready).await;
+            assert!(!manager.0.root.join(&metadata_path).exists());
+        }
+
+        assert_eq!(fixture.state.ranged_requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -1483,6 +1962,44 @@ mod tests {
             Some("valid-token")
         );
         assert!(manager.status().authentication_configured);
+        assert_eq!(manager.status().error_code, None);
+    }
+
+    #[tokio::test]
+    async fn authorization_distinguishes_credentials_from_service_failures() {
+        let bytes = b"authorization fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+
+        assert!(matches!(
+            manager.authorize_hugging_face("bad-token".into()).await,
+            Err(ModelAssetError::Authentication)
+        ));
+        assert!(matches!(
+            manager.authorize_hugging_face("rate-limited".into()).await,
+            Err(ModelAssetError::Network(_))
+        ));
+        assert!(matches!(
+            manager.authorize_hugging_face("service-down".into()).await,
+            Err(ModelAssetError::Network(_))
+        ));
+
+        let mut stale = manager.status();
+        stale.phase = ModelAssetPhase::AuthenticationRequired;
+        stale.error_code = Some(ModelAssetErrorCode::Authentication);
+        manager.publish(stale);
+        manager
+            .authorize_hugging_face("valid-token".into())
+            .await
+            .expect("valid credentials");
+        assert_eq!(manager.status().error_code, None);
     }
 
     #[tokio::test]
@@ -1505,6 +2022,14 @@ mod tests {
         assert!(manager.cancel_download());
         let cancelled = wait_for_phase(&manager, ModelAssetPhase::Cancelled).await;
         assert!(cancelled.can_resume);
+        let partial = partial_path(Path::new("target/model.bin"));
+        assert!(
+            manager
+                .0
+                .root
+                .join(partial_metadata_path(&partial))
+                .exists()
+        );
 
         fixture.mode(DISCONNECT);
         manager.start_download().expect("resume into disconnect");
@@ -1515,6 +2040,13 @@ mod tests {
         manager.start_download().expect("resume after disconnect");
         wait_for_phase(&manager, ModelAssetPhase::Ready).await;
         assert!(fixture.state.ranged_requests.load(Ordering::Relaxed) >= 2);
+        assert!(
+            !manager
+                .0
+                .root
+                .join(partial_metadata_path(&partial))
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -1531,6 +2063,11 @@ mod tests {
         );
         manager.start_download().expect("start disk check");
         let disk_failure = wait_for_phase(&manager, ModelAssetPhase::Failed).await;
+        assert_eq!(disk_failure.current_free_bytes, 0);
+        assert_eq!(
+            disk_failure.required_free_bytes,
+            bytes.len() as u64 + DISK_SAFETY_RESERVE_BYTES
+        );
         assert!(
             disk_failure
                 .message
@@ -1556,6 +2093,15 @@ mod tests {
                 .contains("SHA-256")
         );
         assert!(!partial_path(&manager.0.root.join("target/model.bin")).exists());
+        assert!(
+            !manager
+                .0
+                .root
+                .join(partial_metadata_path(&partial_path(Path::new(
+                    "target/model.bin"
+                ))))
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -1732,6 +2278,130 @@ mod tests {
         assert!(outside_file.exists());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_never_follows_symlinked_asset_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let bytes = b"download symlink fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        let outside = temporary.path().join("outside");
+        tokio::fs::create_dir(&outside)
+            .await
+            .expect("outside directory");
+        let outside_file = outside.join("model.bin.part");
+        tokio::fs::write(&outside_file, b"outside remains unchanged")
+            .await
+            .expect("outside sentinel");
+        symlink(&outside, manager.0.root.join("target")).expect("target symlink");
+
+        manager.start_download().expect("start guarded download");
+        let failed = wait_for_phase(&manager, ModelAssetPhase::Failed).await;
+
+        assert_eq!(failed.error_code, Some(ModelAssetErrorCode::Storage));
+        assert_eq!(
+            tokio::fs::read(&outside_file)
+                .await
+                .expect("outside sentinel"),
+            b"outside remains unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_replaces_part_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let bytes = b"partial symlink fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        tokio::fs::create_dir(manager.0.root.join("target"))
+            .await
+            .expect("target directory");
+        let outside = temporary.path().join("outside.txt");
+        tokio::fs::write(&outside, b"outside remains unchanged")
+            .await
+            .expect("outside sentinel");
+        let partial = partial_path(Path::new("target/model.bin"));
+        symlink(&outside, manager.0.root.join(&partial)).expect("partial symlink");
+        let metadata = PartialMetadata::from_manifest(
+            &manager.0.manifest,
+            manager.0.manifest.files.first().expect("fixture file"),
+        );
+        tokio::fs::write(
+            manager.0.root.join(partial_metadata_path(&partial)),
+            serde_json::to_vec(&metadata).expect("partial metadata JSON"),
+        )
+        .await
+        .expect("partial metadata");
+
+        manager.start_download().expect("start guarded download");
+        wait_for_phase(&manager, ModelAssetPhase::Ready).await;
+
+        assert_eq!(
+            tokio::fs::read(&outside).await.expect("outside sentinel"),
+            b"outside remains unchanged"
+        );
+        assert_eq!(
+            tokio::fs::read(manager.0.root.join("target/model.bin"))
+                .await
+                .expect("installed model"),
+            bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_root_components_cannot_redirect_to_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let bytes = b"root symlink fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let outside = temporary.path().join("outside");
+        tokio::fs::create_dir(&outside)
+            .await
+            .expect("outside directory");
+        symlink(&outside, temporary.path().join("models")).expect("model root symlink");
+        let manifest = fixture_manifest(&bytes);
+
+        let result = ModelAssetManager::new(
+            temporary.path().to_path_buf(),
+            PathBuf::from("models"),
+            manifest.clone(),
+            format!("{}/resolve/{}", fixture.base_url, manifest.revision),
+            format!("{}/whoami", fixture.base_url),
+            Arc::new(MemoryCredentials::default()),
+            Arc::new(FixedDisk(AtomicU64::new(u64::MAX))),
+        );
+
+        assert!(matches!(result, Err(ModelAssetError::Storage { .. })));
+        assert!(
+            tokio::fs::read_dir(&outside)
+                .await
+                .expect("outside directory")
+                .next_entry()
+                .await
+                .expect("outside directory entry")
+                .is_none()
+        );
+    }
+
     #[test]
     fn mismatched_owned_revision_is_never_treated_as_ready() {
         let bytes = b"old revision fixture";
@@ -1748,20 +2418,24 @@ mod tests {
         )
         .expect("marker write");
 
-        let status = ModelAssetManager::inspect_install(&root, &manifest, u64::MAX, false)
+        let storage = SafeStorage::open(temporary.path().to_path_buf(), Path::new("models"))
+            .expect("safe storage");
+        let status = ModelAssetManager::inspect_install(&storage, &manifest, u64::MAX, false)
             .expect("inspect mismatch");
 
-        assert_eq!(status.phase, ModelAssetPhase::RevisionMismatch);
+        assert_eq!(status.status.phase, ModelAssetPhase::RevisionMismatch);
+        assert!(status.validation.is_none());
     }
 
-    #[test]
-    fn exact_legacy_ownership_marker_migrates_atomically_to_current_schema() {
-        let bytes = b"legacy marker fixture";
-        let manifest = fixture_manifest(bytes);
+    #[tokio::test]
+    async fn exact_legacy_ownership_marker_migrates_only_after_background_hashing() {
+        let bytes = b"legacy marker fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
         let temporary = TempDir::new().expect("temporary model root");
         let root = temporary.path().join("models");
         fs::create_dir_all(root.join("target")).expect("target directory");
-        fs::write(root.join("target/model.bin"), bytes).expect("model bytes");
+        fs::write(root.join("target/model.bin"), &bytes).expect("model bytes");
+        let manifest = fixture_manifest(&bytes);
         let mut marker = OwnershipMarker::from_manifest(&manifest);
         marker.schema_version = 0;
         fs::write(
@@ -1770,14 +2444,85 @@ mod tests {
         )
         .expect("legacy marker write");
 
-        let status = ModelAssetManager::inspect_install(&root, &manifest, u64::MAX, false)
-            .expect("migrate exact marker");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        assert_eq!(manager.status().phase, ModelAssetPhase::Verifying);
+        wait_for_phase(&manager, ModelAssetPhase::Ready).await;
         let migrated: OwnershipMarker =
             serde_json::from_slice(&fs::read(root.join(OWNERSHIP_FILE)).expect("migrated marker"))
                 .expect("migrated JSON");
 
-        assert_eq!(status.phase, ModelAssetPhase::Ready);
         assert_eq!(migrated.schema_version, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_size_tampering_is_verified_off_the_startup_path() {
+        let bytes = vec![42; 32 * 1024 * 1024];
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let root = temporary.path().join("models");
+        fs::create_dir_all(root.join("target")).expect("target directory");
+        let mut tampered = bytes.clone();
+        tampered[0] ^= 0xff;
+        fs::write(root.join("target/model.bin"), tampered).expect("tampered model bytes");
+        let manifest = fixture_manifest(&bytes);
+        fs::write(
+            root.join(OWNERSHIP_FILE),
+            serde_json::to_vec(&OwnershipMarker::from_manifest(&manifest)).expect("marker JSON"),
+        )
+        .expect("marker write");
+
+        let started = std::time::Instant::now();
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(manager.status().phase, ModelAssetPhase::Verifying);
+        let failed = wait_for_phase(&manager, ModelAssetPhase::Failed).await;
+        assert_eq!(failed.error_code, Some(ModelAssetErrorCode::Integrity));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_background_hash_never_migrates_marker_or_publishes_ready() {
+        let bytes = vec![7; 16 * 1024 * 1024];
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let root = temporary.path().join("models");
+        fs::create_dir_all(root.join("target")).expect("target directory");
+        fs::write(root.join("target/model.bin"), &bytes).expect("model bytes");
+        let manifest = fixture_manifest(&bytes);
+        let mut marker = OwnershipMarker::from_manifest(&manifest);
+        marker.schema_version = 0;
+        fs::write(
+            root.join(OWNERSHIP_FILE),
+            serde_json::to_vec(&marker).expect("legacy marker JSON"),
+        )
+        .expect("legacy marker write");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+
+        assert!(manager.cancel_download());
+        wait_for_phase(&manager, ModelAssetPhase::Cancelled).await;
+        let retained: OwnershipMarker =
+            serde_json::from_slice(&fs::read(root.join(OWNERSHIP_FILE)).expect("retained marker"))
+                .expect("retained marker JSON");
+        assert_eq!(retained.schema_version, 0);
+        assert_ne!(manager.status().phase, ModelAssetPhase::Ready);
     }
 
     #[test]
