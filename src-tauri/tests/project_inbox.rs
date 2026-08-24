@@ -56,9 +56,12 @@ fn seed_chat(
         .execute(
             "INSERT INTO chats (
                 id, project_id, project_name, title, branch_name, worktree_path,
+                worktree_root_path, worktree_root_device, worktree_root_inode,
+                worktree_git_dir_path, worktree_git_dir_device, worktree_git_dir_inode,
                 base_commit, pull_request_number, created_at_ms, merge_state,
                 setup_phase, setup_attempt, setup_log
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'fixture-base', ?7, ?8, ?9,
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 'fixture-device', ?7,
+                       ?8, 'fixture-git-device', ?9, 'fixture-base', ?10, ?11, ?12,
                        'succeeded', 1, '')",
             params![
                 id,
@@ -67,6 +70,9 @@ fn seed_chat(
                 title,
                 format!("feature/{id}"),
                 format!("/private/tmp/piu-fixture-{id}"),
+                format!("fixture-root-inode-{id}"),
+                format!("/private/tmp/piu-fixture-git-{id}"),
+                format!("fixture-git-inode-{id}"),
                 73,
                 created_at_ms,
                 merge_state,

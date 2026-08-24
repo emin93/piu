@@ -44,6 +44,11 @@ test("streams setup output into one focused status view", () => {
   renderPanel(controller);
 
   expect(screen.getByRole("heading", { name: "Setting up worktree" })).toBeVisible();
+  expect(screen.getByRole("region", { name: "Setting up worktree" })).toHaveAttribute(
+    "aria-busy",
+    "true",
+  );
+  expect(screen.getByRole("status")).toHaveAttribute("aria-live", "polite");
   expect(screen.getByRole("button", { name: "Cancel setup" })).toBeVisible();
   expect(screen.getByLabelText("Setup output")).toHaveTextContent("Installing packages");
 
@@ -95,3 +100,32 @@ test("a cancelled setup keeps the same explicit recovery actions", () => {
   expect(screen.getByRole("button", { name: "Retry setup" })).toBeVisible();
   expect(screen.getByRole("button", { name: "Open Terminal" })).toBeVisible();
 });
+
+test.each([
+  ["failed", "exit", "Setup failed"],
+  ["cancelled", null, "Setup failed"],
+] as const)(
+  "a %s transition announces completion and moves focus to the stable status",
+  (phase, failure, heading) => {
+    const controller = new ChatSetupController();
+    controller.apply({ chatId: chat.id, setup: chat.setup });
+    renderPanel(controller);
+
+    act(() => {
+      controller.apply({
+        chatId: chat.id,
+        setup: {
+          ...chat.setup,
+          phase,
+          failure,
+          exitCode: phase === "failed" ? 17 : null,
+        },
+      });
+    });
+
+    const statusHeading = screen.getByRole("heading", { name: heading });
+    expect(statusHeading).toHaveFocus();
+    expect(screen.getByRole("status")).toHaveTextContent(heading);
+    expect(screen.getByRole("region", { name: heading })).toHaveAttribute("aria-busy", "false");
+  },
+);

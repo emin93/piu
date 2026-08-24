@@ -293,8 +293,12 @@ pub async fn create_chat<R: Runtime>(
             tracing::warn!(%error, "could not emit setup change");
         }
     });
-    if let Err(error) = setup_workspaces.start_setup(&chat_id, on_change) {
-        tracing::warn!(%error, %chat_id, "could not start chat setup");
+    let setup_chat_id = chat_id.clone();
+    if let Err(error) =
+        blocking_chat_operation(move || setup_workspaces.start_setup(&setup_chat_id, on_change))
+            .await
+    {
+        tracing::warn!(?error, %chat_id, "could not start chat setup");
     }
 
     let latest_snapshot = {
@@ -339,9 +343,8 @@ pub async fn retry_chat_setup<R: Runtime>(
             tracing::warn!(%error, "could not emit retried setup change");
         }
     });
-    core.chat_workspaces()
-        .start_setup(&request.chat_id, on_change)
-        .map_err(Into::into)
+    let workspaces = core.chat_workspaces();
+    blocking_chat_operation(move || workspaces.start_setup(&request.chat_id, on_change)).await
 }
 
 #[tauri::command]
@@ -360,7 +363,9 @@ pub async fn open_chat_terminal<R: Runtime>(
     core: State<'_, ApplicationCore>,
     request: ChatIdRequest,
 ) -> Result<ChatTerminalRequest, ChatWorkspaceCommandError> {
-    let request = core.chat_workspaces().terminal_request(&request.chat_id)?;
+    let workspaces = core.chat_workspaces();
+    let request =
+        blocking_chat_operation(move || workspaces.terminal_request(&request.chat_id)).await?;
     app.emit(CHAT_TERMINAL_REQUESTED_EVENT, &request)
         .map_err(|_| ChatWorkspaceCommandError {
             code: ChatWorkspaceCommandErrorCode::StorageUnavailable,

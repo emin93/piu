@@ -26,7 +26,8 @@ use crate::{
     git_process::{GitProcess, GitProcessError},
     project_inbox::{
         ChatCreationReservation, ChatSetupFailureKind, ChatSetupPhase, ChatSetupSummary,
-        ChatSummary, FilesystemIdentity, InboxSnapshot, ProjectInbox, ProjectInboxError,
+        ChatSummary, ChatWorkspaceOwnership, FilesystemIdentity, InboxSnapshot, ProjectInbox,
+        ProjectInboxError, ProjectLocation,
     },
 };
 
@@ -103,9 +104,6 @@ struct ActiveSetup {
 
 struct SetupRun {
     chat_id: String,
-    script: PathBuf,
-    project_root: PathBuf,
-    worktree: PathBuf,
     attempt: u32,
     cancelled: Arc<AtomicBool>,
     on_change: Arc<dyn Fn(ChatSetupChangedEvent) + Send + Sync>,
@@ -113,7 +111,7 @@ struct SetupRun {
 
 struct SpawnedSetup {
     child: Child,
-    receiver: mpsc::Receiver<Vec<u8>>,
+    receiver: mpsc::Receiver<String>,
     readers: Vec<JoinHandle<std::io::Result<()>>>,
 }
 
@@ -169,7 +167,7 @@ impl ChatWorkspaces {
         for reservation in self.inbox.pending_chat_creations()? {
             self.reconcile_reservation(&reservation)?;
         }
-        self.inbox.interrupt_running_setups()?;
+        self.inbox.interrupt_incomplete_setups()?;
         *reconciled = true;
         Ok(())
     }
@@ -301,7 +299,8 @@ impl ChatWorkspaces {
         chat_id: &str,
         on_change: Arc<dyn Fn(ChatSetupChangedEvent) + Send + Sync>,
     ) -> Result<ChatSetupSummary, ChatWorkspaceError> {
-        let worktree = self.inbox.chat_worktree(chat_id)?;
+        let (ownership, _) = self.validate_chat_workspace(chat_id)?;
+        let worktree = ownership.worktree_path;
         let script = worktree.join(SETUP_SCRIPT);
         let script_exists = match script.try_exists() {
             Ok(exists) => exists,
@@ -337,7 +336,6 @@ impl ChatWorkspaces {
         }
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let project_root = self.project_root_for_chat(chat_id)?;
         let setup = {
             let mut active = self
                 .active_setups
@@ -364,9 +362,6 @@ impl ChatWorkspaces {
             .spawn(move || {
                 manager.run_setup(SetupRun {
                     chat_id: owned_chat_id,
-                    script,
-                    project_root,
-                    worktree,
                     attempt: setup.attempt,
                     cancelled,
                     on_change: thread_on_change,
@@ -403,17 +398,48 @@ impl ChatWorkspaces {
         &self,
         chat_id: &str,
     ) -> Result<ChatTerminalRequest, ChatWorkspaceError> {
-        let worktree = self.inbox.chat_worktree(chat_id)?;
-        if !worktree.is_dir() || worktree.parent() != Some(self.root.as_path()) {
-            return Err(ChatWorkspaceError::InvalidOwnership);
-        }
+        self.validate_chat_workspace(chat_id)?;
         Ok(ChatTerminalRequest {
             chat_id: chat_id.to_owned(),
         })
     }
 
-    fn project_root_for_chat(&self, chat_id: &str) -> Result<PathBuf, ChatWorkspaceError> {
-        self.inbox.chat_project_root(chat_id).map_err(Into::into)
+    fn validate_chat_workspace(
+        &self,
+        chat_id: &str,
+    ) -> Result<(ChatWorkspaceOwnership, ProjectLocation), ChatWorkspaceError> {
+        let ownership = self.inbox.chat_workspace_ownership(chat_id)?;
+        if ownership.chat_id != chat_id || ownership.worktree_path != self.root.join(chat_id) {
+            return Err(ChatWorkspaceError::InvalidOwnership);
+        }
+        let project = self.inbox.project_location(ownership.project_id)?;
+        let actual_root = filesystem_identity(&ownership.worktree_path)
+            .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
+        if actual_root != ownership.worktree_root {
+            return Err(ChatWorkspaceError::InvalidOwnership);
+        }
+        let managed = self
+            .git
+            .inspect_managed_worktree(&ownership.worktree_path)
+            .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
+        let actual_git_dir = filesystem_identity(&managed.git_dir)
+            .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
+        let actual_common_git_dir = managed
+            .common_git_dir
+            .canonicalize()
+            .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
+        let current_branch = self
+            .git
+            .current_branch(&ownership.worktree_path)
+            .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
+        if managed.root != ownership.worktree_root.path
+            || actual_git_dir != ownership.worktree_git_dir
+            || actual_common_git_dir != project.git_dir_path
+            || current_branch.as_deref() != Some(ownership.branch_name.as_str())
+        {
+            return Err(ChatWorkspaceError::InvalidOwnership);
+        }
+        Ok((ownership, project))
     }
 
     fn fail_setup_before_launch(
@@ -432,7 +458,14 @@ impl ChatWorkspaces {
     }
 
     fn run_setup(&self, run: SetupRun) {
-        let outcome = spawn_setup_process(&run.script, &run.project_root, &run.worktree);
+        let outcome = self
+            .validate_chat_workspace(&run.chat_id)
+            .map_err(|_| ())
+            .and_then(|(ownership, project)| {
+                let script = ownership.worktree_path.join(SETUP_SCRIPT);
+                spawn_setup_process(&script, &project.canonical_path, &ownership.worktree_path)
+                    .map_err(|_| ())
+            });
         let final_setup = match outcome {
             Err(_) => self.inbox.finish_setup(
                 &run.chat_id,
@@ -506,7 +539,7 @@ impl ChatWorkspaces {
         chat_id: &str,
         attempt: u32,
         child: &mut Child,
-        receiver: mpsc::Receiver<Vec<u8>>,
+        receiver: mpsc::Receiver<String>,
         readers: Vec<JoinHandle<std::io::Result<()>>>,
         cancelled: &AtomicBool,
         on_change: &Arc<dyn Fn(ChatSetupChangedEvent) + Send + Sync>,
@@ -579,20 +612,26 @@ impl ChatWorkspaces {
         &self,
         chat_id: &str,
         attempt: u32,
-        bytes: &[u8],
+        text: &str,
         retained_bytes: &mut usize,
         truncated: &mut bool,
         on_change: &Arc<dyn Fn(ChatSetupChangedEvent) + Send + Sync>,
     ) -> Result<(), ProjectInboxError> {
         let remaining = MAX_SETUP_LOG_BYTES.saturating_sub(*retained_bytes);
         if remaining > 0 {
-            let accepted = bytes.len().min(remaining);
-            let text = String::from_utf8_lossy(&bytes[..accepted]);
-            let setup = self.inbox.append_setup_log(chat_id, attempt, &text)?;
-            *retained_bytes += accepted;
-            on_change(setup_event(chat_id, &setup));
+            let mut accepted = text.len().min(remaining);
+            while accepted > 0 && !text.is_char_boundary(accepted) {
+                accepted -= 1;
+            }
+            if accepted > 0 {
+                let setup = self
+                    .inbox
+                    .append_setup_log(chat_id, attempt, &text[..accepted])?;
+                *retained_bytes += accepted;
+                on_change(setup_event(chat_id, &setup));
+            }
         }
-        if bytes.len() > remaining && !*truncated {
+        if text.len() > remaining && !*truncated {
             let setup = self
                 .inbox
                 .append_setup_log(chat_id, attempt, OUTPUT_TRUNCATED_MARKER)?;
@@ -613,102 +652,99 @@ impl ChatWorkspaces {
         if reservation.worktree_path != self.root.join(&reservation.chat_id) {
             return Err(ChatWorkspaceError::InvalidOwnership);
         }
-        if !reservation.worktree_path.exists() {
-            return Err(ChatWorkspaceError::InvalidOwnership);
-        }
-        let actual_root = filesystem_identity(&reservation.worktree_path)
-            .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
-        if actual_root.path != reservation.worktree_root.path
-            || actual_root.device != reservation.worktree_root.device
-            || actual_root.inode != reservation.worktree_root.inode
-        {
-            return Err(ChatWorkspaceError::InvalidOwnership);
-        }
-        let attached_at_owned_path = if reservation.worktree_path.exists() {
-            self.git
+        let path_exists = match fs::symlink_metadata(&reservation.worktree_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ChatWorkspaceError::InvalidOwnership);
+            }
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => return Err(ChatWorkspaceError::InvalidOwnership),
+        };
+        let mut owned_branch = reservation.branch_attached;
+        if path_exists {
+            let actual_root = filesystem_identity(&reservation.worktree_path)
+                .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
+            if actual_root != reservation.worktree_root {
+                return Err(ChatWorkspaceError::InvalidOwnership);
+            }
+            let attached_at_owned_path = self
+                .git
                 .current_branch(&reservation.worktree_path)
                 .ok()
                 .flatten()
-                .is_some_and(|branch| branch == reservation.branch_name)
-        } else {
-            false
-        };
-        let identity = match self
-            .git
-            .inspect_managed_worktree(&reservation.worktree_path)
-        {
-            Ok(identity) => Some(identity),
-            Err(_) if !reservation.worktree_created => None,
-            Err(_) => return Err(ChatWorkspaceError::InvalidOwnership),
-        };
-        if let Some(identity) = identity {
-            let expected_root = reservation
-                .worktree_path
-                .canonicalize()
-                .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
-            let expected_git_dir = reservation
-                .project
-                .git_dir_path
-                .canonicalize()
-                .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
-            let actual_git_root = identity
-                .root
-                .canonicalize()
-                .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
-            let actual_git_dir = identity
-                .common_git_dir
-                .canonicalize()
-                .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
-            if actual_git_root != expected_root
-                || actual_git_dir != expected_git_dir
-                || identity.head != reservation.base_commit
+                .is_some_and(|branch| branch == reservation.branch_name);
+            let identity = match self
+                .git
+                .inspect_managed_worktree(&reservation.worktree_path)
             {
-                return Err(ChatWorkspaceError::InvalidOwnership);
-            }
-            if reservation.worktree_created {
-                let expected_worktree_git_dir = reservation
-                    .worktree_git_dir
-                    .as_ref()
-                    .ok_or(ChatWorkspaceError::InvalidOwnership)?;
-                let actual_worktree_git_dir = filesystem_identity(&identity.git_dir)
+                Ok(identity) => Some(identity),
+                Err(_) if !reservation.worktree_created => None,
+                Err(_) => return Err(ChatWorkspaceError::InvalidOwnership),
+            };
+            if let Some(identity) = identity {
+                let expected_root = reservation
+                    .worktree_path
+                    .canonicalize()
                     .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
-                if actual_worktree_git_dir.path != expected_worktree_git_dir.path
-                    || actual_worktree_git_dir.device != expected_worktree_git_dir.device
-                    || actual_worktree_git_dir.inode != expected_worktree_git_dir.inode
+                let expected_git_dir = reservation
+                    .project
+                    .git_dir_path
+                    .canonicalize()
+                    .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
+                let actual_git_root = identity
+                    .root
+                    .canonicalize()
+                    .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
+                let actual_git_dir = identity
+                    .common_git_dir
+                    .canonicalize()
+                    .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
+                if actual_git_root != expected_root
+                    || actual_git_dir != expected_git_dir
+                    || identity.head != reservation.base_commit
                 {
                     return Err(ChatWorkspaceError::InvalidOwnership);
                 }
+                if reservation.worktree_created {
+                    let expected_worktree_git_dir = reservation
+                        .worktree_git_dir
+                        .as_ref()
+                        .ok_or(ChatWorkspaceError::InvalidOwnership)?;
+                    let actual_worktree_git_dir = filesystem_identity(&identity.git_dir)
+                        .map_err(|_| ChatWorkspaceError::InvalidOwnership)?;
+                    if actual_worktree_git_dir != *expected_worktree_git_dir {
+                        return Err(ChatWorkspaceError::InvalidOwnership);
+                    }
+                }
+                if attached_at_owned_path && !owned_branch {
+                    self.inbox
+                        .mark_creation_branch_attached(&reservation.chat_id)?;
+                    owned_branch = true;
+                }
+                if !self
+                    .git
+                    .worktree_is_pristine(&reservation.worktree_path)
+                    .map_err(|error| ChatWorkspaceError::Reconciliation(error.to_string()))?
+                {
+                    return Err(ChatWorkspaceError::InvalidOwnership);
+                }
+                self.git
+                    .remove_worktree(
+                        &reservation.project.canonical_path,
+                        &reservation.worktree_path,
+                    )
+                    .map_err(|error| ChatWorkspaceError::Reconciliation(error.to_string()))?;
+            } else {
+                fs::remove_dir(&reservation.worktree_path)
+                    .map_err(|error| ChatWorkspaceError::Reconciliation(error.to_string()))?;
             }
-            if !self
-                .git
-                .worktree_is_pristine(&reservation.worktree_path)
-                .map_err(|error| ChatWorkspaceError::Reconciliation(error.to_string()))?
-            {
-                return Err(ChatWorkspaceError::InvalidOwnership);
-            }
-            self.git
-                .remove_worktree(
-                    &reservation.project.canonical_path,
-                    &reservation.worktree_path,
-                )
-                .map_err(|error| ChatWorkspaceError::Reconciliation(error.to_string()))?;
-        } else {
-            fs::remove_dir(&reservation.worktree_path)
-                .map_err(|error| ChatWorkspaceError::Reconciliation(error.to_string()))?;
         }
-        let remove_owned_branch = (reservation.branch_attached || attached_at_owned_path)
-            && self
-                .git
-                .branch_exists(
-                    &reservation.project.canonical_path,
-                    &reservation.branch_name,
-                )
-                .map_err(|error| ChatWorkspaceError::Reconciliation(error.to_string()))?;
-        if remove_owned_branch {
+        if owned_branch {
             self.git
-                .delete_branch(
+                .delete_branch_if_at(
                     &reservation.project.canonical_path,
                     &reservation.branch_name,
+                    &reservation.base_commit,
                 )
                 .map_err(|error| ChatWorkspaceError::Reconciliation(error.to_string()))?;
         }
@@ -724,6 +760,12 @@ impl ChatWorkspaces {
 }
 
 fn filesystem_identity(path: &Path) -> std::io::Result<FilesystemIdentity> {
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "symbolic links cannot own a managed worktree",
+        ));
+    }
     let path = path.canonicalize()?;
     let metadata = fs::metadata(&path)?;
     Ok(FilesystemIdentity {
@@ -772,26 +814,77 @@ fn spawn_setup_process(
 
 fn stream_output(
     mut pipe: impl Read + Send + 'static,
-    sender: mpsc::SyncSender<Vec<u8>>,
+    sender: mpsc::SyncSender<String>,
 ) -> JoinHandle<std::io::Result<()>> {
     thread::spawn(move || {
         let mut buffer = [0_u8; SETUP_OUTPUT_CHUNK_BYTES];
+        let mut undecoded = Vec::with_capacity(SETUP_OUTPUT_CHUNK_BYTES);
         loop {
             let read = pipe.read(&mut buffer)?;
             if read == 0 {
+                send_decoded_output(&sender, &mut undecoded, true);
                 return Ok(());
             }
-            if sender.send(buffer[..read].to_vec()).is_err() {
+            undecoded.extend_from_slice(&buffer[..read]);
+            if !send_decoded_output(&sender, &mut undecoded, false) {
                 return Ok(());
             }
         }
     })
 }
 
-fn drain_setup_output(
-    receiver: mpsc::Receiver<Vec<u8>>,
+fn send_decoded_output(
+    sender: &mpsc::SyncSender<String>,
+    undecoded: &mut Vec<u8>,
+    end_of_stream: bool,
+) -> bool {
+    loop {
+        match std::str::from_utf8(undecoded) {
+            Ok("") => return true,
+            Ok(text) => {
+                if sender.send(text.to_owned()).is_err() {
+                    return false;
+                }
+                undecoded.clear();
+                return true;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid > 0 {
+                    let text = std::str::from_utf8(&undecoded[..valid])
+                        .expect("the UTF-8 decoder reported a valid prefix")
+                        .to_owned();
+                    if sender.send(text).is_err() {
+                        return false;
+                    }
+                    undecoded.drain(..valid);
+                }
+                if let Some(invalid) = error.error_len() {
+                    if sender.send(String::from('\u{fffd}')).is_err() {
+                        return false;
+                    }
+                    undecoded.drain(..invalid);
+                    continue;
+                }
+                if end_of_stream {
+                    if sender
+                        .send(String::from_utf8_lossy(undecoded).into_owned())
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    undecoded.clear();
+                }
+                return true;
+            }
+        }
+    }
+}
+
+fn drain_setup_output<T>(
+    receiver: mpsc::Receiver<T>,
     readers: Vec<JoinHandle<std::io::Result<()>>>,
-    mut consume: impl FnMut(Vec<u8>) -> Result<(), ProjectInboxError>,
+    mut consume: impl FnMut(T) -> Result<(), ProjectInboxError>,
 ) -> Result<(), ProjectInboxError> {
     let mut result = Ok(());
     while result.is_ok() {
@@ -893,7 +986,8 @@ mod tests {
     use std::{
         ffi::OsStr,
         fs,
-        os::unix::fs::PermissionsExt,
+        io::{Cursor, Read},
+        os::unix::fs::{PermissionsExt, symlink},
         path::PathBuf,
         process::{Command, Output},
         sync::{
@@ -1125,6 +1219,23 @@ mod tests {
             "Repair parser ownership now"
         );
         assert!(created.snapshot.drafts.is_empty());
+        let ownership = fixture
+            .inbox
+            .chat_workspace_ownership(&created.chat.id)
+            .unwrap();
+        assert_eq!(
+            ownership.worktree_root,
+            filesystem_identity(&worktree).unwrap()
+        );
+        let managed = fixture
+            .manager
+            .git
+            .inspect_managed_worktree(&worktree)
+            .unwrap();
+        assert_eq!(
+            ownership.worktree_git_dir,
+            filesystem_identity(&managed.git_dir).unwrap()
+        );
     }
 
     #[test]
@@ -1213,6 +1324,23 @@ mod tests {
         }
     }
 
+    fn leave_interrupted_creation(
+        fixture: &WorkspaceFixture,
+        checkpoint: CreationCheckpoint,
+        prompt: &str,
+    ) -> ChatCreationReservation {
+        let crashing = ChatWorkspaces::with_observer(
+            Arc::clone(&fixture.inbox),
+            GitProcess::with_executable("/usr/bin/git".into()),
+            fixture.worktrees.clone(),
+            Arc::new(FailAt { checkpoint }),
+        );
+        crashing
+            .create_chat(fixture.project_id, prompt)
+            .expect_err("checkpoint should simulate a crash");
+        fixture.inbox.pending_chat_creations().unwrap().remove(0)
+    }
+
     #[test]
     fn relaunch_reconciles_every_incomplete_durable_creation_step() {
         for checkpoint in [
@@ -1252,6 +1380,201 @@ mod tests {
             );
             assert!(fixture.inbox.snapshot().unwrap().chats.is_empty());
         }
+    }
+
+    #[test]
+    fn reconciliation_retries_after_each_cleanup_mutation() {
+        let missing_directory = WorkspaceFixture::new(RemoteFixture::new());
+        let reserved = leave_interrupted_creation(
+            &missing_directory,
+            CreationCheckpoint::Reserved,
+            "Retry after directory cleanup",
+        );
+        fs::remove_dir(&reserved.worktree_path).unwrap();
+        missing_directory.manager.reconcile_once().unwrap();
+        assert!(
+            missing_directory
+                .inbox
+                .pending_chat_creations()
+                .unwrap()
+                .is_empty()
+        );
+
+        let missing_worktree = WorkspaceFixture::new(RemoteFixture::new());
+        let attached = leave_interrupted_creation(
+            &missing_worktree,
+            CreationCheckpoint::BranchAttached,
+            "Retry after worktree cleanup",
+        );
+        missing_worktree
+            .manager
+            .git
+            .remove_worktree(&attached.project.canonical_path, &attached.worktree_path)
+            .unwrap();
+        missing_worktree.manager.reconcile_once().unwrap();
+        assert!(
+            !missing_worktree
+                .manager
+                .git
+                .branch_exists(&attached.project.canonical_path, &attached.branch_name)
+                .unwrap()
+        );
+        assert!(
+            missing_worktree
+                .inbox
+                .pending_chat_creations()
+                .unwrap()
+                .is_empty()
+        );
+
+        let missing_branch = WorkspaceFixture::new(RemoteFixture::new());
+        let attached = leave_interrupted_creation(
+            &missing_branch,
+            CreationCheckpoint::BranchAttached,
+            "Retry after branch cleanup",
+        );
+        missing_branch
+            .manager
+            .git
+            .remove_worktree(&attached.project.canonical_path, &attached.worktree_path)
+            .unwrap();
+        missing_branch
+            .manager
+            .git
+            .delete_branch_if_at(
+                &attached.project.canonical_path,
+                &attached.branch_name,
+                &attached.base_commit,
+            )
+            .unwrap();
+        missing_branch.manager.reconcile_once().unwrap();
+        assert!(
+            missing_branch
+                .inbox
+                .pending_chat_creations()
+                .unwrap()
+                .is_empty()
+        );
+
+        let inferred_branch = WorkspaceFixture::new(RemoteFixture::new());
+        let reservation = leave_interrupted_creation(
+            &inferred_branch,
+            CreationCheckpoint::WorktreeCreated,
+            "Retry inferred branch ownership",
+        );
+        inferred_branch
+            .manager
+            .git
+            .attach_new_branch(&reservation.worktree_path, &reservation.branch_name)
+            .unwrap();
+        fs::write(reservation.worktree_path.join("pause-cleanup"), "pause\n").unwrap();
+        inferred_branch
+            .manager
+            .reconcile_once()
+            .expect_err("dirty data should pause cleanup after ownership is journaled");
+        let journal = inferred_branch.inbox.pending_chat_creations().unwrap();
+        assert!(journal[0].branch_attached);
+        fs::remove_file(reservation.worktree_path.join("pause-cleanup")).unwrap();
+        inferred_branch
+            .manager
+            .git
+            .remove_worktree(
+                &reservation.project.canonical_path,
+                &reservation.worktree_path,
+            )
+            .unwrap();
+        ChatWorkspaces::new(
+            Arc::clone(&inferred_branch.inbox),
+            GitProcess::with_executable("/usr/bin/git".into()),
+            inferred_branch.worktrees.clone(),
+        )
+        .reconcile_once()
+        .unwrap();
+        assert!(
+            !inferred_branch
+                .manager
+                .git
+                .branch_exists(
+                    &reservation.project.canonical_path,
+                    &reservation.branch_name
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn cleanup_mutations_recheck_dirty_worktrees_and_branch_oids() {
+        let dirty = WorkspaceFixture::new(RemoteFixture::new());
+        let reservation = leave_interrupted_creation(
+            &dirty,
+            CreationCheckpoint::BranchAttached,
+            "Race worktree cleanup",
+        );
+        assert!(
+            dirty
+                .manager
+                .git
+                .worktree_is_pristine(&reservation.worktree_path)
+                .unwrap()
+        );
+        fs::write(
+            reservation.worktree_path.join("arrived-after-check.txt"),
+            "preserve me\n",
+        )
+        .unwrap();
+        dirty
+            .manager
+            .git
+            .remove_worktree(
+                &reservation.project.canonical_path,
+                &reservation.worktree_path,
+            )
+            .expect_err("non-forced removal must reject newly dirty data");
+        assert!(
+            reservation
+                .worktree_path
+                .join("arrived-after-check.txt")
+                .is_file()
+        );
+
+        let moved_branch = WorkspaceFixture::new(RemoteFixture::new());
+        let reservation = leave_interrupted_creation(
+            &moved_branch,
+            CreationCheckpoint::BranchAttached,
+            "Race branch cleanup",
+        );
+        moved_branch
+            .manager
+            .git
+            .remove_worktree(
+                &reservation.project.canonical_path,
+                &reservation.worktree_path,
+            )
+            .unwrap();
+        let newer_oid =
+            moved_branch
+                .remote
+                .write_and_push("new-main.txt", "newer\n", "advance cleanup race");
+        moved_branch
+            .remote
+            .git(["branch", "-f", &reservation.branch_name, &newer_oid]);
+
+        moved_branch
+            .manager
+            .reconcile_once()
+            .expect_err("compare-and-delete must reject a moved branch");
+
+        assert_eq!(
+            moved_branch
+                .remote
+                .git(["rev-parse", &reservation.branch_name])
+                .trim(),
+            newer_oid
+        );
+        assert_eq!(
+            moved_branch.inbox.pending_chat_creations().unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -1603,6 +1926,33 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
+    struct OneByteReader(Cursor<Vec<u8>>);
+
+    impl Read for OneByteReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            self.0.read(&mut buffer[..1])
+        }
+    }
+
+    #[test]
+    fn setup_streaming_preserves_utf8_scalars_split_across_reads() {
+        let expected = "start 🧪 — più\n";
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let reader = stream_output(
+            OneByteReader(Cursor::new(expected.as_bytes().to_vec())),
+            sender,
+        );
+
+        let actual = receiver.into_iter().collect::<Vec<_>>().concat();
+        reader.join().unwrap().unwrap();
+
+        assert_eq!(actual, expected);
+        assert!(!actual.contains('\u{fffd}'));
+    }
+
     #[test]
     fn post_exit_output_drain_unblocks_readers_when_the_bounded_channel_is_full() {
         let (sender, receiver) = mpsc::sync_channel(2);
@@ -1641,8 +1991,12 @@ mod tests {
             ))
         });
 
-        let error = drain_setup_output(receiver, vec![healthy_reader, failing_reader], |_| Ok(()))
-            .expect_err("a reader failure must fail setup supervision");
+        let error = drain_setup_output(
+            receiver,
+            vec![healthy_reader, failing_reader],
+            |_: Vec<u8>| Ok(()),
+        )
+        .expect_err("a reader failure must fail setup supervision");
 
         assert!(matches!(error, ProjectInboxError::AppData(_)));
         assert!(error.to_string().contains("fixture setup output"));
@@ -1684,6 +2038,36 @@ mod tests {
     }
 
     #[test]
+    fn relaunch_marks_pending_and_running_setups_as_retryable_interruptions() {
+        for phase in [ChatSetupPhase::Pending, ChatSetupPhase::Running] {
+            let fixture = WorkspaceFixture::new(RemoteFixture::new());
+            let chat = fixture.create("Recover interrupted setup state").chat;
+            if phase == ChatSetupPhase::Running {
+                fixture.inbox.begin_setup(&chat.id).unwrap();
+            }
+            let relaunched = ChatWorkspaces::new(
+                Arc::clone(&fixture.inbox),
+                GitProcess::with_executable("/usr/bin/git".into()),
+                fixture.worktrees.clone(),
+            );
+
+            relaunched.reconcile_once().unwrap();
+
+            let setup = &fixture
+                .inbox
+                .snapshot()
+                .unwrap()
+                .chats
+                .into_iter()
+                .find(|candidate| candidate.id == chat.id)
+                .unwrap()
+                .setup;
+            assert_eq!(setup.phase, ChatSetupPhase::Failed);
+            assert_eq!(setup.failure, Some(ChatSetupFailureKind::Interrupted));
+        }
+    }
+
+    #[test]
     fn terminal_requests_validate_managed_ownership_without_exposing_a_path() {
         let fixture = WorkspaceFixture::new(RemoteFixture::new());
         let chat = fixture.create("Open recovery terminal").chat;
@@ -1691,5 +2075,49 @@ mod tests {
         let request = fixture.manager.terminal_request(&chat.id).unwrap();
 
         assert_eq!(request.chat_id, chat.id);
+    }
+
+    #[test]
+    fn setup_and_terminal_reject_a_symlinked_or_replaced_committed_worktree() {
+        let symlinked = WorkspaceFixture::new(RemoteFixture::new());
+        let chat = symlinked.create("Reject symlinked workspace").chat;
+        let worktree = symlinked.worktrees.join(&chat.id);
+        let moved = symlinked.worktrees.join("moved-owned-worktree");
+        fs::rename(&worktree, &moved).unwrap();
+        symlink(&moved, &worktree).unwrap();
+
+        assert!(matches!(
+            symlinked.manager.terminal_request(&chat.id),
+            Err(ChatWorkspaceError::InvalidOwnership)
+        ));
+        assert!(matches!(
+            symlinked.manager.start_setup(&chat.id, Arc::new(|_| {})),
+            Err(ChatWorkspaceError::InvalidOwnership)
+        ));
+
+        let replaced = WorkspaceFixture::new(RemoteFixture::new());
+        let chat = replaced.create("Reject replaced workspace").chat;
+        let worktree = replaced.worktrees.join(&chat.id);
+        let original = replaced.worktrees.join("original-owned-worktree");
+        let replacement = replaced.worktrees.join("replacement-worktree");
+        let base_commit = replaced.remote.git(["rev-parse", "HEAD"]);
+        run(replaced
+            .remote
+            .git_command()
+            .args(["worktree", "add", "--detach"])
+            .arg(&replacement)
+            .arg(base_commit.trim()));
+        fs::rename(&worktree, &original).unwrap();
+        fs::rename(&replacement, &worktree).unwrap();
+        run(replaced
+            .remote
+            .git_command()
+            .args(["worktree", "repair"])
+            .arg(&worktree));
+
+        assert!(matches!(
+            replaced.manager.terminal_request(&chat.id),
+            Err(ChatWorkspaceError::InvalidOwnership)
+        ));
     }
 }

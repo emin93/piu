@@ -5,7 +5,7 @@ import {
   SquareTerminalIcon,
   XIcon,
 } from "lucide-react";
-import { useCallback, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -55,6 +55,8 @@ export function ChatSetupPanel({
   const setup = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   const [pendingAction, setPendingAction] = useState<SetupAction>();
   const [actionError, setActionError] = useState<string>();
+  const statusHeadingRef = useRef<HTMLHeadingElement>(null);
+  const previousSetupRef = useRef({ chatId: chat.id, phase: setup.phase });
 
   const runAction = useCallback(
     async (action: SetupAction) => {
@@ -75,9 +77,18 @@ export function ChatSetupPanel({
   const failed = setup.phase === "failed" || setup.phase === "cancelled";
   const ready = setup.phase === "notRequired" || setup.phase === "succeeded";
 
+  useEffect(() => {
+    const previousSetup = previousSetupRef.current;
+    previousSetupRef.current = { chatId: chat.id, phase: setup.phase };
+    const wasRunning = previousSetup.phase === "pending" || previousSetup.phase === "running";
+    if (previousSetup.chatId === chat.id && wasRunning && !running) {
+      statusHeadingRef.current?.focus({ preventScroll: true });
+    }
+  }, [chat.id, running, setup.phase]);
+
   return (
-    <section className="setup-stage" aria-labelledby="setup-stage-title">
-      <header className="setup-stage-header">
+    <section aria-busy={running} aria-labelledby="setup-stage-title" className="setup-stage">
+      <header aria-atomic="true" aria-live="polite" className="setup-stage-header" role="status">
         <div className="setup-stage-status" data-phase={setup.phase}>
           {running ? (
             <LoaderCircleIcon aria-hidden="true" className="setup-spinner" />
@@ -89,7 +100,7 @@ export function ChatSetupPanel({
         </div>
         <div>
           <p className="setup-stage-project">{chat.projectName}</p>
-          <h2 id="setup-stage-title">
+          <h2 id="setup-stage-title" ref={statusHeadingRef} tabIndex={-1}>
             {running ? "Setting up worktree" : ready ? "Worktree ready" : "Setup failed"}
           </h2>
           <p className="setup-stage-copy">
@@ -109,9 +120,7 @@ export function ChatSetupPanel({
           </pre>
         </ScrollArea>
       ) : running ? (
-        <div className="setup-log-empty" role="status">
-          Waiting for setup output
-        </div>
+        <div className="setup-log-empty">Waiting for setup output</div>
       ) : null}
 
       {actionError ? (

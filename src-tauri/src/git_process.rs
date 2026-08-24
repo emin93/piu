@@ -270,7 +270,6 @@ impl GitProcess {
                 repository.as_os_str(),
                 OsStr::new("worktree"),
                 OsStr::new("remove"),
-                OsStr::new("--force"),
                 worktree.as_os_str(),
             ],
             WORKTREE_OPERATION_TIMEOUT,
@@ -327,14 +326,25 @@ impl GitProcess {
         }
     }
 
-    pub fn delete_branch(&self, repository: &Path, branch: &str) -> Result<(), GitProcessError> {
+    pub fn delete_branch_if_at(
+        &self,
+        repository: &Path,
+        branch: &str,
+        expected_oid: &str,
+    ) -> Result<(), GitProcessError> {
+        if !self.branch_exists(repository, branch)? {
+            return Ok(());
+        }
+        let reference = format!("refs/heads/{branch}");
         self.run_with_timeout(
             [
                 OsStr::new("-C"),
                 repository.as_os_str(),
-                OsStr::new("branch"),
-                OsStr::new("-D"),
-                OsStr::new(branch),
+                OsStr::new("update-ref"),
+                OsStr::new("--no-deref"),
+                OsStr::new("-d"),
+                OsStr::new(&reference),
+                OsStr::new(expected_oid),
             ],
             WORKTREE_OPERATION_TIMEOUT,
         )?;
@@ -396,6 +406,7 @@ impl GitProcess {
                 }
             }
         };
+        terminate_owned_process_group(child.id());
         let (stdout, stderr) = readers.finish()?;
         if output_limited.load(Ordering::Acquire) {
             return Err(GitProcessError::OutputLimitExceeded);
@@ -477,12 +488,7 @@ fn terminate_and_reap(
     child: &mut Child,
     readers: Option<ChildReaders>,
 ) -> Result<(), GitProcessError> {
-    let terminated = child
-        .id()
-        .try_into()
-        .ok()
-        .and_then(Pid::from_raw)
-        .is_some_and(|pid| kill_process_group(pid, Signal::KILL).is_ok());
+    let terminated = terminate_owned_process_group(child.id());
     let kill_result = if terminated { Ok(()) } else { child.kill() };
     let wait_result = child.wait();
     let reader_result = readers.map(ChildReaders::finish).transpose();
@@ -491,6 +497,14 @@ fn terminate_and_reap(
     wait_result.map_err(GitProcessError::Supervision)?;
     reader_result?;
     Ok(())
+}
+
+fn terminate_owned_process_group(child_id: u32) -> bool {
+    child_id
+        .try_into()
+        .ok()
+        .and_then(Pid::from_raw)
+        .is_some_and(|pid| kill_process_group(pid, Signal::KILL).is_ok())
 }
 
 fn successful_output(
@@ -505,5 +519,40 @@ fn successful_output(
             status: status.code(),
             stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt, time::Instant};
+
+    use super::*;
+
+    #[test]
+    fn a_completed_git_child_terminates_descendants_that_inherited_its_pipes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let executable = fixture.path().join("git-fixture");
+        fs::write(
+            &executable,
+            "#!/bin/sh\n(sleep 5) &\nprintf 'complete\\n'\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let git = GitProcess::with_executable_and_policy(
+            executable,
+            Duration::from_secs(2),
+            MAX_CAPTURED_OUTPUT_BYTES,
+        );
+        let started = Instant::now();
+
+        let output = git
+            .run_with_timeout([OsStr::new("ignored")], Duration::from_secs(2))
+            .unwrap();
+
+        assert_eq!(output, b"complete\n");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "inherited pipes should close when the owned process group is terminated"
+        );
     }
 }

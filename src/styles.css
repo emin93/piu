@@ -809,6 +809,12 @@
   line-height: 1.22;
 }
 
+.setup-stage h2:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 4px;
+  border-radius: 2px;
+}
+
 .setup-stage-copy {
   margin: 8px 0 0;
   color: var(--muted-foreground);
