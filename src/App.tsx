@@ -30,6 +30,7 @@ import { listenToWindowClose } from "./platform/window-lifecycle";
 interface AppProps {
   onOpenRepository?: () => void;
   surface?: "inbox" | DeferredSurfaceName;
+  visualReviewStartup?: "loading";
 }
 
 const EMPTY_INBOX: InboxSnapshot = { projects: [], drafts: [], chats: [] };
@@ -64,7 +65,7 @@ function StartupLoading() {
   );
 }
 
-export function App({ onOpenRepository, surface = "inbox" }: AppProps) {
+export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }: AppProps) {
   useSystemAppearance();
   const [hostStatus, setHostStatus] = useState<"checking" | "ready" | "failed">("checking");
   const [snapshot, setSnapshot] = useState<InboxSnapshot>(EMPTY_INBOX);
@@ -179,12 +180,13 @@ export function App({ onOpenRepository, surface = "inbox" }: AppProps) {
   );
 
   useEffect(() => {
+    if (visualReviewStartup === "loading") return;
     const generation = ++verificationGeneration.current;
     completeStartup(generation);
     return () => {
       verificationGeneration.current += 1;
     };
-  }, [completeStartup]);
+  }, [completeStartup, visualReviewStartup]);
 
   useEffect(() => {
     let disposed = false;

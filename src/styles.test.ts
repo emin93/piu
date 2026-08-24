@@ -1,5 +1,7 @@
 import { expect, test } from "vitest";
 
+import alertDialogSource from "./components/ui/alert-dialog.tsx?raw";
+import dialogSource from "./components/ui/dialog.tsx?raw";
 import stylesheet from "./styles.css?raw";
 
 test("the interface uses two local Latin Geist variable faces", () => {
@@ -17,6 +19,25 @@ test("motion and transparency follow macOS accessibility preferences", () => {
   expect(reducedMotion).toContain("animation-duration: 0.01ms !important");
   expect(reducedMotion).toContain("transition-duration: 0.01ms !important");
   expect(stylesheet).toContain("@media (prefers-reduced-transparency: reduce)");
+});
+
+test("the composer layout seam docks through motion that reduced-motion disables", () => {
+  expect(stylesheet).toMatch(
+    /\.composer-stage\[data-composer-layout="docked"\][\s\S]*?align-self: end/,
+  );
+  expect(stylesheet).toMatch(/\.composer-stage\s*\{[\s\S]*?transition:/);
+  expect(stylesheet).toMatch(
+    /@media \(prefers-reduced-motion: reduce\)[\s\S]*?transition-duration: 0\.01ms !important/,
+  );
+});
+
+test("the modal overlay uses restrained dimming without backdrop blur", () => {
+  const overlayRule = stylesheet.match(
+    /\[data-slot="alert-dialog-overlay"\],[\s\S]*?\{([^}]*)\}/,
+  )?.[1];
+  expect(overlayRule).not.toContain("backdrop-filter");
+  expect(alertDialogSource).not.toContain("backdrop-blur");
+  expect(dialogSource).not.toContain("backdrop-blur");
 });
 
 test("the keyboard splitter uses a short focus indicator rather than a full-height stripe", () => {

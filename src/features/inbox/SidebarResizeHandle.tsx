@@ -6,7 +6,8 @@ const MAX_WIDTH = 360;
 const KEYBOARD_STEP = 16;
 
 function clampWidth(width: number) {
-  return Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, Math.round(width)));
+  const quantizedWidth = Math.round(width / 4) * 4;
+  return Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, quantizedWidth));
 }
 
 export function SidebarResizeHandle({ disabled = false }: { disabled?: boolean }) {

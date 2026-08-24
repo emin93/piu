@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { expect, test, vi } from "vitest";
 
@@ -59,13 +59,15 @@ const populatedSnapshot: InboxSnapshot = {
 };
 
 function WorkspaceHarness({
+  initialSnapshot = populatedSnapshot,
   onRemove = vi.fn().mockResolvedValue(undefined),
   onSave,
 }: {
+  initialSnapshot?: InboxSnapshot;
   onRemove?: (projectId: number) => Promise<string | undefined>;
   onSave?: (projectId: number, prompt: string) => Promise<void>;
 }) {
-  const [snapshot, setSnapshot] = useState(populatedSnapshot);
+  const [snapshot, setSnapshot] = useState(initialSnapshot);
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
   const [query, setQuery] = useState("");
   const [drafts] = useState(() => {
@@ -79,7 +81,7 @@ function WorkspaceHarness({
         ],
       }));
     });
-    controller.reconcile(populatedSnapshot);
+    controller.reconcile(initialSnapshot);
     return controller;
   });
   useEffect(() => drafts.reconcile(snapshot), [drafts, snapshot]);
@@ -152,7 +154,7 @@ test("All Projects uses the first available project as the centered composer tar
   );
   const composer = screen.getByRole("textbox", { name: "Draft for Atlas" });
   expect(composer).toHaveValue("Explain the parser");
-  expect(screen.getByRole("heading", { name: "What should we build?" })).toBeVisible();
+  expect(screen.getByRole("heading", { name: "Start a chat" })).toBeVisible();
   expect(screen.getByText(/New chat in/)).toHaveTextContent("New chat in Atlas");
 
   await user.clear(composer);
@@ -173,6 +175,16 @@ test("the inbox sidebar resize seam is keyboard operable", async () => {
   expect(resizeHandle).toHaveAttribute("aria-valuenow", "208");
 });
 
+test("the inbox sidebar drag width stays on the four-pixel grid", () => {
+  render(<WorkspaceHarness />);
+
+  const resizeHandle = screen.getByRole("separator", { name: "Resize inbox" });
+  fireEvent.pointerDown(resizeHandle, { clientX: 100, pointerId: 1 });
+  fireEvent.pointerMove(resizeHandle, { clientX: 111, pointerId: 1 });
+
+  expect(resizeHandle).toHaveAttribute("aria-valuenow", "268");
+});
+
 test("explains unavailable projects and enforces removal rules", async () => {
   const removeProject = vi.fn().mockResolvedValue(undefined);
   const user = userEvent.setup();
@@ -189,7 +201,8 @@ test("explains unavailable projects and enforces removal rules", async () => {
   await user.keyboard("{Escape}");
   await user.click(screen.getByRole("button", { name: /Beacon, repository unavailable/ }));
   expect(screen.getByRole("heading", { name: "Beacon is unavailable" })).toBeVisible();
-  expect(screen.getByText("Repository access required")).toBeVisible();
+  expect(screen.queryByRole("textbox", { name: /Beacon/ })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /Send message/ })).not.toBeInTheDocument();
 
   const trigger = screen.getByRole("button", { name: "Project actions for Caldera" });
   await user.click(trigger);
@@ -208,6 +221,26 @@ test("explains unavailable projects and enforces removal rules", async () => {
   const reopenedConfirmation = screen.getByRole("alertdialog", { name: "Remove Caldera?" });
   await user.click(within(reopenedConfirmation).getByRole("button", { name: "Remove project" }));
   expect(removeProject).toHaveBeenCalledWith(3);
+});
+
+test("an unavailable project presents its retained draft read-only without send affordances", async () => {
+  const retainedSnapshot: InboxSnapshot = {
+    ...populatedSnapshot,
+    drafts: [
+      ...populatedSnapshot.drafts,
+      { projectId: 2, prompt: "Keep the unavailable repository context", updatedAtMs: 600 },
+    ],
+  };
+  const user = userEvent.setup();
+  render(<WorkspaceHarness initialSnapshot={retainedSnapshot} />);
+
+  await user.click(screen.getByRole("button", { name: /Beacon, repository unavailable/ }));
+
+  const retainedDraft = screen.getByRole("textbox", { name: "Retained draft for Beacon" });
+  expect(retainedDraft).toHaveValue("Keep the unavailable repository context");
+  expect(retainedDraft).toHaveAttribute("readonly");
+  expect(retainedDraft).not.toHaveAttribute("placeholder");
+  expect(screen.queryByRole("button", { name: /Send message/ })).not.toBeInTheDocument();
 });
 
 test("removal discloses draft deletion and keeps the modal open on failure", async () => {

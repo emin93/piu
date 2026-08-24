@@ -183,7 +183,7 @@
 
 .wordmark {
   display: inline-flex;
-  gap: 7px;
+  gap: 8px;
   align-items: center;
   min-width: 0;
   padding-left: 80px;
@@ -229,7 +229,7 @@
 .sidebar-header {
   display: grid;
   gap: 8px;
-  padding: 10px 8px 8px;
+  padding: 12px 8px 8px;
 }
 
 .sidebar-title-row,
@@ -274,7 +274,7 @@
 
 .search-field input {
   width: 100%;
-  padding-left: 27px;
+  padding-left: 28px;
   background: color-mix(in oklab, var(--background) 42%, transparent);
 }
 
@@ -297,16 +297,16 @@
 
 .sidebar-scroll-content {
   display: grid;
-  gap: 10px;
-  padding: 2px 8px 14px;
+  gap: 12px;
+  padding: 4px 8px 16px;
 }
 
 .sidebar-section-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  min-height: 23px;
-  padding: 0 7px;
+  min-height: 24px;
+  padding: 0 8px;
   color: var(--muted-foreground);
   font-size: 11px;
   font-weight: 510;
@@ -324,7 +324,7 @@
   width: 100%;
   justify-content: space-between;
   min-height: 32px;
-  padding: 0 9px;
+  padding: 0 8px;
   color: var(--sidebar-foreground);
   font-size: 12px;
 }
@@ -337,26 +337,26 @@
 
 .project-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 26px;
+  grid-template-columns: minmax(0, 1fr) 28px;
   align-items: center;
   min-width: 0;
 }
 
 .project-row-select {
   display: grid;
-  grid-template-columns: 7px minmax(0, 1fr);
+  grid-template-columns: 8px minmax(0, 1fr);
   gap: 8px;
   justify-content: stretch;
   width: 100%;
   min-width: 0;
-  min-height: 38px;
-  padding: 4px 7px;
+  min-height: 40px;
+  padding: 4px 8px;
   text-align: left;
 }
 
 .project-availability {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
   border-radius: 999px;
   background: var(--success);
 }
@@ -390,7 +390,7 @@
 
 .project-row-copy > span:last-child {
   color: var(--muted-foreground);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .project-actions-trigger {
@@ -425,15 +425,15 @@
   justify-content: stretch;
   width: 100%;
   min-width: 0;
-  min-height: 42px;
-  padding: 5px 9px;
+  min-height: 44px;
+  padding: 4px 8px;
   color: var(--sidebar-foreground);
   text-align: left;
 }
 
 .draft-row-project {
   color: var(--muted-foreground);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .draft-row-prompt {
@@ -446,13 +446,13 @@
 
 .draft-row-failure {
   color: var(--destructive);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .draft-row-retry {
   position: absolute;
-  right: 5px;
-  bottom: 5px;
+  right: 4px;
+  bottom: 4px;
 }
 
 .chat-list-section {
@@ -462,11 +462,11 @@
 .chat-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 6px;
+  gap: 8px;
   align-items: center;
   min-width: 0;
   min-height: 52px;
-  padding: 6px 9px;
+  padding: 8px;
   border-radius: 8px;
   content-visibility: auto;
   contain-intrinsic-block-size: 52px;
@@ -492,9 +492,9 @@
   display: flex;
   gap: 4px;
   min-width: 0;
-  margin: 3px 0 0;
+  margin: 4px 0 0;
   color: var(--muted-foreground);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .chat-row-copy p span:first-child {
@@ -503,7 +503,7 @@
 }
 
 .sidebar-zero-copy {
-  margin: 2px 8px 6px;
+  margin: 4px 8px 8px;
   color: var(--muted-foreground);
   font-size: 11px;
 }
@@ -527,7 +527,7 @@
 }
 
 .chat-list-merged .chat-row {
-  min-height: 42px;
+  min-height: 44px;
   opacity: 0.76;
 }
 
@@ -580,14 +580,26 @@
 
 .composer-stage {
   display: grid;
-  gap: 18px;
-  width: min(48rem, calc(100% - 64px));
-  margin-top: -5vh;
+  gap: 16px;
+  align-self: center;
+  width: min(44rem, calc(100% - 64px));
+  transform: translateY(-24px);
+  transition: transform 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.composer-stage[data-composer-layout="docked"] {
+  align-self: end;
+  margin-bottom: 24px;
+  transform: translateY(0);
+}
+
+.composer-stage:not([data-repository-available]) {
+  width: min(36rem, calc(100% - 64px));
 }
 
 .composer-heading {
   display: grid;
-  gap: 9px;
+  gap: 8px;
   justify-items: center;
   text-align: center;
 }
@@ -595,7 +607,7 @@
 .composer-heading h2 {
   max-width: 36rem;
   margin: 0;
-  font-size: clamp(18px, 1.8vw, 21px);
+  font-size: 20px;
   font-weight: 480;
   letter-spacing: -0.025em;
   line-height: 1.22;
@@ -603,7 +615,7 @@
 
 .composer-heading p {
   display: flex;
-  gap: 6px;
+  gap: 8px;
   align-items: center;
   margin: 0;
   color: var(--warning);
@@ -611,7 +623,7 @@
 }
 
 .composer-heading p svg {
-  width: 14px;
+  width: 16px;
 }
 
 .composer-heading .composer-context {
@@ -636,14 +648,14 @@
   background: var(--card);
   box-shadow:
     0 1px 0 color-mix(in oklab, var(--foreground) 4%, transparent),
-    0 12px 30px color-mix(in oklab, var(--foreground) 7%, transparent);
+    0 8px 16px color-mix(in oklab, var(--foreground) 5%, transparent);
 }
 
 .composer-shell:focus-within {
   border-color: color-mix(in oklab, var(--ring) 72%, var(--input));
   box-shadow:
     0 0 0 2px color-mix(in oklab, var(--ring) 22%, transparent),
-    0 12px 30px color-mix(in oklab, var(--foreground) 7%, transparent);
+    0 8px 16px color-mix(in oklab, var(--foreground) 5%, transparent);
 }
 
 .composer-input {
@@ -652,7 +664,7 @@
   border: 0;
   border-radius: 0;
   background: transparent;
-  padding: 14px 15px 6px;
+  padding: 12px 16px 8px;
   font-family: var(--font-sans);
   font-size: 14px;
   line-height: 1.48;
@@ -664,26 +676,31 @@
   box-shadow: none;
 }
 
-.composer-input:disabled {
-  cursor: not-allowed;
+.composer-shell-readonly {
+  background: color-mix(in oklab, var(--card) 72%, var(--background));
+  box-shadow: none;
+}
+
+.composer-shell-readonly .composer-input {
+  color: var(--muted-foreground);
 }
 
 .composer-footer {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  min-height: 42px;
-  padding: 5px 7px 7px 14px;
+  min-height: 40px;
+  padding: 4px 8px 8px 16px;
   color: var(--muted-foreground);
   font-size: 11px;
 }
 
 .composer-error {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   align-items: center;
   justify-content: space-between;
-  padding: 0 14px 11px;
+  padding: 0 16px 12px;
 }
 
 .composer-error > span {
@@ -722,7 +739,7 @@
 
 .startup-loading-copy {
   display: grid;
-  gap: 9px;
+  gap: 8px;
 }
 
 .deferred-workspace .conversation-stage {
@@ -732,7 +749,7 @@
 
 [data-slot="alert-dialog-overlay"],
 [data-slot="dialog-overlay"] {
-  background: color-mix(in oklab, oklch(0.11 0.006 286) 58%, transparent);
+  background: color-mix(in oklab, oklch(0.11 0.006 286) 44%, transparent);
 }
 
 .dialog-error {
@@ -745,7 +762,7 @@
   }
 
   .composer-stage {
-    width: min(48rem, calc(100% - 40px));
+    width: min(44rem, calc(100% - 40px));
   }
 }
 

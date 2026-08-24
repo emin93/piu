@@ -263,12 +263,12 @@ test("the shell verifies the typed host boundary without exposing internals", as
 
 test("startup presents a stable non-interactive loading state", () => {
   installMatchMedia("light");
-  boundary.verify.mockReturnValueOnce(new Promise(() => undefined));
 
-  render(<App />);
+  render(<App visualReviewStartup="loading" />);
 
   expect(screen.getByRole("status")).toHaveTextContent("Opening your inbox");
   expect(screen.queryByRole("button", { name: "Open Repository" })).not.toBeInTheDocument();
+  expect(boundary.verify).not.toHaveBeenCalled();
 });
 
 test("a host startup failure offers a retry in product language", async () => {

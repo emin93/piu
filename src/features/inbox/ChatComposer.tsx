@@ -13,8 +13,7 @@ interface ChatComposerProps {
   project: ProjectSummary;
 }
 
-function draftStatusCopy(status: DraftPersistenceStatus, available: boolean) {
-  if (!available) return "Repository access required";
+function draftStatusCopy(status: DraftPersistenceStatus) {
   if (status.state === "saving") return "Saving";
   if (status.state === "saved") return "Saved locally";
   if (status.state === "failed") return "Not saved";
@@ -30,6 +29,7 @@ export function ChatComposer({ drafts, layout = "centered", project }: ChatCompo
   );
   const getSnapshot = useCallback(() => drafts.get(project.id), [drafts, project.id]);
   const draft = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const hasRetainedDraft = !available && Boolean(draft.prompt.trim());
 
   useEffect(() => {
     if (!available) return;
@@ -41,10 +41,11 @@ export function ChatComposer({ drafts, layout = "centered", project }: ChatCompo
       aria-labelledby="new-chat-heading"
       className="composer-stage"
       data-composer-layout={layout}
+      data-repository-available={available || undefined}
     >
       <div className="composer-heading">
         <h2 id="new-chat-heading">
-          {available ? "What should we build?" : `${project.name} is unavailable`}
+          {available ? "Start a chat" : `${project.name} is unavailable`}
         </h2>
         {available ? (
           <p className="composer-context">
@@ -58,44 +59,58 @@ export function ChatComposer({ drafts, layout = "centered", project }: ChatCompo
         )}
       </div>
 
-      <div className="composer-shell">
-        <Textarea
-          aria-describedby="draft-persistence-status"
-          aria-label={`Draft for ${project.name}`}
-          className="composer-input"
-          disabled={!available}
-          onChange={(event) => drafts.change(project.id, event.target.value)}
-          placeholder="Describe what you want to change"
-          ref={textareaRef}
-          rows={4}
-          value={draft.prompt}
-        />
-        <div className="composer-footer">
-          <span
-            aria-live="polite"
-            className={draft.status.state === "failed" ? "text-destructive" : undefined}
-            id="draft-persistence-status"
-          >
-            {draftStatusCopy(draft.status, available)}
-          </span>
-          <Button
-            aria-label="Send message (available with chat creation)"
-            disabled
-            size="icon"
-            type="button"
-          >
-            <ArrowUpIcon aria-hidden="true" />
-          </Button>
-        </div>
-        {draft.status.state === "failed" ? (
-          <div className="composer-error" role="alert">
-            <span>{draft.status.message}</span>
-            <Button onClick={() => void drafts.retry(project.id)} size="sm" variant="outline">
-              Retry save
+      {available ? (
+        <div className="composer-shell">
+          <Textarea
+            aria-describedby="draft-persistence-status"
+            aria-label={`Draft for ${project.name}`}
+            className="composer-input"
+            onChange={(event) => drafts.change(project.id, event.target.value)}
+            placeholder="Describe what you want to change"
+            ref={textareaRef}
+            rows={4}
+            value={draft.prompt}
+          />
+          <div className="composer-footer">
+            <span
+              aria-live="polite"
+              className={draft.status.state === "failed" ? "text-destructive" : undefined}
+              id="draft-persistence-status"
+            >
+              {draftStatusCopy(draft.status)}
+            </span>
+            <Button
+              aria-label="Send message (available with chat creation)"
+              disabled
+              size="icon"
+              type="button"
+            >
+              <ArrowUpIcon aria-hidden="true" />
             </Button>
           </div>
-        ) : null}
-      </div>
+          {draft.status.state === "failed" ? (
+            <div className="composer-error" role="alert">
+              <span>{draft.status.message}</span>
+              <Button onClick={() => void drafts.retry(project.id)} size="sm" variant="outline">
+                Retry save
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      ) : hasRetainedDraft ? (
+        <div className="composer-shell composer-shell-readonly">
+          <Textarea
+            aria-label={`Retained draft for ${project.name}`}
+            className="composer-input"
+            readOnly
+            rows={4}
+            value={draft.prompt}
+          />
+          <div className="composer-footer">
+            <span>Draft retained locally · read-only</span>
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 }

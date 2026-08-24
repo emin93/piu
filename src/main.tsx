@@ -9,8 +9,11 @@ if (!root) {
   throw new Error("Più root element is missing");
 }
 
+const visualReviewStartup =
+  import.meta.env.VITE_PIU_VISUAL_REVIEW_STATE === "loading" ? "loading" : undefined;
+
 createRoot(root).render(
   <StrictMode>
-    <App />
+    <App visualReviewStartup={visualReviewStartup} />
   </StrictMode>,
 );
