@@ -243,6 +243,17 @@ pub enum ModelAssetErrorCode {
     Manifest,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub enum ModelAssetAction {
+    Download,
+    Cancel,
+    Authorize,
+    Remove,
+    RetryRecovery,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../src/generated/")]
@@ -266,8 +277,8 @@ pub struct ModelAssetStatus {
     #[ts(type = "number | null")]
     pub operation_id: Option<u64>,
     pub authentication_configured: bool,
-    pub can_cancel: bool,
     pub can_resume: bool,
+    pub available_actions: Vec<ModelAssetAction>,
     pub error_code: Option<ModelAssetErrorCode>,
     pub message: Option<String>,
 }
@@ -289,8 +300,8 @@ impl ModelAssetStatus {
             current_file: None,
             operation_id: None,
             authentication_configured,
-            can_cancel: false,
             can_resume: false,
+            available_actions: Vec::new(),
             error_code: None,
             message: None,
         }
@@ -1449,9 +1460,12 @@ impl ModelAssetManager {
     fn publish_initialization_failure(&self, error: &ModelAssetError) {
         let mut status = self.status();
         status.phase = ModelAssetPhase::Failed;
-        status.message = Some(error.to_string());
+        status.message = Some(
+            "Più couldn't prepare its managed model storage. Quit and reopen Più. If the problem continues, reset Più's pre-release application data."
+                .into(),
+        );
         status.error_code = Some(error.code());
-        status.can_cancel = false;
+        tracing::error!(%error, "model resource initialization failed");
         self.publish(status);
     }
 
@@ -1903,7 +1917,6 @@ impl ModelAssetManager {
         });
         let mut status = self.status();
         status.operation_id = Some(operation_id);
-        status.can_cancel = true;
         self.publish(status);
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
@@ -2037,6 +2050,21 @@ impl ModelAssetManager {
         self.remove_owned_assets_with_hook(|_| {}).await
     }
 
+    pub async fn retry_recovery(&self) -> Result<ModelAssetStatus, ModelAssetError> {
+        self.ensure_initialized()?;
+        if !self.0.recovery_required.load(Ordering::Acquire) {
+            return Err(ModelAssetError::Unavailable(
+                "model resources do not require recovery".into(),
+            ));
+        }
+        let manager = self.clone();
+        blocking_phase(move || {
+            manager.reconcile_recovery_required()?;
+            Ok(manager.status())
+        })
+        .await?
+    }
+
     async fn remove_owned_assets_with_hook(
         &self,
         after_verified: impl FnMut(&Path) + Send + 'static,
@@ -2075,7 +2103,6 @@ impl ModelAssetManager {
         status.operation_id = Some(operation_id);
         status.current_asset = None;
         status.current_file = None;
-        status.can_cancel = true;
         status.error_code = None;
         status.message = Some("Verifying and removing Più-owned model assets.".into());
         self.publish(status);
@@ -2098,7 +2125,6 @@ impl ModelAssetManager {
         drop(active);
 
         let mut status = self.status();
-        status.can_cancel = false;
         status.message = Some("Finalizing removal. Più will finish this safely.".into());
         self.publish(status);
         Ok(())
@@ -2153,7 +2179,6 @@ impl ModelAssetManager {
         let mut status = inspection.status;
         status.phase = ModelAssetPhase::Downloading;
         status.operation_id = Some(operation_id);
-        status.can_cancel = true;
         status.message = Some("Recovered model resources. Resuming the download.".into());
         self.publish(status);
         Ok(())
@@ -2594,7 +2619,6 @@ impl ModelAssetManager {
         let mut status = self.status();
         status.phase = ModelAssetPhase::Downloading;
         status.operation_id = Some(operation_id);
-        status.can_cancel = true;
         status.transferred_bytes = transferred;
         status.remaining_bytes = remaining;
         status.current_free_bytes = free;
@@ -2708,6 +2732,7 @@ impl ModelAssetManager {
             return Err(ModelAssetError::Cancelled);
         }
         *active = None;
+        drop(active);
         let mut status = self.status();
         status.phase = ModelAssetPhase::Ready;
         status.transferred_bytes = status.total_bytes;
@@ -2716,7 +2741,6 @@ impl ModelAssetManager {
         status.current_asset = None;
         status.current_file = None;
         status.operation_id = None;
-        status.can_cancel = false;
         status.can_resume = false;
         status.message = Some("The local model and MTP drafter are ready.".into());
         status.error_code = None;
@@ -3104,7 +3128,6 @@ impl ModelAssetManager {
         if !recovery_required {
             status.operation_id = None;
         }
-        status.can_cancel = false;
         status.current_asset = None;
         status.current_file = None;
         status.transferred_bytes = self.transferred_bytes();
@@ -3123,7 +3146,13 @@ impl ModelAssetManager {
             status.current_free_bytes = free;
         }
         status.can_resume = status.transferred_bytes > 0;
-        status.message = Some(error.to_string());
+        status.message = Some(if recovery_required {
+            format!(
+                "Più couldn't finish recovering model storage. Resolve the reported storage problem, then retry recovery. {error}"
+            )
+        } else {
+            error.to_string()
+        });
         status.error_code = Some(error.code());
         status.phase = match error {
             ModelAssetError::Cancelled => ModelAssetPhase::Cancelled,
@@ -3168,7 +3197,49 @@ impl ModelAssetManager {
         self.publish(status);
     }
 
-    fn publish(&self, status: ModelAssetStatus) {
+    fn available_actions(&self, status: &ModelAssetStatus) -> Vec<ModelAssetAction> {
+        if self.0.storage.get().is_none() {
+            return Vec::new();
+        }
+        if self.0.recovery_required.load(Ordering::Acquire) {
+            return vec![ModelAssetAction::RetryRecovery];
+        }
+        if let Some(active) = self
+            .0
+            .active
+            .lock()
+            .expect("model asset operation lock")
+            .as_ref()
+        {
+            return active
+                .can_cancel
+                .then_some(ModelAssetAction::Cancel)
+                .into_iter()
+                .collect();
+        }
+        match status.phase {
+            ModelAssetPhase::Missing | ModelAssetPhase::Cancelled => {
+                vec![ModelAssetAction::Download]
+            }
+            ModelAssetPhase::AuthenticationRequired => vec![ModelAssetAction::Authorize],
+            ModelAssetPhase::Ready | ModelAssetPhase::RevisionMismatch => {
+                vec![ModelAssetAction::Remove]
+            }
+            ModelAssetPhase::Failed
+                if status.error_code != Some(ModelAssetErrorCode::Ownership) =>
+            {
+                vec![ModelAssetAction::Download]
+            }
+            ModelAssetPhase::Initializing
+            | ModelAssetPhase::Downloading
+            | ModelAssetPhase::Verifying
+            | ModelAssetPhase::Removing
+            | ModelAssetPhase::Failed => Vec::new(),
+        }
+    }
+
+    fn publish(&self, mut status: ModelAssetStatus) {
+        status.available_actions = self.available_actions(&status);
         self.0.status.send_replace(status);
     }
 
@@ -5368,7 +5439,12 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(!manager.cancel_download());
-        assert!(!manager.status().can_cancel);
+        assert!(
+            !manager
+                .status()
+                .available_actions
+                .contains(&ModelAssetAction::Cancel)
+        );
         commit.release();
 
         assert_eq!(
@@ -5413,6 +5489,10 @@ mod tests {
         assert_eq!(failed.phase, ModelAssetPhase::Failed);
         assert_eq!(failed.error_code, Some(ModelAssetErrorCode::Storage));
         assert!(failed.operation_id.is_some());
+        assert_eq!(
+            failed.available_actions,
+            vec![ModelAssetAction::RetryRecovery]
+        );
         assert!(manager.0.recovery_required.load(Ordering::Acquire));
         assert!(
             manager
@@ -5423,18 +5503,27 @@ mod tests {
                 .is_some()
         );
         assert!(matches!(
-            manager.reconcile_recovery_required(),
+            manager.retry_recovery().await,
             Err(ModelAssetError::RecoveryRequired(_))
         ));
+        assert_eq!(
+            manager.status().available_actions,
+            vec![ModelAssetAction::RetryRecovery]
+        );
         assert!(manager.0.recovery_required.load(Ordering::Acquire));
 
         fs::remove_file(manager.0.root.join("target/model.bin"))
             .expect("remove rollback obstruction");
         manager
-            .reconcile_recovery_required()
+            .retry_recovery()
+            .await
             .expect("reconcile durable staging journal");
         wait_for_phase(&manager, ModelAssetPhase::Ready).await;
         assert!(!manager.0.recovery_required.load(Ordering::Acquire));
+        assert_eq!(
+            manager.status().available_actions,
+            vec![ModelAssetAction::Remove]
+        );
         assert_eq!(
             fs::read(manager.0.root.join("target/model.bin")).expect("restored owned asset"),
             bytes
@@ -6543,14 +6632,14 @@ mod tests {
         let manager = ModelAssetManager::production_or_unavailable(app_data_file.path());
 
         assert_eq!(manager.status().phase, ModelAssetPhase::Initializing);
-        wait_for_phase(&manager, ModelAssetPhase::Failed).await;
+        let failed = wait_for_phase(&manager, ModelAssetPhase::Failed).await;
         assert!(
-            manager
-                .status()
+            failed
                 .message
                 .expect("failure message")
-                .contains("model storage")
+                .contains("Quit and reopen Più")
         );
+        assert!(failed.available_actions.is_empty());
         assert!(matches!(
             manager.start_download(),
             Err(ModelAssetError::Unavailable(_))

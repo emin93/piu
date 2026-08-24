@@ -59,3 +59,7 @@ export function authorizeHuggingFace(token: string): Promise<void> {
 export function removeModelAssets(): Promise<ModelAssetStatus> {
   return modelAssetInvoke<ModelAssetStatus>("remove_model_assets");
 }
+
+export function retryModelAssetRecovery(): Promise<ModelAssetStatus> {
+  return modelAssetInvoke<ModelAssetStatus>("retry_model_asset_recovery");
+}

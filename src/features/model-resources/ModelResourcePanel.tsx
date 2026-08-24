@@ -27,6 +27,7 @@ import {
   cancelModelDownload,
   getModelAssetStatus,
   removeModelAssets,
+  retryModelAssetRecovery,
   startModelDownload,
   subscribeToModelAssetStatus,
 } from "@/platform/model-assets";
@@ -189,11 +190,12 @@ export function ModelResourcePanel({
 
   const downloading = currentStatus.phase === "downloading" || currentStatus.phase === "verifying";
   const removing = currentStatus.phase === "removing";
-  const initializing = currentStatus.phase === "initializing";
-  const authenticationNeeded = currentStatus.phase === "authenticationRequired";
   const mismatch = currentStatus.phase === "revisionMismatch";
-  const ownershipBlocked = currentStatus.errorCode === "ownership";
-  const removable = currentStatus.phase === "ready" || mismatch;
+  const canAuthorize = currentStatus.availableActions.includes("authorize");
+  const canCancel = currentStatus.availableActions.includes("cancel");
+  const canDownload = currentStatus.availableActions.includes("download");
+  const canRemove = currentStatus.availableActions.includes("remove");
+  const canRetryRecovery = currentStatus.availableActions.includes("retryRecovery");
   const transferRelevant =
     downloading || currentStatus.canResume || currentStatus.phase === "cancelled";
   const qaMode = statusOverride !== undefined;
@@ -272,7 +274,7 @@ export function ModelResourcePanel({
         </div>
       ) : null}
 
-      {authenticationNeeded ? (
+      {canAuthorize ? (
         <form
           className="resource-auth"
           onSubmit={(event) => {
@@ -316,7 +318,7 @@ export function ModelResourcePanel({
       ) : null}
 
       <div className="resource-actions">
-        {(downloading || removing) && currentStatus.canCancel ? (
+        {canCancel ? (
           <Button
             disabled={(busy && !removing) || qaMode}
             onClick={() => {
@@ -337,7 +339,7 @@ export function ModelResourcePanel({
           >
             {removing ? "Cancel removal" : "Cancel download"}
           </Button>
-        ) : removing || initializing || ownershipBlocked ? null : removable ? (
+        ) : canRemove ? (
           <Button
             disabled={busy}
             onClick={() => setConfirmRemoval(true)}
@@ -347,15 +349,28 @@ export function ModelResourcePanel({
           >
             {mismatch ? "Remove old model" : "Remove model"}
           </Button>
-        ) : (
+        ) : canRetryRecovery ? (
           <Button
-            disabled={busy || authenticationNeeded || qaMode}
+            disabled={busy || qaMode}
+            onClick={() =>
+              void perform(async () => {
+                setStatus(await retryModelAssetRecovery());
+              })
+            }
+            type="button"
+            variant="outline"
+          >
+            Retry recovery
+          </Button>
+        ) : canDownload ? (
+          <Button
+            disabled={busy || qaMode}
             onClick={() => void perform(startModelDownload)}
             type="button"
           >
             {currentStatus.canResume ? "Resume download" : "Download model"}
           </Button>
-        )}
+        ) : null}
       </div>
 
       <AlertDialog onOpenChange={setConfirmRemoval} open={confirmRemoval}>

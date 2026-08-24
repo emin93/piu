@@ -75,8 +75,8 @@ const missingModel = {
   currentFile: null,
   operationId: null,
   authenticationConfigured: false,
-  canCancel: false,
   canResume: false,
+  availableActions: ["download"],
   errorCode: null,
   message: null,
 };

@@ -13,6 +13,7 @@ const assets = vi.hoisted(() => ({
   cancel: vi.fn(),
   authorize: vi.fn(),
   remove: vi.fn(),
+  retryRecovery: vi.fn(),
   listener: undefined as ((status: ModelAssetStatus) => void) | undefined,
 }));
 
@@ -23,6 +24,7 @@ vi.mock("../../platform/model-assets", () => ({
   cancelModelDownload: assets.cancel,
   authorizeHuggingFace: assets.authorize,
   removeModelAssets: assets.remove,
+  retryModelAssetRecovery: assets.retryRecovery,
 }));
 
 const missing: ModelAssetStatus = {
@@ -39,8 +41,8 @@ const missing: ModelAssetStatus = {
   currentFile: null,
   operationId: null,
   authenticationConfigured: false,
-  canCancel: false,
   canResume: false,
+  availableActions: ["download"],
   errorCode: null,
   message: null,
 };
@@ -53,6 +55,7 @@ beforeEach(() => {
     assets.cancel,
     assets.authorize,
     assets.remove,
+    assets.retryRecovery,
   ])
     mock.mockReset();
   assets.listener = undefined;
@@ -65,6 +68,7 @@ beforeEach(() => {
   assets.cancel.mockResolvedValue(true);
   assets.authorize.mockResolvedValue(undefined);
   assets.remove.mockResolvedValue({ ...missing, phase: "missing" });
+  assets.retryRecovery.mockResolvedValue({ ...missing, phase: "missing" });
 });
 
 test("settings explains the pinned target, disk requirement, and manual download", async () => {
@@ -81,7 +85,11 @@ test("settings explains the pinned target, disk requirement, and manual download
 });
 
 test("authentication is graphical and the token disappears after Keychain handoff", async () => {
-  assets.status.mockResolvedValue({ ...missing, phase: "authenticationRequired" });
+  assets.status.mockResolvedValue({
+    ...missing,
+    phase: "authenticationRequired",
+    availableActions: ["authorize"],
+  });
   const user = userEvent.setup();
   render(<ModelResourcePanel context="onboarding" />);
   const token = await screen.findByLabelText("Hugging Face access token");
@@ -99,6 +107,7 @@ test("ready resources require confirmation before ownership-safe removal", async
     phase: "ready",
     transferredBytes: missing.totalBytes,
     remainingBytes: 0,
+    availableActions: ["remove"],
   });
   const user = userEvent.setup();
   render(<ModelResourcePanel context="settings" />);
@@ -125,6 +134,7 @@ test("an active removal closes confirmation and remains cancellable", async () =
     phase: "ready",
     transferredBytes: missing.totalBytes,
     remainingBytes: 0,
+    availableActions: ["remove"],
   });
   assets.remove.mockImplementation(() => new Promise(() => undefined));
   const user = userEvent.setup();
@@ -139,7 +149,7 @@ test("an active removal closes confirmation and remains cancellable", async () =
     transferredBytes: missing.totalBytes,
     remainingBytes: 0,
     operationId: 2,
-    canCancel: true,
+    availableActions: ["cancel"],
   });
   const cancel = await screen.findByRole("button", { name: "Cancel removal" });
   expect(cancel).toBeEnabled();
@@ -152,7 +162,7 @@ test("an active removal closes confirmation and remains cancellable", async () =
     transferredBytes: missing.totalBytes,
     remainingBytes: 0,
     operationId: 2,
-    canCancel: false,
+    availableActions: [],
     message: "Finalizing removal. Più will finish this safely.",
   });
   await waitFor(() =>
@@ -166,11 +176,11 @@ test("a rejected stale cancel refreshes the committed removal state", async () =
     ...missing,
     phase: "removing" as const,
     operationId: 2,
-    canCancel: true,
+    availableActions: ["cancel"],
   };
   assets.status.mockResolvedValueOnce(removing).mockResolvedValueOnce({
     ...removing,
-    canCancel: false,
+    availableActions: [],
     message: "Finalizing removal. Più will finish this safely.",
   });
   assets.cancel.mockResolvedValue(false);
@@ -186,7 +196,11 @@ test("a rejected stale cancel refreshes the committed removal state", async () =
 });
 
 test("the removal dialog traps keyboard focus with the safe action first", async () => {
-  assets.status.mockResolvedValue({ ...missing, phase: "ready" });
+  assets.status.mockResolvedValue({
+    ...missing,
+    phase: "ready",
+    availableActions: ["remove"],
+  });
   const user = userEvent.setup();
   render(<ModelResourcePanel context="settings" />);
   await user.click(await screen.findByRole("button", { name: "Remove model" }));
@@ -233,6 +247,7 @@ test("background phase changes are announced without remounting settings", async
     transferredBytes: 4_000_000_000,
     remainingBytes: 12_950_451_879,
     currentAsset: "target",
+    availableActions: ["cancel"],
   });
 
   expect(await screen.findByRole("status")).toHaveTextContent("Downloading");
@@ -245,6 +260,7 @@ test("revision mismatch offers ownership-safe graphical reset and then the pinne
     phase: "revisionMismatch",
     errorCode: "revisionMismatch",
     message: "An older Più model revision is installed.",
+    availableActions: ["remove"],
   });
   const user = userEvent.setup();
   render(<ModelResourcePanel context="settings" />);
@@ -269,12 +285,50 @@ test("unsupported ownership fails closed without offering an operation", async (
     phase: "failed",
     errorCode: "ownership",
     message: "Existing model assets are not owned by this Più manifest and were left untouched.",
+    availableActions: [],
   });
   render(<ModelResourcePanel context="settings" />);
 
   expect(await screen.findByRole("alert")).toHaveTextContent("were left untouched");
   expect(screen.queryByRole("button", { name: /download model/i })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: /remove/i })).not.toBeInTheDocument();
+});
+
+test("backend initialization failure exposes guidance without an impossible download", async () => {
+  assets.status.mockResolvedValue({
+    ...missing,
+    phase: "failed",
+    errorCode: "storage",
+    message:
+      "Più couldn't prepare its managed model storage. Quit and reopen Più. If the problem continues, reset Più's pre-release application data.",
+    availableActions: [],
+  });
+  render(<ModelResourcePanel context="settings" />);
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("Quit and reopen Più");
+  expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  expect(assets.start).not.toHaveBeenCalled();
+});
+
+test("recovery-required removal exposes only the bounded recovery retry", async () => {
+  assets.status.mockResolvedValue({
+    ...missing,
+    phase: "failed",
+    operationId: 7,
+    errorCode: "storage",
+    message: "Resolve the reported storage problem, then retry recovery.",
+    availableActions: ["retryRecovery"],
+  });
+  const user = userEvent.setup();
+  render(<ModelResourcePanel context="settings" />);
+
+  const retry = await screen.findByRole("button", { name: "Retry recovery" });
+  expect(screen.queryByRole("button", { name: "Download model" })).not.toBeInTheDocument();
+  await user.click(retry);
+
+  expect(assets.retryRecovery).toHaveBeenCalledOnce();
+  expect(await screen.findByRole("button", { name: "Download model" })).toBeVisible();
+  expect(assets.start).not.toHaveBeenCalled();
 });
 
 test("the build-time QA gallery cannot invoke production model IPC", async () => {
@@ -305,4 +359,5 @@ test("the build-time QA gallery cannot invoke production model IPC", async () =>
   expect(assets.cancel).not.toHaveBeenCalled();
   expect(assets.authorize).not.toHaveBeenCalled();
   expect(assets.remove).not.toHaveBeenCalled();
+  expect(assets.retryRecovery).not.toHaveBeenCalled();
 });

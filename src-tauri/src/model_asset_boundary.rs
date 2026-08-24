@@ -59,6 +59,13 @@ pub async fn remove_model_assets(
     manager.remove_owned_assets().await.map_err(Into::into)
 }
 
+#[tauri::command]
+pub async fn retry_model_asset_recovery(
+    manager: State<'_, ModelAssetManager>,
+) -> Result<ModelAssetStatus, ModelAssetCommandError> {
+    manager.retry_recovery().await.map_err(Into::into)
+}
+
 pub fn forward_status_events<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     manager: &ModelAssetManager,

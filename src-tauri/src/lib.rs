@@ -20,6 +20,7 @@ pub fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
             model_asset_boundary::cancel_model_download,
             model_asset_boundary::authorize_hugging_face,
             model_asset_boundary::remove_model_assets,
+            model_asset_boundary::retry_model_asset_recovery,
             project_commands::load_project_inbox,
             project_commands::open_repository,
             project_commands::save_project_draft,

@@ -19,8 +19,8 @@ const base: ModelAssetStatus = {
   currentFile: null,
   operationId: null,
   authenticationConfigured: false,
-  canCancel: false,
   canResume: false,
+  availableActions: ["download"],
   errorCode: null,
   message: null,
 };
@@ -37,8 +37,8 @@ const states: Array<{ label: string; status: ModelAssetStatus }> = [
       currentAsset: "target",
       currentFile: "target/model-00002-of-00003.safetensors",
       operationId: 7,
-      canCancel: true,
       canResume: true,
+      availableActions: ["cancel"],
     },
   },
   {
@@ -52,8 +52,8 @@ const states: Array<{ label: string; status: ModelAssetStatus }> = [
       currentAsset: "drafter",
       currentFile: "drafter/model.safetensors",
       operationId: 7,
-      canCancel: true,
       canResume: true,
+      availableActions: ["cancel"],
     },
   },
   {
@@ -63,6 +63,7 @@ const states: Array<{ label: string; status: ModelAssetStatus }> = [
       phase: "authenticationRequired",
       errorCode: "authentication",
       message: "Hugging Face access expired. Connect again, then resume the download.",
+      availableActions: ["authorize"],
     },
   },
   {
@@ -73,6 +74,7 @@ const states: Array<{ label: string; status: ModelAssetStatus }> = [
       currentFreeBytes: 8_000_000_000,
       errorCode: "insufficientSpace",
       message: "Not enough disk space. Free 10 GB, then retry the download.",
+      availableActions: ["download"],
     },
   },
   {
@@ -85,6 +87,7 @@ const states: Array<{ label: string; status: ModelAssetStatus }> = [
       requiredFreeBytes: totalBytes - 4_500_000_000 + 1_073_741_824,
       canResume: true,
       message: "Download paused. The verified partial is ready to resume.",
+      availableActions: ["download"],
     },
   },
   {
@@ -96,6 +99,7 @@ const states: Array<{ label: string; status: ModelAssetStatus }> = [
       remainingBytes: 0,
       requiredFreeBytes: 0,
       message: "The local model and MTP drafter are ready.",
+      availableActions: ["remove"],
     },
   },
   {
@@ -105,6 +109,7 @@ const states: Array<{ label: string; status: ModelAssetStatus }> = [
       phase: "revisionMismatch",
       errorCode: "revisionMismatch",
       message: null,
+      availableActions: ["remove"],
     },
   },
 ];
