@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod support;
+
 use std::{
     fs,
     path::Path,
@@ -11,14 +14,16 @@ use piu_lib::{
     git_process::GitProcess,
     host_boundary::{HostRoundTripRequest, HostRoundTripResponse},
     project_commands::{
-        OpenRepositoryRequest, OpenRepositoryResponse, PROJECT_INBOX_CHANGED_EVENT,
-        ProjectInboxChangedEvent, SaveProjectDraftRequest,
+        CHAT_SETUP_CHANGED_EVENT, CHAT_TERMINAL_REQUESTED_EVENT, ChatIdRequest, CreateChatRequest,
+        CreateChatResponse, OpenRepositoryRequest, OpenRepositoryResponse,
+        PROJECT_INBOX_CHANGED_EVENT, ProjectInboxChangedEvent, SaveProjectDraftRequest,
     },
     project_inbox::{
         DraftSummary, ProjectInbox, RepositoryIdentity, RepositoryInspectionError,
         RepositoryInspector,
     },
 };
+use support::TemporaryGitRemote;
 use tauri::{
     Listener, WebviewWindowBuilder,
     ipc::{CallbackFn, InvokeBody},
@@ -166,7 +171,11 @@ fn delayed_git_inspection_does_not_block_another_ipc_request() {
         }),
     )
     .unwrap();
-    let core = ApplicationCore::from_project_inbox(inbox);
+    let core = ApplicationCore::from_project_inbox(
+        inbox,
+        fixture.path(),
+        GitProcess::with_executable("/usr/bin/git".into()),
+    );
     let app = piu_lib::configure_builder(test::mock_builder().manage(core))
         .build(test::mock_context(test::noop_assets()))
         .unwrap();
@@ -221,4 +230,104 @@ fn delayed_git_inspection_does_not_block_another_ipc_request() {
     load_receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("the deferred load should finish after inspection is released");
+}
+
+#[test]
+fn first_send_crosses_the_typed_boundary_and_publishes_setup_and_terminal_actions() {
+    let fixture = tempfile::TempDir::new().expect("fixture should be created");
+    let repository = TemporaryGitRemote::new();
+    fs::write(repository.working_path().join("README.md"), "fixture\n").unwrap();
+    repository.git(["add", "README.md"]);
+    repository.git(["commit", "-m", "fixture"]);
+    repository.git(["push", "-u", "origin", "main"]);
+    let core = ApplicationCore::open(
+        &fixture.path().join("piu.sqlite3"),
+        GitProcess::with_executable("/usr/bin/git".into()),
+    )
+    .unwrap();
+    let project_id = core
+        .project_inbox()
+        .open_repository(repository.working_path())
+        .unwrap()
+        .project
+        .id;
+    let app = piu_lib::configure_builder(test::mock_builder().manage(core))
+        .build(test::mock_context(test::noop_assets()))
+        .unwrap();
+    let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let (setup_sender, setup_receiver) = mpsc::channel();
+    app.listen(CHAT_SETUP_CHANGED_EVENT, move |event| {
+        setup_sender
+            .send(
+                serde_json::from_str::<piu_lib::chat_workspaces::ChatSetupChangedEvent>(
+                    event.payload(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    });
+    let (terminal_sender, terminal_receiver) = mpsc::channel();
+    app.listen(CHAT_TERMINAL_REQUESTED_EVENT, move |event| {
+        terminal_sender.send(event.payload().to_owned()).unwrap();
+    });
+
+    let response = test::get_ipc_response(
+        &webview,
+        InvokeRequest {
+            cmd: "create_chat".into(),
+            callback: CallbackFn(20),
+            error: CallbackFn(21),
+            url: "tauri://localhost".parse().unwrap(),
+            body: InvokeBody::Json(serde_json::json!({
+                "request": CreateChatRequest {
+                    project_id,
+                    prompt: "Build the parser boundary".into(),
+                }
+            })),
+            headers: Default::default(),
+            invoke_key: test::INVOKE_KEY.into(),
+        },
+    )
+    .unwrap()
+    .deserialize::<CreateChatResponse>()
+    .unwrap();
+
+    assert_eq!(response.snapshot.chats.len(), 1);
+    assert_eq!(response.chat.id, response.snapshot.chats[0].id);
+    assert!(
+        response
+            .chat
+            .branch_name
+            .ends_with("-build-the-parser-boundary")
+    );
+    let setup = setup_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        setup.setup.phase,
+        piu_lib::project_inbox::ChatSetupPhase::NotRequired
+    );
+
+    test::get_ipc_response(
+        &webview,
+        InvokeRequest {
+            cmd: "open_chat_terminal".into(),
+            callback: CallbackFn(22),
+            error: CallbackFn(23),
+            url: "tauri://localhost".parse().unwrap(),
+            body: InvokeBody::Json(serde_json::json!({
+                "request": ChatIdRequest {
+                    chat_id: response.chat.id.clone(),
+                }
+            })),
+            headers: Default::default(),
+            invoke_key: test::INVOKE_KEY.into(),
+        },
+    )
+    .unwrap();
+    let terminal_event = terminal_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(!terminal_event.contains("worktrees"));
+    assert!(terminal_event.contains(&response.chat.id));
 }

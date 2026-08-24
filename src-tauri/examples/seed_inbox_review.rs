@@ -114,14 +114,20 @@ fn main() {
             .execute(
                 "INSERT INTO chats (
                     id, project_id, project_name, title, branch_name,
-                    pull_request_number, created_at_ms, merge_state
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    worktree_path, base_commit, pull_request_number, created_at_ms,
+                    merge_state, setup_phase, setup_attempt, setup_log
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'review-base', ?7, ?8, ?9,
+                           'succeeded', 1, '')",
                 params![
                     fixture.id,
                     fixture.project_id,
                     fixture.project_name,
                     fixture.title,
                     fixture.branch_name,
+                    app_data
+                        .join("worktrees")
+                        .join(fixture.id)
+                        .to_string_lossy(),
                     fixture.pull_request_number,
                     fixture.created_at_ms,
                     fixture.merge_state,

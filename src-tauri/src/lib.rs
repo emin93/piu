@@ -1,4 +1,5 @@
 pub mod application;
+pub mod chat_workspaces;
 pub mod database;
 pub mod git_process;
 pub mod host_boundary;
@@ -16,6 +17,10 @@ pub fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
             project_commands::open_repository,
             project_commands::save_project_draft,
             project_commands::remove_project,
+            project_commands::create_chat,
+            project_commands::retry_chat_setup,
+            project_commands::cancel_chat_setup,
+            project_commands::open_chat_terminal,
         ])
 }
 

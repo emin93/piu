@@ -18,6 +18,14 @@ const projectInbox = vi.hoisted(() => ({
   remove: vi.fn(),
   saveDraft: vi.fn(),
 }));
+const chatWorkspaces = vi.hoisted(() => ({
+  cancel: vi.fn(),
+  create: vi.fn(),
+  listen: vi.fn(),
+  onSetup: undefined as ((event: unknown) => void) | undefined,
+  openTerminal: vi.fn(),
+  retry: vi.fn(),
+}));
 
 vi.mock("./platform/host-boundary", () => ({ verifyHostBoundary: boundary.verify }));
 vi.mock("./platform/repository-picker", () => ({
@@ -33,6 +41,14 @@ vi.mock("./platform/project-inbox", async (importOriginal) => ({
   openRepository: projectInbox.open,
   removeProject: projectInbox.remove,
   saveProjectDraft: projectInbox.saveDraft,
+}));
+vi.mock("./platform/chat-workspaces", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./platform/chat-workspaces")>()),
+  cancelChatSetup: chatWorkspaces.cancel,
+  createChat: chatWorkspaces.create,
+  listenToChatSetup: chatWorkspaces.listen,
+  openChatTerminal: chatWorkspaces.openTerminal,
+  retryChatSetup: chatWorkspaces.retry,
 }));
 
 const emptySnapshot = { projects: [], drafts: [], chats: [] };
@@ -53,12 +69,73 @@ beforeEach(() => {
   projectInbox.saveDraft.mockResolvedValue({ projectId: 1, prompt: "", updatedAtMs: 1 });
   projectInbox.listen.mockReset();
   projectInbox.listen.mockResolvedValue(() => undefined);
+  chatWorkspaces.cancel.mockReset();
+  chatWorkspaces.cancel.mockResolvedValue(undefined);
+  chatWorkspaces.create.mockReset();
+  chatWorkspaces.listen.mockReset();
+  chatWorkspaces.onSetup = undefined;
+  chatWorkspaces.listen.mockImplementation((onSetup: (event: unknown) => void) => {
+    chatWorkspaces.onSetup = onSetup;
+    return Promise.resolve(() => undefined);
+  });
+  chatWorkspaces.openTerminal.mockReset();
+  chatWorkspaces.openTerminal.mockResolvedValue({ chatId: "chat-1" });
+  chatWorkspaces.retry.mockReset();
   windowLifecycle.beforeClose = undefined;
   windowLifecycle.listen.mockReset();
   windowLifecycle.listen.mockImplementation((beforeClose: () => Promise<void>) => {
     windowLifecycle.beforeClose = beforeClose;
     return Promise.resolve(() => undefined);
   });
+});
+
+test("first send creates a durable chat and moves into streamed setup", async () => {
+  installMatchMedia("light");
+  const project = { id: 1, name: "Atlas", availability: "available", unmergedChatCount: 0 };
+  projectInbox.load.mockResolvedValueOnce({ projects: [project], drafts: [], chats: [] });
+  const chat = {
+    id: "chat-1",
+    projectId: 1,
+    projectName: "Atlas",
+    title: "Repair the parser",
+    branchName: "agent/chat-1-repair-the-parser",
+    pullRequestNumber: null,
+    createdAtMs: 10,
+    mergeState: "unmerged",
+    setup: {
+      phase: "running",
+      failure: null,
+      exitCode: null,
+      signal: null,
+      attempt: 1,
+      log: "Installing dependencies\n",
+    },
+  };
+  chatWorkspaces.create.mockResolvedValueOnce({
+    chat,
+    snapshot: { projects: [{ ...project, unmergedChatCount: 1 }], drafts: [], chats: [chat] },
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  const composer = await screen.findByRole("textbox", { name: "Draft for Atlas" });
+  await user.type(composer, "Repair the parser");
+
+  await user.click(screen.getByRole("button", { name: "Send message" }));
+
+  expect(chatWorkspaces.create).toHaveBeenCalledWith(1, "Repair the parser");
+  expect(await screen.findByRole("heading", { name: "Setting up worktree" })).toBeVisible();
+  expect(screen.getByLabelText("Setup output")).toHaveTextContent("Installing dependencies");
+  expect(screen.queryByRole("textbox", { name: "Draft for Atlas" })).not.toBeInTheDocument();
+
+  act(() => {
+    chatWorkspaces.onSetup?.({
+      chatId: chat.id,
+      setup: { ...chat.setup, phase: "failed", failure: "exit", exitCode: 7 },
+    });
+  });
+  expect(await screen.findByRole("heading", { name: "Setup failed" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Retry setup" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Open Terminal" })).toBeVisible();
 });
 
 test("the shell follows system appearance changes live", () => {

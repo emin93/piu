@@ -13,7 +13,16 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { DeferredSurface, type DeferredSurfaceName } from "./features/deferred/DeferredSurface";
 import { ProjectDraftController } from "./features/inbox/draft-controller";
 import { InboxWorkspace } from "./features/inbox/InboxWorkspace";
+import { ChatSetupController } from "./features/inbox/setup-controller";
 import { useSystemAppearance } from "./hooks/use-system-appearance";
+import {
+  cancelChatSetup,
+  chatWorkspaceErrorMessage,
+  createChat,
+  listenToChatSetup,
+  openChatTerminal,
+  retryChatSetup,
+} from "./platform/chat-workspaces";
 import { verifyHostBoundary } from "./platform/host-boundary";
 import {
   type InboxSnapshot,
@@ -70,9 +79,11 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
   const [hostStatus, setHostStatus] = useState<"checking" | "ready" | "failed">("checking");
   const [snapshot, setSnapshot] = useState<InboxSnapshot>(EMPTY_INBOX);
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
+  const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [repositoryActionError, setRepositoryActionError] = useState<string>();
   const verificationGeneration = useRef(0);
+  const [setups] = useState(() => new ChatSetupController());
   const [drafts] = useState(() => {
     const controller = new ProjectDraftController(
       async (projectId, prompt) => {
@@ -93,6 +104,7 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
         ([, loadedSnapshot]) => {
           if (verificationGeneration.current !== generation) return;
           drafts.reconcile(loadedSnapshot);
+          setups.reconcile(loadedSnapshot);
           setSnapshot(drafts.overlay(loadedSnapshot));
           setHostStatus("ready");
         },
@@ -101,7 +113,7 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
         },
       );
     },
-    [drafts],
+    [drafts, setups],
   );
 
   const retryStartup = useCallback(() => {
@@ -131,8 +143,10 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
       try {
         const opened = await openRepository(path);
         drafts.reconcile(opened.snapshot);
+        setups.reconcile(opened.snapshot);
         setSnapshot(drafts.overlay(opened.snapshot));
         setSelectedProjectId(opened.focusedProjectId);
+        setSelectedChatId(null);
         setQuery("");
       } catch (error: unknown) {
         setRepositoryActionError(
@@ -140,15 +154,69 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
         );
       }
     })();
-  }, [drafts, flushAllDrafts, onOpenRepository]);
+  }, [drafts, flushAllDrafts, onOpenRepository, setups]);
 
   const selectProject = useCallback(
     (projectId: number | null) => {
       void flushAllDrafts().catch(() => undefined);
       setSelectedProjectId(projectId);
+      setSelectedChatId(null);
     },
     [flushAllDrafts],
   );
+
+  const createProjectChat = useCallback(
+    async (projectId: number, prompt: string) => {
+      await drafts.flush(projectId);
+      try {
+        const created = await createChat(projectId, prompt);
+        drafts.forget(projectId);
+        setups.reconcile(created.snapshot);
+        setSnapshot(created.snapshot);
+        setSelectedProjectId(created.chat.projectId);
+        setSelectedChatId(created.chat.id);
+        setQuery("");
+        return undefined;
+      } catch (error: unknown) {
+        return chatWorkspaceErrorMessage(
+          error,
+          "Più couldn’t prepare this chat. Check the repository and try again.",
+        );
+      }
+    },
+    [drafts, setups],
+  );
+
+  const retrySetup = useCallback(
+    async (chatId: string) => {
+      try {
+        const setup = await retryChatSetup(chatId);
+        setups.apply({ chatId, setup });
+        return undefined;
+      } catch (error: unknown) {
+        return chatWorkspaceErrorMessage(error, "Più couldn’t retry setup. Try again.");
+      }
+    },
+    [setups],
+  );
+
+  const cancelSetup = useCallback(async (chatId: string) => {
+    try {
+      await cancelChatSetup(chatId);
+      return undefined;
+    } catch (error: unknown) {
+      return chatWorkspaceErrorMessage(error, "Più couldn’t cancel setup. Try again.");
+    }
+  }, []);
+
+  const openTerminal = useCallback(async (chatId: string) => {
+    try {
+      await openChatTerminal(chatId);
+      return undefined;
+    } catch (error: unknown) {
+      return chatWorkspaceErrorMessage(error, "Più couldn’t open the chat terminal. Try again.");
+    }
+  }, []);
 
   const changeQuery = useCallback(
     (nextQuery: string) => {
@@ -194,6 +262,7 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
     void listenToProjectInbox((event) => {
       if (disposed) return;
       drafts.reconcile(event.snapshot);
+      setups.reconcile(event.snapshot);
       setSnapshot(drafts.overlay(event.snapshot));
       if (event.focusedProjectId !== null) setSelectedProjectId(event.focusedProjectId);
     })
@@ -206,7 +275,24 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
       disposed = true;
       stopListening?.();
     };
-  }, [drafts]);
+  }, [drafts, setups]);
+
+  useEffect(() => {
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    void listenToChatSetup((event) => {
+      if (!disposed) setups.apply(event);
+    })
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else stopListening = unlisten;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, [setups]);
 
   useEffect(() => {
     const flush = () => void flushAllDrafts().catch(() => undefined);
@@ -258,12 +344,19 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
           <InboxWorkspace
             actionError={repositoryActionError}
             drafts={drafts}
+            onCancelSetup={cancelSetup}
+            onCreateChat={createProjectChat}
             onOpenRepository={openSelectedRepository}
+            onOpenTerminal={openTerminal}
             onQueryChange={changeQuery}
             onRemoveProject={removeSelectedProject}
+            onRetrySetup={retrySetup}
+            onSelectChat={setSelectedChatId}
             onSelectProject={selectProject}
             query={query}
+            selectedChatId={selectedChatId}
             selectedProjectId={selectedProjectId}
+            setups={setups}
             snapshot={snapshot}
           />
         ) : (

@@ -55,15 +55,18 @@ fn seed_chat(
     connection
         .execute(
             "INSERT INTO chats (
-                id, project_id, project_name, title, branch_name, pull_request_number,
-                created_at_ms, merge_state
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                id, project_id, project_name, title, branch_name, worktree_path,
+                base_commit, pull_request_number, created_at_ms, merge_state,
+                setup_phase, setup_attempt, setup_log
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'fixture-base', ?7, ?8, ?9,
+                       'succeeded', 1, '')",
             params![
                 id,
                 project_id,
                 project_name,
                 title,
                 format!("feature/{id}"),
+                format!("/private/tmp/piu-fixture-{id}"),
                 73,
                 created_at_ms,
                 merge_state,

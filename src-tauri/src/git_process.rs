@@ -17,6 +17,8 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use thiserror::Error;
 
 const INSPECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const NETWORK_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
+const WORKTREE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Error)]
@@ -35,6 +37,7 @@ pub enum GitProcessError {
     InvalidOutput,
 }
 
+#[derive(Clone)]
 pub struct GitProcess {
     executable: PathBuf,
     runtime_environment: Option<GitRuntimeEnvironment>,
@@ -42,6 +45,7 @@ pub struct GitProcess {
     max_output_bytes: usize,
 }
 
+#[derive(Clone)]
 struct GitRuntimeEnvironment {
     exec_path: PathBuf,
     template_dir: PathBuf,
@@ -52,6 +56,14 @@ struct GitRuntimeEnvironment {
 pub struct GitWorktreePaths {
     pub root: PathBuf,
     pub git_dir: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedWorktreeIdentity {
+    pub root: PathBuf,
+    pub git_dir: PathBuf,
+    pub common_git_dir: PathBuf,
+    pub head: String,
 }
 
 impl GitProcess {
@@ -102,13 +114,16 @@ impl GitProcess {
         &self,
         selected_path: &Path,
     ) -> Result<GitWorktreePaths, GitProcessError> {
-        let output = self.run([
-            OsStr::new("-C"),
-            selected_path.as_os_str(),
-            OsStr::new("rev-parse"),
-            OsStr::new("--show-toplevel"),
-            OsStr::new("--absolute-git-dir"),
-        ])?;
+        let output = self.run_with_timeout(
+            [
+                OsStr::new("-C"),
+                selected_path.as_os_str(),
+                OsStr::new("rev-parse"),
+                OsStr::new("--show-toplevel"),
+                OsStr::new("--absolute-git-dir"),
+            ],
+            self.timeout,
+        )?;
         let paths = String::from_utf8(output).map_err(|_| GitProcessError::InvalidOutput)?;
         let mut lines = paths.lines();
         let root = lines.next().filter(|line| !line.is_empty());
@@ -122,7 +137,215 @@ impl GitProcess {
         })
     }
 
-    fn run<const N: usize>(&self, args: [&OsStr; N]) -> Result<Vec<u8>, GitProcessError> {
+    pub fn fetch_origin_main(&self, repository: &Path) -> Result<String, GitProcessError> {
+        self.run_with_timeout(
+            [
+                OsStr::new("-C"),
+                repository.as_os_str(),
+                OsStr::new("fetch"),
+                OsStr::new("--no-tags"),
+                OsStr::new("--prune"),
+                OsStr::new("origin"),
+                OsStr::new("+refs/heads/main:refs/remotes/origin/main"),
+            ],
+            NETWORK_OPERATION_TIMEOUT,
+        )?;
+        let output = self.run_with_timeout(
+            [
+                OsStr::new("-C"),
+                repository.as_os_str(),
+                OsStr::new("rev-parse"),
+                OsStr::new("--verify"),
+                OsStr::new("refs/remotes/origin/main^{commit}"),
+            ],
+            self.timeout,
+        )?;
+        single_line_output(output)
+    }
+
+    pub fn add_detached_worktree(
+        &self,
+        repository: &Path,
+        worktree: &Path,
+        commit: &str,
+    ) -> Result<(), GitProcessError> {
+        self.run_with_timeout(
+            [
+                OsStr::new("-C"),
+                repository.as_os_str(),
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("--detach"),
+                worktree.as_os_str(),
+                OsStr::new(commit),
+            ],
+            WORKTREE_OPERATION_TIMEOUT,
+        )?;
+        Ok(())
+    }
+
+    pub fn attach_new_branch(&self, worktree: &Path, branch: &str) -> Result<(), GitProcessError> {
+        self.run_with_timeout(
+            [
+                OsStr::new("-C"),
+                worktree.as_os_str(),
+                OsStr::new("switch"),
+                OsStr::new("-c"),
+                OsStr::new(branch),
+            ],
+            WORKTREE_OPERATION_TIMEOUT,
+        )?;
+        Ok(())
+    }
+
+    pub fn current_branch(&self, worktree: &Path) -> Result<Option<String>, GitProcessError> {
+        let output = self.run_with_timeout(
+            [
+                OsStr::new("-C"),
+                worktree.as_os_str(),
+                OsStr::new("symbolic-ref"),
+                OsStr::new("--quiet"),
+                OsStr::new("--short"),
+                OsStr::new("HEAD"),
+            ],
+            self.timeout,
+        );
+        match output {
+            Ok(output) => single_line_output(output).map(Some),
+            Err(GitProcessError::Failed {
+                status: Some(1), ..
+            }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn inspect_managed_worktree(
+        &self,
+        worktree: &Path,
+    ) -> Result<ManagedWorktreeIdentity, GitProcessError> {
+        let output = self.run_with_timeout(
+            [
+                OsStr::new("-C"),
+                worktree.as_os_str(),
+                OsStr::new("rev-parse"),
+                OsStr::new("--path-format=absolute"),
+                OsStr::new("--show-toplevel"),
+                OsStr::new("--git-dir"),
+                OsStr::new("--git-common-dir"),
+                OsStr::new("--verify"),
+                OsStr::new("HEAD^{commit}"),
+            ],
+            self.timeout,
+        )?;
+        let text = String::from_utf8(output).map_err(|_| GitProcessError::InvalidOutput)?;
+        let mut lines = text.lines();
+        let root = lines.next().filter(|line| !line.is_empty());
+        let git_dir = lines.next().filter(|line| !line.is_empty());
+        let common_git_dir = lines.next().filter(|line| !line.is_empty());
+        let head = lines.next().filter(|line| !line.is_empty());
+        if lines.next().is_some()
+            || root.is_none()
+            || git_dir.is_none()
+            || common_git_dir.is_none()
+            || head.is_none()
+        {
+            return Err(GitProcessError::InvalidOutput);
+        }
+        Ok(ManagedWorktreeIdentity {
+            root: PathBuf::from(root.expect("root was checked")),
+            git_dir: PathBuf::from(git_dir.expect("Git dir was checked")),
+            common_git_dir: PathBuf::from(common_git_dir.expect("common Git dir was checked")),
+            head: head.expect("HEAD was checked").to_owned(),
+        })
+    }
+
+    pub fn remove_worktree(
+        &self,
+        repository: &Path,
+        worktree: &Path,
+    ) -> Result<(), GitProcessError> {
+        self.run_with_timeout(
+            [
+                OsStr::new("-C"),
+                repository.as_os_str(),
+                OsStr::new("worktree"),
+                OsStr::new("remove"),
+                OsStr::new("--force"),
+                worktree.as_os_str(),
+            ],
+            WORKTREE_OPERATION_TIMEOUT,
+        )?;
+        Ok(())
+    }
+
+    pub fn worktree_is_pristine(&self, worktree: &Path) -> Result<bool, GitProcessError> {
+        let output = self.run_with_timeout(
+            [
+                OsStr::new("-C"),
+                worktree.as_os_str(),
+                OsStr::new("status"),
+                OsStr::new("--porcelain=v1"),
+                OsStr::new("--untracked-files=all"),
+                OsStr::new("--ignored=matching"),
+            ],
+            self.timeout,
+        )?;
+        Ok(output.is_empty())
+    }
+
+    pub fn prune_worktrees(&self, repository: &Path) -> Result<(), GitProcessError> {
+        self.run_with_timeout(
+            [
+                OsStr::new("-C"),
+                repository.as_os_str(),
+                OsStr::new("worktree"),
+                OsStr::new("prune"),
+            ],
+            WORKTREE_OPERATION_TIMEOUT,
+        )?;
+        Ok(())
+    }
+
+    pub fn branch_exists(&self, repository: &Path, branch: &str) -> Result<bool, GitProcessError> {
+        let reference = format!("refs/heads/{branch}");
+        match self.run_with_timeout(
+            [
+                OsStr::new("-C"),
+                repository.as_os_str(),
+                OsStr::new("show-ref"),
+                OsStr::new("--verify"),
+                OsStr::new("--quiet"),
+                OsStr::new(&reference),
+            ],
+            self.timeout,
+        ) {
+            Ok(_) => Ok(true),
+            Err(GitProcessError::Failed {
+                status: Some(1), ..
+            }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn delete_branch(&self, repository: &Path, branch: &str) -> Result<(), GitProcessError> {
+        self.run_with_timeout(
+            [
+                OsStr::new("-C"),
+                repository.as_os_str(),
+                OsStr::new("branch"),
+                OsStr::new("-D"),
+                OsStr::new(branch),
+            ],
+            WORKTREE_OPERATION_TIMEOUT,
+        )?;
+        Ok(())
+    }
+
+    fn run_with_timeout<const N: usize>(
+        &self,
+        args: [&OsStr; N],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, GitProcessError> {
         let mut command = Command::new(&self.executable);
         command
             .args(args)
@@ -152,7 +375,7 @@ impl GitProcess {
                 return Err(error);
             }
         };
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + timeout;
         let status = loop {
             if output_limited.load(Ordering::Acquire) {
                 terminate_and_reap(&mut child, Some(readers))?;
@@ -179,6 +402,16 @@ impl GitProcess {
         }
         successful_output(status, stdout, stderr)
     }
+}
+
+fn single_line_output(output: Vec<u8>) -> Result<String, GitProcessError> {
+    let text = String::from_utf8(output).map_err(|_| GitProcessError::InvalidOutput)?;
+    let mut lines = text.lines();
+    let value = lines.next().filter(|line| !line.is_empty());
+    if lines.next().is_some() || value.is_none() {
+        return Err(GitProcessError::InvalidOutput);
+    }
+    Ok(value.expect("single line was checked").to_owned())
 }
 
 struct ChildReaders {

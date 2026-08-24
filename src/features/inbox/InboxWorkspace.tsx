@@ -37,17 +37,26 @@ import { ChatComposer } from "./ChatComposer";
 import { EmptyInbox } from "./EmptyInbox";
 import { type DraftPersistenceStatus, ProjectDraftController } from "./draft-controller";
 import { composerProject, selectInbox } from "./inbox-model";
+import { ChatSetupPanel } from "./ChatSetupPanel";
+import { ChatSetupController } from "./setup-controller";
 import { SidebarResizeHandle } from "./SidebarResizeHandle";
 
 interface InboxWorkspaceProps {
   actionError: string | undefined;
   drafts: ProjectDraftController;
+  onCancelSetup: (chatId: string) => Promise<string | undefined>;
+  onCreateChat: (projectId: number, prompt: string) => Promise<string | undefined>;
   onOpenRepository: () => void;
+  onOpenTerminal: (chatId: string) => Promise<string | undefined>;
   onQueryChange: (query: string) => void;
   onRemoveProject: (projectId: number) => Promise<string | undefined>;
+  onRetrySetup: (chatId: string) => Promise<string | undefined>;
+  onSelectChat: (chatId: string) => void;
   onSelectProject: (projectId: number | null) => void;
   query: string;
   selectedProjectId: number | null;
+  selectedChatId: string | null;
+  setups: ChatSetupController;
   snapshot: InboxSnapshot;
 }
 
@@ -133,24 +142,52 @@ const ProjectFilter = memo(function ProjectFilter({
   );
 });
 
-const ChatRow = memo(function ChatRow({ chat }: { chat: ChatSummary }) {
+const ChatRow = memo(function ChatRow({
+  chat,
+  onSelect,
+  selected,
+  setups,
+}: {
+  chat: ChatSummary;
+  onSelect: () => void;
+  selected: boolean;
+  setups: ChatSetupController;
+}) {
+  const subscribe = useCallback(
+    (listener: () => void) => setups.subscribe(chat.id, listener),
+    [chat.id, setups],
+  );
+  const getSnapshot = useCallback(() => setups.get(chat.id), [chat.id, setups]);
+  const setup = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   return (
     <li className="chat-row" data-chat-id={chat.id}>
-      <div className="chat-row-copy">
-        <h3 title={chat.title}>{chat.title}</h3>
-        <p>
-          <span>{chat.projectName}</span>
-          <span aria-hidden="true">/</span>
-          <span className="font-mono" title={chat.branchName}>
-            {chat.branchName}
+      <Button
+        aria-label={`${chat.title}, ${setup.phase}`}
+        aria-pressed={selected}
+        className="chat-row-select"
+        onClick={onSelect}
+        type="button"
+        variant="ghost"
+      >
+        <span aria-hidden="true" className="chat-setup-indicator" data-phase={setup.phase} />
+        <span className="chat-row-copy">
+          <span className="chat-row-title" title={chat.title}>
+            {chat.title}
           </span>
-        </p>
-      </div>
-      {chat.pullRequestNumber !== null ? (
-        <Badge className="font-mono" variant="outline">
-          #{chat.pullRequestNumber}
-        </Badge>
-      ) : null}
+          <span className="chat-row-metadata">
+            <span>{chat.projectName}</span>
+            <span aria-hidden="true">/</span>
+            <span className="font-mono" title={chat.branchName}>
+              {chat.branchName}
+            </span>
+          </span>
+        </span>
+        {chat.pullRequestNumber !== null ? (
+          <Badge className="font-mono" variant="outline">
+            #{chat.pullRequestNumber}
+          </Badge>
+        ) : null}
+      </Button>
     </li>
   );
 });
@@ -242,12 +279,19 @@ function SearchStage({ count }: { count: number }) {
 export function InboxWorkspace({
   actionError,
   drafts,
+  onCancelSetup,
+  onCreateChat,
   onOpenRepository,
+  onOpenTerminal,
   onQueryChange,
   onRemoveProject,
+  onRetrySetup,
+  onSelectChat,
   onSelectProject,
   query,
   selectedProjectId,
+  selectedChatId,
+  setups,
   snapshot,
 }: InboxWorkspaceProps) {
   const [projectPendingRemoval, setProjectPendingRemoval] = useState<ProjectSummary>();
@@ -260,6 +304,7 @@ export function InboxWorkspace({
     [query, selectedProjectId, snapshot],
   );
   const targetProject = composerProject(snapshot, selectedProjectId);
+  const selectedChat = snapshot.chats.find(({ id }) => id === selectedChatId);
   const visibleChatCount = selection.unmergedChats.length;
 
   const closeRemovalDialog = useCallback(() => {
@@ -390,7 +435,13 @@ export function InboxWorkspace({
               {selection.unmergedChats.length > 0 ? (
                 <ul aria-label="Active chats" className="chat-list">
                   {selection.unmergedChats.map((chat) => (
-                    <ChatRow chat={chat} key={chat.id} />
+                    <ChatRow
+                      chat={chat}
+                      key={chat.id}
+                      onSelect={() => onSelectChat(chat.id)}
+                      selected={selectedChatId === chat.id}
+                      setups={setups}
+                    />
                   ))}
                 </ul>
               ) : (
@@ -414,7 +465,13 @@ export function InboxWorkspace({
                 <CollapsibleContent>
                   <ul aria-label="Merged chats" className="chat-list chat-list-merged">
                     {selection.mergedChats.map((chat) => (
-                      <ChatRow chat={chat} key={chat.id} />
+                      <ChatRow
+                        chat={chat}
+                        key={chat.id}
+                        onSelect={() => onSelectChat(chat.id)}
+                        selected={selectedChatId === chat.id}
+                        setups={setups}
+                      />
                     ))}
                   </ul>
                 </CollapsibleContent>
@@ -435,8 +492,16 @@ export function InboxWorkspace({
           <EmptyInbox actionError={actionError} onOpenRepository={onOpenRepository} />
         ) : query.trim() ? (
           <SearchStage count={totalSearchResults} />
+        ) : selectedChat ? (
+          <ChatSetupPanel
+            chat={selectedChat}
+            onCancel={onCancelSetup}
+            onOpenTerminal={onOpenTerminal}
+            onRetry={onRetrySetup}
+            setups={setups}
+          />
         ) : targetProject ? (
-          <ChatComposer drafts={drafts} project={targetProject} />
+          <ChatComposer drafts={drafts} onSubmit={onCreateChat} project={targetProject} />
         ) : null}
       </section>
 
