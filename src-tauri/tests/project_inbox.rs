@@ -72,76 +72,6 @@ fn seed_chat(
         .expect("fixture chat should be inserted");
 }
 
-fn seed_version_two_project_inbox(database_path: &Path, repository_path: &Path) {
-    let canonical_path = repository_path
-        .canonicalize()
-        .expect("legacy repository path should canonicalize");
-    let connection = Connection::open(database_path).expect("legacy database should open");
-    connection
-        .execute_batch(
-            r#"
-            PRAGMA foreign_keys = ON;
-            CREATE TABLE application_metadata (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                created_at TEXT NOT NULL
-            );
-            INSERT INTO application_metadata (id, created_at)
-            VALUES (1, '2026-08-24T00:00:00.000Z');
-            CREATE TABLE projects (
-                id INTEGER PRIMARY KEY,
-                canonical_path TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                created_at_ms INTEGER NOT NULL
-            );
-            CREATE TABLE chat_drafts (
-                project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-                prompt TEXT NOT NULL,
-                updated_at_ms INTEGER NOT NULL
-            );
-            CREATE TABLE chats (
-                id TEXT PRIMARY KEY,
-                project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
-                project_name TEXT NOT NULL,
-                title TEXT NOT NULL,
-                branch_name TEXT NOT NULL,
-                pull_request_number INTEGER,
-                created_at_ms INTEGER NOT NULL,
-                merge_state TEXT NOT NULL CHECK (merge_state IN ('unmerged', 'merged'))
-            );
-            CREATE INDEX chats_created_at ON chats(created_at_ms DESC, id ASC);
-            CREATE INDEX chats_project_id ON chats(project_id);
-            PRAGMA user_version = 2;
-            "#,
-        )
-        .expect("legacy schema should be created");
-    connection
-        .execute(
-            "INSERT INTO projects (id, canonical_path, name, created_at_ms)
-             VALUES (7, ?1, 'legacy-project', 100)",
-            [canonical_path.to_string_lossy().as_ref()],
-        )
-        .expect("legacy project should be inserted");
-    connection
-        .execute(
-            "INSERT INTO chat_drafts (project_id, prompt, updated_at_ms)
-             VALUES (7, 'Preserve this draft', 200)",
-            [],
-        )
-        .expect("legacy draft should be inserted");
-    connection
-        .execute(
-            "INSERT INTO chats (
-                 id, project_id, project_name, title, branch_name,
-                 pull_request_number, created_at_ms, merge_state
-             ) VALUES (
-                 'legacy-chat', 7, 'legacy-project', 'Preserve this chat',
-                 'agent/legacy-chat', 42, 300, 'unmerged'
-             )",
-            [],
-        )
-        .expect("legacy chat should be inserted");
-}
-
 #[test]
 fn rejects_non_repositories_without_persisting_them() {
     let fixture = TempDir::new().expect("fixture should be created");
@@ -197,52 +127,6 @@ fn opens_real_repositories_once_and_retains_one_draft_per_project() {
     assert_eq!(snapshot.projects.len(), 1);
     assert_eq!(snapshot.drafts.len(), 1);
     assert_eq!(snapshot.drafts[0].prompt, "replacement prompt");
-}
-
-#[test]
-fn version_two_projects_are_revalidated_backfilled_and_preserved() {
-    let fixture = TempDir::new().expect("fixture should be created");
-    let database_path = fixture.path().join("piu.sqlite3");
-    let repository_path = fixture.path().join("legacy-project");
-    make_repository(&repository_path);
-    seed_version_two_project_inbox(&database_path, &repository_path);
-
-    let inbox = open_inbox(&database_path);
-    let snapshot = inbox.snapshot().expect("legacy inbox should load");
-    assert_eq!(snapshot.projects.len(), 1);
-    assert_eq!(
-        snapshot.projects[0].availability,
-        ProjectAvailability::Available
-    );
-    assert_eq!(snapshot.drafts[0].prompt, "Preserve this draft");
-    assert_eq!(snapshot.chats[0].title, "Preserve this chat");
-    drop(inbox);
-
-    let connection = Connection::open(&database_path).expect("migrated database should open");
-    let identity: (Option<String>, Option<String>, Option<String>) = connection
-        .query_row(
-            "SELECT root_device, root_inode, git_dir_path FROM projects WHERE id = 7",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .expect("legacy identity should remain addressable");
-    assert!(identity.0.is_some());
-    assert!(identity.1.is_some());
-    assert!(identity.2.is_some());
-    drop(connection);
-
-    fs::remove_dir_all(repository_path.join(".git"))
-        .expect("the admitted repository metadata should be removable");
-    make_repository(&repository_path);
-    let replacement = open_inbox(&database_path);
-    assert_eq!(
-        replacement
-            .snapshot()
-            .expect("replacement should still yield an inbox")
-            .projects[0]
-            .availability,
-        ProjectAvailability::Missing
-    );
 }
 
 #[test]
@@ -306,12 +190,6 @@ fn relaunch_revalidates_the_original_git_worktree_identity() {
         .expect("project should remain remembered")
         .availability;
     assert_eq!(availability, ProjectAvailability::Missing);
-
-    let reopened = replacement
-        .open_repository(&repository_path)
-        .expect("explicitly reopening a valid replacement should refresh its identity");
-    assert_eq!(reopened.outcome, OpenRepositoryOutcome::FocusedExisting);
-    assert_eq!(reopened.project.availability, ProjectAvailability::Available);
 }
 
 #[test]

@@ -3,7 +3,7 @@ use std::path::Path;
 use rusqlite::{Connection, TransactionBehavior, params};
 use thiserror::Error;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 const MIGRATIONS: &[Migration] = &[
     Migration::new(
@@ -26,6 +26,11 @@ const MIGRATIONS: &[Migration] = &[
     CREATE TABLE projects (
         id INTEGER PRIMARY KEY,
         canonical_path TEXT NOT NULL UNIQUE,
+        root_device TEXT NOT NULL,
+        root_inode TEXT NOT NULL,
+        git_dir_path TEXT NOT NULL,
+        git_dir_device TEXT NOT NULL,
+        git_dir_inode TEXT NOT NULL,
         name TEXT NOT NULL,
         created_at_ms INTEGER NOT NULL
     );
@@ -49,17 +54,6 @@ const MIGRATIONS: &[Migration] = &[
 
     CREATE INDEX chats_created_at ON chats(created_at_ms DESC, id ASC);
     CREATE INDEX chats_project_id ON chats(project_id);
-"#,
-    ),
-    Migration::new(
-        3,
-        "pin repository identities",
-        r#"
-    ALTER TABLE projects ADD COLUMN root_device TEXT;
-    ALTER TABLE projects ADD COLUMN root_inode TEXT;
-    ALTER TABLE projects ADD COLUMN git_dir_path TEXT;
-    ALTER TABLE projects ADD COLUMN git_dir_device TEXT;
-    ALTER TABLE projects ADD COLUMN git_dir_inode TEXT;
 "#,
     ),
 ];
