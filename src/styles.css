@@ -802,6 +802,7 @@
 }
 
 .setup-stage h2 {
+  width: fit-content;
   margin: 0;
   font-size: 20px;
   font-weight: 480;
