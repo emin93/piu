@@ -1,0 +1,5 @@
+# Bridge Pi authentication to macOS Keychain
+
+Più will bundle a small Node launcher that constructs Pi sessions through Pi's public runtime APIs and passes the resulting runtime to Pi's official native RPC runner. The launcher supplies a Pi-compatible credential store backed by macOS Keychain instead of allowing Pi to create `auth.json`. Credential updates are serialized per provider across concurrent chat processes so OAuth refresh-token rotation remains correct. Pi retains ownership of provider login, refresh, model, tool, skill, extension, session, and RPC behavior; Più owns only persistence and the graphical interaction callbacks. The Tauri host still communicates with each child exclusively through Pi's native JSONL RPC protocol and does not embed the Pi SDK in the desktop process.
+
+This is preferred to copying Pi's CLI bootstrap, storing OAuth credentials in a private plaintext file, passing long-lived tokens through environment variables, or introducing the AI SDK Pi Harness. The launcher is an application boundary required by Più's credential policy, not a second agent runtime or protocol.

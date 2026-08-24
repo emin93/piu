@@ -13,8 +13,8 @@ The single execution system that owns sessions, tools, skills, extensions, permi
 _Avoid_: Harness manager, agent launcher, backend
 
 **Pi transport**:
-The bundled Pi process's native JSONL RPC protocol over standard input and output. Più supervises one Pi process per active chat and translates the protocol once at the host boundary. It does not place AI SDK HarnessAgent, ACP, or another agent abstraction between the application and Pi.
-_Avoid_: AI SDK Pi Harness adapter, in-process Pi SDK, sandbox bridge, second agent protocol
+The bundled Pi process's native JSONL RPC protocol over standard input and output. Più supervises one Pi process per active chat and translates the protocol once at the host boundary. Each child starts through a small Più-owned launcher that uses Pi's public session APIs and official RPC runner so it can supply application-owned credentials without copying Pi's CLI. The desktop shell does not host the Pi SDK or place AI SDK HarnessAgent, ACP, or another agent abstraction between the application and Pi.
+_Avoid_: AI SDK Pi Harness adapter, Pi SDK inside the desktop shell, sandbox bridge, copied Pi CLI, second agent protocol
 
 **Frontend**:
 The purpose-built macOS application used to open projects, chat with the agent, inspect tool calls and diffs, approve actions, and change models. Its single main window has a global chat inbox, a primary conversation view, and adjacent Diff, Files, and Terminal views, but no direct code editor.
@@ -139,6 +139,10 @@ _Avoid_: GitHub review submission, direct code editing
 **Onboarding**:
 The in-application setup flow for ChatGPT/Codex authentication, Hugging Face access, model download, oMLX configuration, Pi configuration, and GitHub authentication. App-owned secrets live in macOS Keychain, GitHub authentication remains owned by `gh`, and the finished application must not require terminal setup.
 _Avoid_: README-only setup, terminal onboarding
+
+**Pi credential bridge**:
+The narrow credential adapter used by the bundled Pi launcher. It implements Pi's public credential-store contract over macOS Keychain, serializes provider updates across concurrent chat processes, and lets Pi own login and token-refresh semantics without writing secrets to `auth.json`.
+_Avoid_: Plaintext credential file, imported standalone Pi credentials, environment-only OAuth token, duplicated provider auth flow
 
 **Git host**:
 GitHub is the only pull-request host supported by the first release.
