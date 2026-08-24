@@ -1,0 +1,3 @@
+# Use Tauri for the macOS shell
+
+Più will use Tauri 2 with a React and AI Elements frontend. Tauri uses the macOS system WebView instead of bundling Chromium and provides a Rust host for process supervision, pseudo-terminals, Git worktrees, filesystem access, Pi RPC, oMLX lifecycle, and shutdown coordination. The first release supports Apple Silicon Macs only even though Tauri is cross-platform. Its macOS bundle identifier is `ch.emin.piu`, based on the `emin.ch` domain and the ASCII form of the product name. Più will not include update checks or an automatic updater in the first release; users install new builds from GitHub Releases explicitly.

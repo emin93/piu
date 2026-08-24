@@ -1,0 +1,3 @@
+# Use one agent runtime for every model route
+
+Every local and subscription-backed model route will run through the same agent runtime so that tools, skills, extensions, permissions, sessions, and context behavior do not change when the user switches models. A control plane that switches between separate coding agents does not satisfy this requirement, even when it presents one continuous interface. Più will read each selected Pi model's effective reasoning metadata and expose only the thinking levels that model supports. Local-route failure remains visible and never triggers an automatic switch to a cloud route.
