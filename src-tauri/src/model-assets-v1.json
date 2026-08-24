@@ -4,8 +4,8 @@
   "repository": "orcarouter/Qwen3.8-27B-Uncensored-MLX",
   "revision": "0f88c40e9eff87740295f27654558fcb77e21ae5",
   "sourceLastModified": "2026-08-24T09:44:01.000Z",
-  "mtpBlockSize": 4,
-  "drafterSelectionNote": "The drafter is the repository's same-revision mtp directory with block size 4. mlx-community/Qwen3.8-27B-MTP-4bit is intentionally incompatible because its config declares block size 3.",
+  "mtpBlockSize": 3,
+  "drafterSelectionNote": "The drafter is the repository's same-revision mtp directory. Its pinned config declares the native speculative block size 3.",
   "files": [
     {
       "asset": "target",

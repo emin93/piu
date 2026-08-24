@@ -71,7 +71,7 @@ test("settings explains the pinned target, disk requirement, and manual download
 
   expect(await screen.findByRole("heading", { name: "Local model" })).toBeVisible();
   expect(screen.getByText("Qwen 3.8 27B · 4-bit")).toBeVisible();
-  expect(screen.getByText(/MTP drafter · block 4/i)).toBeVisible();
+  expect(screen.getByText(/MTP drafter · block 3/i)).toBeVisible();
   expect(screen.getByText("Download size").parentElement).toHaveTextContent("17 GB");
   expect(screen.getByText("Space needed").parentElement).toHaveTextContent("18 GB");
   await userEvent.click(screen.getByRole("button", { name: "Download model" }));
@@ -115,6 +115,33 @@ test("ready resources require confirmation before ownership-safe removal", async
   await user.click(remove);
   await user.click(screen.getByRole("button", { name: "Confirm removal" }));
   expect(assets.remove).toHaveBeenCalledOnce();
+});
+
+test("an active removal closes confirmation and remains cancellable", async () => {
+  assets.status.mockResolvedValue({
+    ...missing,
+    phase: "ready",
+    transferredBytes: missing.totalBytes,
+    remainingBytes: 0,
+  });
+  assets.remove.mockImplementation(() => new Promise(() => undefined));
+  const user = userEvent.setup();
+  render(<ModelResourcePanel context="settings" />);
+
+  await user.click(await screen.findByRole("button", { name: "Remove model" }));
+  await user.click(screen.getByRole("button", { name: "Confirm removal" }));
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  assets.listener?.({
+    ...missing,
+    phase: "removing",
+    transferredBytes: missing.totalBytes,
+    remainingBytes: 0,
+    operationId: 2,
+  });
+  const cancel = await screen.findByRole("button", { name: "Cancel removal" });
+  expect(cancel).toBeEnabled();
+  await user.click(cancel);
+  expect(assets.cancel).toHaveBeenCalledOnce();
 });
 
 test("the removal dialog traps keyboard focus with the safe action first", async () => {

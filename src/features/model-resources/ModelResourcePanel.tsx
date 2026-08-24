@@ -14,6 +14,7 @@ const phaseLabels: Record<ModelAssetStatus["phase"], string> = {
   missing: "Not downloaded",
   downloading: "Downloading",
   verifying: "Verifying",
+  removing: "Removing",
   ready: "Ready",
   cancelled: "Paused",
   authenticationRequired: "Access required",
@@ -150,6 +151,7 @@ export function ModelResourcePanel({
   }
 
   const downloading = currentStatus.phase === "downloading" || currentStatus.phase === "verifying";
+  const removing = currentStatus.phase === "removing";
   const authenticationNeeded = currentStatus.phase === "authenticationRequired";
   const mismatch = currentStatus.phase === "revisionMismatch";
   const removable = currentStatus.phase === "ready" || mismatch;
@@ -195,7 +197,7 @@ export function ModelResourcePanel({
 
       <div className="model-resource-card__identity">
         <strong>Qwen 3.8 27B · 4-bit</strong>
-        <span>MTP drafter · block 4</span>
+        <span>MTP drafter · block 3</span>
       </div>
       <p className="model-resource-card__copy">
         Più installs this exact pinned model and drafter in managed application storage. Local
@@ -292,14 +294,22 @@ export function ModelResourcePanel({
       ) : null}
 
       <div className="resource-actions">
-        {downloading ? (
+        {downloading || removing ? (
           <button
             className="secondary-action"
             type="button"
-            disabled={busy || qaMode}
-            onClick={() => void perform(cancelModelDownload)}
+            disabled={(busy && !removing) || qaMode}
+            onClick={() => {
+              if (removing) {
+                void cancelModelDownload().catch((cause: unknown) => {
+                  setError(cause instanceof Error ? cause.message : String(cause));
+                });
+              } else {
+                void perform(cancelModelDownload);
+              }
+            }}
           >
-            Cancel download
+            {removing ? "Cancel removal" : "Cancel download"}
           </button>
         ) : removable ? (
           <button
@@ -351,13 +361,13 @@ export function ModelResourcePanel({
                 className="danger-action"
                 type="button"
                 disabled={busy || qaMode}
-                onClick={() =>
+                onClick={() => {
+                  closeRemoval();
                   void perform(async () => {
                     const next = await removeModelAssets();
                     setStatus(next);
-                    closeRemoval();
-                  })
-                }
+                  });
+                }}
               >
                 Confirm removal
               </button>
