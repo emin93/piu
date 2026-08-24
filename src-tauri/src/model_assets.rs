@@ -540,8 +540,26 @@ impl ModelAssetManager {
                 .map_err(|source| self.storage_error(&marker_path, source))?,
         )
         .map_err(|_| ModelAssetError::NotOwned)?;
-        if !marker.matches(&self.0.manifest) {
+        if !marker.authorizes_removal(&self.0.manifest) {
             return Err(ModelAssetError::NotOwned);
+        }
+        // Validate every extant entry before deleting anything. This makes recovery
+        // atomic from an ownership perspective: a tampered or redirected path leaves
+        // the complete old installation and its evidence intact for manual recovery.
+        for file in &marker.files {
+            let relative = Path::new(&file.install_path);
+            let path = self.0.root.join(relative);
+            let Ok(metadata) = tokio::fs::symlink_metadata(&path).await else {
+                continue;
+            };
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() != file.size_bytes
+                || has_symlink_ancestor(&self.0.root, relative).await?
+                || sha256_file(&path).await? != file.sha256
+            {
+                return Err(ModelAssetError::NotOwned);
+            }
         }
         for file in &marker.files {
             let path = self.0.root.join(&file.install_path);
@@ -993,6 +1011,43 @@ impl OwnershipMarker {
                         && owned.sha256 == expected.sha256
                 })
     }
+
+    fn authorizes_removal(&self, manifest: &AssetManifest) -> bool {
+        if !matches!(self.schema_version, 0 | 1)
+            || self.owner != "ch.emin.piu"
+            || self.repository != manifest.repository
+            || self.revision.len() != 40
+            || !self.revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || self.files.is_empty()
+        {
+            return false;
+        }
+        let mut paths = HashSet::new();
+        self.files.iter().all(|file| {
+            let path = Path::new(&file.install_path);
+            let mut components = path.components();
+            let safe_root = matches!(
+                components.next(),
+                Some(Component::Normal(root)) if root == "target" || root == "drafter"
+            );
+            safe_root
+                && components.next().is_some()
+                && !path.is_absolute()
+                && !path.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir
+                            | Component::RootDir
+                            | Component::Prefix(_)
+                            | Component::CurDir
+                    )
+                })
+                && file.size_bytes > 0
+                && file.sha256.len() == 64
+                && file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && paths.insert(file.install_path.clone())
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1046,6 +1101,31 @@ async fn sha256_file(path: &Path) -> Result<String, ModelAssetError> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+async fn has_symlink_ancestor(root: &Path, relative: &Path) -> Result<bool, ModelAssetError> {
+    let mut current = root.to_path_buf();
+    let Some(parent) = relative.parent() else {
+        return Ok(false);
+    };
+    for component in parent.components() {
+        let Component::Normal(component) = component else {
+            return Ok(true);
+        };
+        current.push(component);
+        match tokio::fs::symlink_metadata(&current).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(ModelAssetError::Storage {
+                    path: current,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -1505,6 +1585,151 @@ mod tests {
         assert_eq!(missing.phase, ModelAssetPhase::Missing);
         assert!(unknown.exists());
         assert!(!manager.0.root.join("target/model.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn old_piu_revision_can_remove_only_its_verified_listed_files() {
+        let bytes = b"old owned fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        let owned = manager.0.root.join("target/model.bin");
+        tokio::fs::create_dir_all(owned.parent().expect("target directory"))
+            .await
+            .expect("target directory");
+        tokio::fs::write(&owned, &bytes)
+            .await
+            .expect("old owned file");
+        let unknown = manager.0.root.join("target/notes.txt");
+        tokio::fs::write(&unknown, b"user file")
+            .await
+            .expect("unknown file");
+        let mut marker = OwnershipMarker::from_manifest(&manager.0.manifest);
+        marker.manifest_id = "old-piu-manifest".into();
+        marker.revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        tokio::fs::write(
+            manager.0.root.join(OWNERSHIP_FILE),
+            serde_json::to_vec(&marker).expect("old marker JSON"),
+        )
+        .await
+        .expect("old marker");
+        let relaunched = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        assert_eq!(relaunched.status().phase, ModelAssetPhase::RevisionMismatch);
+
+        let missing = relaunched
+            .remove_owned_assets()
+            .await
+            .expect("remove verified old revision");
+
+        assert_eq!(missing.phase, ModelAssetPhase::Missing);
+        assert!(!owned.exists());
+        assert!(unknown.exists());
+    }
+
+    #[tokio::test]
+    async fn adversarial_old_marker_paths_and_tampered_files_are_never_removed() {
+        let bytes = b"safe fixture bytes".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        let outside = temporary.path().join("outside.txt");
+        tokio::fs::write(&outside, b"safe fixture bytes")
+            .await
+            .expect("outside file");
+        let mut marker = OwnershipMarker::from_manifest(&manager.0.manifest);
+        marker.revision = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        marker.files[0].install_path = "../outside.txt".into();
+        tokio::fs::write(
+            manager.0.root.join(OWNERSHIP_FILE),
+            serde_json::to_vec(&marker).expect("adversarial marker JSON"),
+        )
+        .await
+        .expect("adversarial marker");
+
+        assert!(matches!(
+            manager.remove_owned_assets().await,
+            Err(ModelAssetError::NotOwned)
+        ));
+        assert!(outside.exists());
+
+        let owned = manager.0.root.join("target/model.bin");
+        tokio::fs::create_dir_all(owned.parent().expect("target directory"))
+            .await
+            .expect("target directory");
+        tokio::fs::write(&owned, b"tampered fixture")
+            .await
+            .expect("tampered file");
+        marker.files[0].install_path = "target/model.bin".into();
+        tokio::fs::write(
+            manager.0.root.join(OWNERSHIP_FILE),
+            serde_json::to_vec(&marker).expect("old marker JSON"),
+        )
+        .await
+        .expect("old marker");
+
+        assert!(matches!(
+            manager.remove_owned_assets().await,
+            Err(ModelAssetError::NotOwned)
+        ));
+        assert!(owned.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn old_marker_cannot_follow_a_symlinked_owned_directory() {
+        use std::os::unix::fs::symlink;
+
+        let bytes = b"symlink fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        let outside = temporary.path().join("outside");
+        tokio::fs::create_dir(&outside)
+            .await
+            .expect("outside directory");
+        let outside_file = outside.join("model.bin");
+        tokio::fs::write(&outside_file, &bytes)
+            .await
+            .expect("outside file");
+        symlink(&outside, manager.0.root.join("target")).expect("target symlink");
+        let mut marker = OwnershipMarker::from_manifest(&manager.0.manifest);
+        marker.revision = "cccccccccccccccccccccccccccccccccccccccc".into();
+        tokio::fs::write(
+            manager.0.root.join(OWNERSHIP_FILE),
+            serde_json::to_vec(&marker).expect("old marker JSON"),
+        )
+        .await
+        .expect("old marker");
+
+        assert!(matches!(
+            manager.remove_owned_assets().await,
+            Err(ModelAssetError::NotOwned)
+        ));
+        assert!(outside_file.exists());
     }
 
     #[test]

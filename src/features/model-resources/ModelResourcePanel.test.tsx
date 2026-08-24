@@ -4,6 +4,7 @@ import { beforeEach, expect, test, vi } from "vitest";
 
 import type { ModelAssetStatus } from "../../generated/ModelAssetStatus";
 import { ModelResourcePanel } from "./ModelResourcePanel";
+import { ModelResourceQaGallery } from "./ModelResourceQaGallery";
 
 const assets = vi.hoisted(() => ({
   status: vi.fn(),
@@ -12,6 +13,7 @@ const assets = vi.hoisted(() => ({
   cancel: vi.fn(),
   authorize: vi.fn(),
   remove: vi.fn(),
+  listener: undefined as ((status: ModelAssetStatus) => void) | undefined,
 }));
 
 vi.mock("../../platform/model-assets", () => ({
@@ -43,9 +45,21 @@ const missing: ModelAssetStatus = {
 };
 
 beforeEach(() => {
-  for (const mock of Object.values(assets)) mock.mockReset();
+  for (const mock of [
+    assets.status,
+    assets.subscribe,
+    assets.start,
+    assets.cancel,
+    assets.authorize,
+    assets.remove,
+  ])
+    mock.mockReset();
+  assets.listener = undefined;
   assets.status.mockResolvedValue(missing);
-  assets.subscribe.mockResolvedValue(() => undefined);
+  assets.subscribe.mockImplementation((listener: (status: ModelAssetStatus) => void) => {
+    assets.listener = listener;
+    return Promise.resolve(() => undefined);
+  });
   assets.start.mockResolvedValue(1);
   assets.cancel.mockResolvedValue(true);
   assets.authorize.mockResolvedValue(undefined);
@@ -87,9 +101,114 @@ test("ready resources require confirmation before ownership-safe removal", async
   const user = userEvent.setup();
   render(<ModelResourcePanel context="settings" />);
 
-  await user.click(await screen.findByRole("button", { name: "Remove model" }));
-  expect(screen.getByText(/only files verified as owned by Più/i)).toBeVisible();
+  const remove = await screen.findByRole("button", { name: "Remove model" });
+  await user.click(remove);
+  const dialog = screen.getByRole("dialog", { name: "Remove local model?" });
+  expect(dialog).toBeVisible();
   expect(assets.remove).not.toHaveBeenCalled();
+  const keep = screen.getByRole("button", { name: "Keep model" });
+  expect(keep).toHaveFocus();
+  await user.keyboard("{Escape}");
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(remove).toHaveFocus();
+
+  await user.click(remove);
   await user.click(screen.getByRole("button", { name: "Confirm removal" }));
   expect(assets.remove).toHaveBeenCalledOnce();
+});
+
+test("the removal dialog traps keyboard focus with the safe action first", async () => {
+  assets.status.mockResolvedValue({ ...missing, phase: "ready" });
+  const user = userEvent.setup();
+  render(<ModelResourcePanel context="settings" />);
+  await user.click(await screen.findByRole("button", { name: "Remove model" }));
+  const keep = screen.getByRole("button", { name: "Keep model" });
+  const confirm = screen.getByRole("button", { name: "Confirm removal" });
+
+  expect(keep).toHaveFocus();
+  await user.tab({ shift: true });
+  expect(confirm).toHaveFocus();
+  await user.tab();
+  expect(keep).toHaveFocus();
+});
+
+test("initialization failures stop loading and offer a finite retry", async () => {
+  assets.status.mockRejectedValueOnce(new Error("resource boundary unavailable"));
+  const user = userEvent.setup();
+  render(<ModelResourcePanel context="settings" />);
+
+  expect(await screen.findByRole("heading", { name: "Model resources unavailable" })).toBeVisible();
+  expect(screen.getByRole("alert")).toHaveTextContent("resource boundary unavailable");
+  const retry = screen.getByRole("button", { name: "Retry" });
+  await user.click(retry);
+
+  expect(await screen.findByRole("heading", { name: "Local model" })).toBeVisible();
+  expect(assets.status).toHaveBeenCalledTimes(2);
+});
+
+test("subscription failures are finite and retryable", async () => {
+  assets.subscribe.mockRejectedValueOnce(new Error("events unavailable"));
+  render(<ModelResourcePanel context="settings" />);
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("events unavailable");
+  expect(screen.getByRole("button", { name: "Retry" })).toBeVisible();
+  expect(screen.queryByText("Checking model resources…")).not.toBeInTheDocument();
+});
+
+test("background phase changes are announced without remounting settings", async () => {
+  render(<ModelResourcePanel context="settings" />);
+  await screen.findByRole("heading", { name: "Local model" });
+
+  assets.listener?.({
+    ...missing,
+    phase: "downloading",
+    transferredBytes: 4_000_000_000,
+    remainingBytes: 12_950_451_879,
+    currentAsset: "target",
+  });
+
+  expect(await screen.findByRole("status")).toHaveTextContent("Downloading");
+  expect(screen.getByLabelText("Model download progress")).toBeVisible();
+});
+
+test("revision mismatch offers ownership-safe graphical reset and then the pinned download", async () => {
+  assets.status.mockResolvedValue({
+    ...missing,
+    phase: "revisionMismatch",
+    errorCode: "revisionMismatch",
+    message: "An older Più model revision is installed.",
+  });
+  const user = userEvent.setup();
+  render(<ModelResourcePanel context="settings" />);
+
+  await user.click(await screen.findByRole("button", { name: "Remove old model" }));
+  await user.click(screen.getByRole("button", { name: "Confirm removal" }));
+
+  expect(assets.remove).toHaveBeenCalledOnce();
+  expect(await screen.findByRole("button", { name: "Download model" })).toBeVisible();
+});
+
+test("the build-time QA gallery cannot invoke production model IPC", async () => {
+  const user = userEvent.setup();
+  render(<ModelResourceQaGallery />);
+
+  expect(assets.status).not.toHaveBeenCalled();
+  expect(assets.subscribe).not.toHaveBeenCalled();
+  for (const label of ["Cancel download", "Download model", "Resume download"]) {
+    for (const button of screen.queryAllByRole("button", { name: label })) {
+      expect(button).toBeDisabled();
+    }
+  }
+  expect(screen.getByLabelText("Hugging Face access token")).toBeDisabled();
+
+  await user.click(screen.getByRole("button", { name: "Remove old model" }));
+  expect(screen.getByRole("button", { name: "Confirm removal" })).toBeDisabled();
+  await user.keyboard("{Escape}");
+  await user.click(screen.getByRole("button", { name: "Remove model" }));
+  expect(screen.getByRole("button", { name: "Confirm removal" })).toBeDisabled();
+
+  expect(assets.start).not.toHaveBeenCalled();
+  expect(assets.cancel).not.toHaveBeenCalled();
+  expect(assets.authorize).not.toHaveBeenCalled();
+  expect(assets.remove).not.toHaveBeenCalled();
 });

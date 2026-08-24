@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import type { ModelAssetStatus } from "../../generated/ModelAssetStatus";
 import {
@@ -32,36 +32,77 @@ function progress(status: ModelAssetStatus): number {
     : Math.min(100, Math.round((status.transferredBytes / status.totalBytes) * 100));
 }
 
-export function ModelResourcePanel({ context }: { context: "onboarding" | "settings" }) {
+interface ModelResourcePanelProps {
+  context: "onboarding" | "settings";
+  /** Deterministic build-time QA input; production Settings never supplies it. */
+  statusOverride?: ModelAssetStatus;
+  dialogOpenForQa?: boolean;
+}
+
+export function ModelResourcePanel({
+  context,
+  statusOverride,
+  dialogOpenForQa = false,
+}: ModelResourcePanelProps) {
+  const headingId = useId();
   const tokenId = useId();
-  const [status, setStatus] = useState<ModelAssetStatus>();
+  const dialogTitleId = useId();
+  const [status, setStatus] = useState<ModelAssetStatus | undefined>(statusOverride);
+  const [initialization, setInitialization] = useState<"loading" | "ready" | "failed">(
+    statusOverride ? "ready" : "loading",
+  );
+  const [initializationAttempt, setInitializationAttempt] = useState(0);
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
-  const [confirmRemoval, setConfirmRemoval] = useState(false);
+  const [confirmRemoval, setConfirmRemoval] = useState(dialogOpenForQa);
+  const removeButtonRef = useRef<HTMLButtonElement>(null);
+  const cancelRemovalRef = useRef<HTMLButtonElement>(null);
+  const confirmRemovalRef = useRef<HTMLButtonElement>(null);
+  const dialogWasOpen = useRef(dialogOpenForQa);
 
   useEffect(() => {
+    if (statusOverride) return;
     let active = true;
     let stopListening: (() => void) | undefined;
     void subscribeToModelAssetStatus((next) => {
       if (active) setStatus(next);
     })
       .then((unlisten) => {
-        if (!active) unlisten();
-        else stopListening = unlisten;
+        if (!active) {
+          unlisten();
+          return undefined;
+        }
+        stopListening = unlisten;
         return getModelAssetStatus();
       })
       .then((current) => {
-        if (active) setStatus(current);
+        if (active && current) {
+          setStatus(current);
+          setInitialization("ready");
+        }
       })
       .catch((cause: unknown) => {
-        if (active) setError(cause instanceof Error ? cause.message : String(cause));
+        if (active) {
+          setInitialization("failed");
+          setError(cause instanceof Error ? cause.message : String(cause));
+        }
       });
     return () => {
       active = false;
       stopListening?.();
     };
-  }, []);
+  }, [initializationAttempt, statusOverride]);
+
+  useEffect(() => {
+    if (confirmRemoval) {
+      dialogWasOpen.current = true;
+      cancelRemovalRef.current?.focus();
+    } else if (dialogWasOpen.current) {
+      dialogWasOpen.current = false;
+      removeButtonRef.current?.focus();
+    }
+  }, [confirmRemoval]);
 
   const perform = useCallback(async (action: () => Promise<unknown>) => {
     setBusy(true);
@@ -75,29 +116,80 @@ export function ModelResourcePanel({ context }: { context: "onboarding" | "setti
     }
   }, []);
 
-  if (!status) {
+  if (initialization === "failed") {
     return (
-      <section className="model-resource-card" aria-busy="true">
-        <p className="model-resource-card__loading">Checking model resources…</p>
-        {error ? <p role="alert">{error}</p> : null}
+      <section className="model-resource-card model-resource-card--failure">
+        <p className="settings-eyebrow">Models & resources</p>
+        <h2>Model resources unavailable</h2>
+        <p className="resource-error" role="alert">
+          {error ?? "Più couldn’t reach its model resource service."}
+        </p>
+        <button
+          className="secondary-action"
+          type="button"
+          onClick={() => {
+            setInitialization("loading");
+            setStatus(undefined);
+            setError(undefined);
+            setInitializationAttempt((attempt) => attempt + 1);
+          }}
+        >
+          Retry
+        </button>
       </section>
     );
   }
 
-  const downloading = status.phase === "downloading" || status.phase === "verifying";
-  const authenticationNeeded = status.phase === "authenticationRequired";
+  const currentStatus = statusOverride ?? status;
+  if (initialization === "loading" || !currentStatus) {
+    return (
+      <section className="model-resource-card" aria-busy="true">
+        <p className="model-resource-card__loading">Checking model resources…</p>
+      </section>
+    );
+  }
+
+  const downloading = currentStatus.phase === "downloading" || currentStatus.phase === "verifying";
+  const authenticationNeeded = currentStatus.phase === "authenticationRequired";
+  const mismatch = currentStatus.phase === "revisionMismatch";
+  const removable = currentStatus.phase === "ready" || mismatch;
+  const transferRelevant =
+    downloading || currentStatus.canResume || currentStatus.phase === "cancelled";
+  const qaMode = statusOverride !== undefined;
+
+  const closeRemoval = () => setConfirmRemoval(false);
+  const keepFocusInDialog = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeRemoval();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    if (event.shiftKey && document.activeElement === cancelRemovalRef.current) {
+      event.preventDefault();
+      confirmRemovalRef.current?.focus();
+    } else if (!event.shiftKey && document.activeElement === confirmRemovalRef.current) {
+      event.preventDefault();
+      cancelRemovalRef.current?.focus();
+    }
+  };
 
   return (
-    <section className="model-resource-card" aria-labelledby="local-model-heading">
+    <section className="model-resource-card" aria-labelledby={headingId}>
       <header className="model-resource-card__header">
         <div>
           <p className="settings-eyebrow">
             {context === "onboarding" ? "Required resource" : "Models & resources"}
           </p>
-          <h2 id="local-model-heading">Local model</h2>
+          <h2 id={headingId}>Local model</h2>
         </div>
-        <span className={`resource-status resource-status--${status.phase}`}>
-          {phaseLabels[status.phase]}
+        <span
+          className={`resource-status resource-status--${currentStatus.phase}`}
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          {phaseLabels[currentStatus.phase]}
         </span>
       </header>
 
@@ -106,41 +198,49 @@ export function ModelResourcePanel({ context }: { context: "onboarding" | "setti
         <span>MTP drafter · block 4</span>
       </div>
       <p className="model-resource-card__copy">
-        Più installs this exact pinned model and drafter in its managed application storage. It
-        won’t start local inference as part of this download.
+        Più installs this exact pinned model and drafter in managed application storage. Local
+        inference stays off until it is needed.
       </p>
 
       <dl className="resource-metrics">
         <div>
           <dt>Download size</dt>
-          <dd>{formatBytes(status.totalBytes)}</dd>
+          <dd>{formatBytes(currentStatus.totalBytes)}</dd>
         </div>
         <div>
           <dt>Space needed</dt>
-          <dd>{formatBytes(status.requiredFreeBytes)}</dd>
+          <dd>{formatBytes(currentStatus.requiredFreeBytes)}</dd>
         </div>
         <div>
           <dt>Free now</dt>
-          <dd>{formatBytes(status.currentFreeBytes)}</dd>
-        </div>
-        <div>
-          <dt>Transferred</dt>
-          <dd>{formatBytes(status.transferredBytes)}</dd>
-        </div>
-        <div>
-          <dt>Remaining</dt>
-          <dd>{formatBytes(status.remainingBytes)}</dd>
+          <dd>{formatBytes(currentStatus.currentFreeBytes)}</dd>
         </div>
       </dl>
 
-      {downloading || status.canResume ? (
+      {transferRelevant ? (
         <div className="resource-progress">
           <div className="resource-progress__labels">
-            <span>{status.currentAsset === "drafter" ? "MTP drafter" : "Model"}</span>
-            <span>{progress(status)}%</span>
+            <span>
+              {currentStatus.phase === "verifying"
+                ? "Checking downloaded files"
+                : currentStatus.currentAsset === "drafter"
+                  ? "MTP drafter"
+                  : "Model"}
+            </span>
+            <span>
+              {formatBytes(currentStatus.transferredBytes)} of{" "}
+              {formatBytes(currentStatus.totalBytes)} · {progress(currentStatus)}%
+            </span>
           </div>
-          <progress max="100" value={progress(status)} aria-label="Model download progress" />
-          {status.currentFile ? <p>{status.currentFile}</p> : null}
+          <progress
+            max="100"
+            value={progress(currentStatus)}
+            aria-label="Model download progress"
+          />
+          <div className="resource-progress__detail">
+            <span>{currentStatus.currentFile ?? "Ready to resume"}</span>
+            <span>{formatBytes(currentStatus.remainingBytes)} remaining</span>
+          </div>
         </div>
       ) : null}
 
@@ -162,17 +262,29 @@ export function ModelResourcePanel({ context }: { context: "onboarding" | "setti
               type="password"
               autoComplete="off"
               value={token}
+              disabled={qaMode}
               onChange={(event) => setToken(event.currentTarget.value)}
             />
-            <button className="secondary-action" type="submit" disabled={busy || !token.trim()}>
+            <button
+              className="secondary-action"
+              type="submit"
+              disabled={busy || !token.trim() || qaMode}
+            >
               Connect Hugging Face
             </button>
           </div>
-          <p>The token is validated graphically, then stored only in macOS Keychain.</p>
+          <p>The token is validated, then stored only in macOS Keychain.</p>
         </form>
       ) : null}
 
-      {status.message ? <p className="resource-message">{status.message}</p> : null}
+      {currentStatus.message ? (
+        <p
+          className={currentStatus.errorCode ? "resource-error" : "resource-message"}
+          role={currentStatus.errorCode ? "alert" : undefined}
+        >
+          {currentStatus.message}
+        </p>
+      ) : null}
       {error ? (
         <p className="resource-error" role="alert">
           {error}
@@ -184,57 +296,72 @@ export function ModelResourcePanel({ context }: { context: "onboarding" | "setti
           <button
             className="secondary-action"
             type="button"
-            disabled={busy}
+            disabled={busy || qaMode}
             onClick={() => void perform(cancelModelDownload)}
           >
             Cancel download
           </button>
-        ) : status.phase === "ready" ? (
+        ) : removable ? (
           <button
+            ref={removeButtonRef}
             className="danger-action"
             type="button"
             disabled={busy}
             onClick={() => setConfirmRemoval(true)}
           >
-            Remove model
+            {mismatch ? "Remove old model" : "Remove model"}
           </button>
-        ) : status.phase !== "revisionMismatch" ? (
+        ) : (
           <button
             className="primary-action"
             type="button"
-            disabled={busy || authenticationNeeded}
+            disabled={busy || authenticationNeeded || qaMode}
             onClick={() => void perform(startModelDownload)}
           >
-            {status.canResume ? "Resume download" : "Download model"}
+            {currentStatus.canResume ? "Resume download" : "Download model"}
           </button>
-        ) : null}
+        )}
       </div>
 
       {confirmRemoval ? (
-        <div className="removal-confirmation" role="group" aria-label="Confirm model removal">
-          <p>Più will remove only files verified as owned by Più. Other files stay untouched.</p>
-          <div>
-            <button
-              className="danger-action"
-              type="button"
-              disabled={busy}
-              onClick={() =>
-                void perform(async () => {
-                  const next = await removeModelAssets();
-                  setStatus(next);
-                  setConfirmRemoval(false);
-                })
-              }
-            >
-              Confirm removal
-            </button>
-            <button
-              className="secondary-action"
-              type="button"
-              onClick={() => setConfirmRemoval(false)}
-            >
-              Keep model
-            </button>
+        <div className="dialog-backdrop">
+          <div
+            className="removal-confirmation"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={dialogTitleId}
+            onKeyDown={keepFocusInDialog}
+          >
+            <h3 id={dialogTitleId}>{mismatch ? "Remove old model?" : "Remove local model?"}</h3>
+            <p>
+              Più verifies every file recorded by its ownership marker before removal. Unknown or
+              changed files stay untouched.
+            </p>
+            <div>
+              <button
+                ref={cancelRemovalRef}
+                className="secondary-action"
+                type="button"
+                onClick={closeRemoval}
+              >
+                Keep model
+              </button>
+              <button
+                ref={confirmRemovalRef}
+                className="danger-action"
+                type="button"
+                disabled={busy || qaMode}
+                onClick={() =>
+                  void perform(async () => {
+                    const next = await removeModelAssets();
+                    setStatus(next);
+                    closeRemoval();
+                  })
+                }
+              >
+                Confirm removal
+              </button>
+            </div>
           </div>
         </div>
       ) : null}
