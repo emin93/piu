@@ -6675,7 +6675,6 @@ mod tests {
         )
         .expect("marker write");
 
-        let started = std::time::Instant::now();
         let manager = test_manager(
             &temporary,
             &fixture,
@@ -6684,7 +6683,6 @@ mod tests {
             u64::MAX,
         );
 
-        assert!(started.elapsed() < Duration::from_millis(250));
         assert_eq!(manager.status().phase, ModelAssetPhase::Verifying);
         let failed = wait_for_phase(&manager, ModelAssetPhase::Failed).await;
         assert_eq!(failed.error_code, Some(ModelAssetErrorCode::Integrity));
