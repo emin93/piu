@@ -2664,6 +2664,7 @@ dependencies = [
  "cap-std",
  "fs4",
  "futures-util",
+ "libc",
  "reqwest",
  "rusqlite",
  "rustix",

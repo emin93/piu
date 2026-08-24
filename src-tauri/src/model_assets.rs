@@ -6,7 +6,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -196,6 +196,7 @@ const REMOVAL_STAGING_PREFIX: &str = ".piu-removal-";
 const REMOVAL_RECOVERY_FILE: &str = "recovery.json";
 const REMOVAL_RECOVERY_MAX_BYTES: u64 = 128 * 1024;
 const REMOVAL_RECOVERY_MAX_ENTRIES: usize = 64;
+const NAMESPACE_SCAN_MAX_ENTRIES: usize = 4_096;
 static PRIVATE_WRITE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
@@ -341,6 +342,8 @@ pub enum ModelAssetError {
     InsufficientSpace { available: u64, required: u64 },
     #[error("model resources are unavailable: {0}")]
     Unavailable(String),
+    #[error("model assets require recovery before another operation: {0}")]
+    RecoveryRequired(String),
 }
 
 impl ModelAssetError {
@@ -361,6 +364,7 @@ impl ModelAssetError {
             Self::Storage { .. }
             | Self::Credential(_)
             | Self::Unavailable(_)
+            | Self::RecoveryRequired(_)
             | Self::OperationInProgress => ModelAssetErrorCode::Storage,
             Self::Manifest(_) => ModelAssetErrorCode::Manifest,
         }
@@ -468,11 +472,7 @@ impl TransferProgress {
 
 struct InstallInspection {
     status: ModelAssetStatus,
-    validation: Option<ValidationPlan>,
-}
-
-struct ValidationPlan {
-    migrate_legacy_marker: bool,
+    requires_validation: bool,
 }
 
 /// Capability-anchors every asset operation at the application-owned model root.
@@ -495,8 +495,6 @@ struct PrivateWrite {
     temporary_path: PathBuf,
     opened_device: u64,
     opened_inode: u64,
-    publish_on_drop: bool,
-    published: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -517,6 +515,7 @@ trait RemovalPersistence: Send + Sync {
     ) -> io::Result<()>;
     fn stage(&self, storage: &SafeStorage, from: &Path, to: &Path) -> io::Result<()>;
     fn delete(&self, storage: &SafeStorage, path: &Path) -> io::Result<()>;
+    fn complete_mutations(&self, storage: &SafeStorage, journal: &Path) -> io::Result<()>;
 }
 
 struct DurableRemovalPersistence;
@@ -528,7 +527,7 @@ impl RemovalPersistence for DurableRemovalPersistence {
         path: &Path,
         _phase: RemovalRecoveryPhase,
     ) -> io::Result<()> {
-        storage.sync_parent(path)
+        storage.order_recovery_phase(path)
     }
 
     fn stage(&self, storage: &SafeStorage, from: &Path, to: &Path) -> io::Result<()> {
@@ -537,6 +536,10 @@ impl RemovalPersistence for DurableRemovalPersistence {
 
     fn delete(&self, storage: &SafeStorage, path: &Path) -> io::Result<()> {
         storage.remove_file_durable(path)
+    }
+
+    fn complete_mutations(&self, storage: &SafeStorage, journal: &Path) -> io::Result<()> {
+        storage.complete_recovery_mutations(journal)
     }
 }
 
@@ -766,11 +769,7 @@ impl SafeStorage {
         ))
     }
 
-    fn create_private_write(
-        &self,
-        destination: &Path,
-        publish_on_drop: bool,
-    ) -> io::Result<PrivateWrite> {
+    fn create_private_write(&self, destination: &Path) -> io::Result<PrivateWrite> {
         let (directory, destination_name, temporary_name, temporary_path, file) =
             self.create_private_slot(destination)?;
         PrivateWrite::new(
@@ -779,7 +778,6 @@ impl SafeStorage {
             temporary_name,
             destination_name,
             temporary_path,
-            publish_on_drop,
         )
     }
 
@@ -826,6 +824,35 @@ impl SafeStorage {
     fn sync_parent(&self, relative: &Path) -> io::Result<()> {
         let (directory, _) = self.parent_and_name(relative, false)?;
         directory.into_std_file().sync_all()
+    }
+
+    fn open_std_read(&self, relative: &Path) -> io::Result<StdFile> {
+        let (directory, name) = self.parent_and_name(relative, false)?;
+        let mut options = CapOpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        directory
+            .open_with(name, &options)
+            .map(|file| file.into_std())
+    }
+
+    /// Orders a recovery journal and its directory entry before the destructive
+    /// phase it describes. On macOS the barrier prevents APFS/the device from
+    /// persisting a later rename or unlink without the earlier journal state.
+    fn order_recovery_phase(&self, journal: &Path) -> io::Result<()> {
+        let journal_file = self.open_std_read(journal)?;
+        journal_file.sync_all()?;
+        self.sync_parent(journal)?;
+        platform_phase_barrier(&journal_file)
+    }
+
+    /// Makes every fsync'd destructive mutation before this point durable before
+    /// its recovery journal is removed. The still-open journal is a same-volume
+    /// durability anchor.
+    fn complete_recovery_mutations(&self, journal: &Path) -> io::Result<()> {
+        let journal_file = self.open_std_read(journal)?;
+        journal_file.sync_all()?;
+        self.sync_parent(journal)?;
+        platform_full_sync(&journal_file)
     }
 
     fn rename_durable(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -875,17 +902,28 @@ impl SafeStorage {
         directory.remove_dir(name)
     }
 
-    fn entry_names(&self, relative: Option<&Path>) -> io::Result<Vec<OsString>> {
-        let directory = if let Some(relative) = relative {
+    fn scan_entry_names(
+        &self,
+        relative: Option<&Path>,
+        mut inspect: impl FnMut(OsString) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let directory = if let Some(relative) = relative.filter(|path| !path.as_os_str().is_empty())
+        {
             let (parent, name) = self.parent_and_name(relative, false)?;
             parent.open_dir_nofollow(name)?
         } else {
             self.directory.try_clone()?
         };
-        directory
-            .entries()?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect()
+        for (index, entry) in directory.entries()?.enumerate() {
+            if index >= NAMESPACE_SCAN_MAX_ENTRIES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "model asset namespace exceeds its scan limit",
+                ));
+            }
+            inspect(entry?.file_name())?;
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -913,6 +951,51 @@ impl SafeStorage {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn macos_fcntl_sync(file: &StdFile, command: libc::c_int) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `file` owns a valid descriptor for the duration of the call, and
+    // both sync commands ignore the variadic argument.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), command) };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_phase_barrier(file: &StdFile) -> io::Result<()> {
+    match macos_fcntl_sync(file, libc::F_BARRIERFSYNC) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::ENOTSUP) | Some(libc::ENOTTY)
+            ) =>
+        {
+            macos_fcntl_sync(file, libc::F_FULLFSYNC)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_phase_barrier(file: &StdFile) -> io::Result<()> {
+    file.sync_all()
+}
+
+#[cfg(target_os = "macos")]
+fn platform_full_sync(file: &StdFile) -> io::Result<()> {
+    macos_fcntl_sync(file, libc::F_FULLFSYNC)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_full_sync(file: &StdFile) -> io::Result<()> {
+    file.sync_all()
+}
+
 #[cfg(unix)]
 fn std_file_identity(file: &StdFile) -> io::Result<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
@@ -935,7 +1018,6 @@ impl PrivateWrite {
         temporary_name: OsString,
         destination_name: OsString,
         temporary_path: PathBuf,
-        publish_on_drop: bool,
     ) -> io::Result<Self> {
         let identity = std_file_identity(&file)?;
         if identity.links != 1 {
@@ -954,8 +1036,6 @@ impl PrivateWrite {
             temporary_path,
             opened_device: identity.device,
             opened_inode: identity.inode,
-            publish_on_drop,
-            published: false,
         })
     }
 
@@ -963,13 +1043,8 @@ impl PrivateWrite {
         &self.temporary_path
     }
 
-    fn enable_publish_on_drop(&mut self) {
-        self.publish_on_drop = true;
-    }
-
     fn adopt_existing(&mut self, expected: FileIdentity) -> io::Result<()> {
         drop(self.output.take());
-        self.publish_on_drop = false;
         self.directory.rename(
             &self.destination_name,
             &self.directory,
@@ -1013,7 +1088,6 @@ impl PrivateWrite {
         self.sync_handle = opened;
         self.opened_device = actual.device;
         self.opened_inode = actual.inode;
-        self.publish_on_drop = true;
         Ok(())
     }
 
@@ -1031,8 +1105,18 @@ impl PrivateWrite {
             output.sync_all().await?;
             drop(output);
         }
-        self.publish_on_drop = false;
-        self.publish_opened_inode()
+        tokio::task::spawn_blocking(move || self.publish_opened_inode())
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("private publication task failed: {error}"))
+            })?
+    }
+
+    async fn discard(mut self) -> io::Result<()> {
+        drop(self.output.take());
+        tokio::task::spawn_blocking(move || self.remove_unpublished_private_inode())
+            .await
+            .map_err(|error| io::Error::other(format!("private cleanup task failed: {error}")))?
     }
 
     fn publish_opened_inode(&mut self) -> io::Result<()> {
@@ -1073,40 +1157,30 @@ impl PrivateWrite {
                 "published model asset does not match its private inode",
             ));
         }
-        self.published = true;
         Ok(())
     }
 
-    fn remove_unpublished_private_inode(&self) {
+    fn remove_unpublished_private_inode(&self) -> io::Result<()> {
         use cap_std::fs::MetadataExt;
 
-        let Ok(metadata) = self.directory.symlink_metadata(&self.temporary_name) else {
-            return;
+        let metadata = match self.directory.symlink_metadata(&self.temporary_name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
         };
-        if metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.dev() == self.opened_device
-            && metadata.ino() == self.opened_inode
-            && metadata.nlink() == 1
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.dev() != self.opened_device
+            || metadata.ino() != self.opened_inode
+            || metadata.nlink() != 1
         {
-            let _ = self.directory.remove_file(&self.temporary_name);
-            let _ = self
-                .directory
-                .try_clone()
-                .and_then(|directory| directory.into_std_file().sync_all());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "operation-private model asset path changed before cleanup",
+            ));
         }
-    }
-}
-
-impl Drop for PrivateWrite {
-    fn drop(&mut self) {
-        drop(self.output.take());
-        if self.publish_on_drop && !self.published {
-            let _ = self.publish_opened_inode();
-        }
-        if !self.published {
-            self.remove_unpublished_private_inode();
-        }
+        self.directory.remove_file(&self.temporary_name)?;
+        self.directory.try_clone()?.into_std_file().sync_all()
     }
 }
 
@@ -1122,6 +1196,7 @@ struct ModelAssetManagerInner {
     disk_space: Arc<dyn DiskSpace>,
     status: watch::Sender<ModelAssetStatus>,
     active: Mutex<Option<ActiveOperation>>,
+    recovery_required: AtomicBool,
     invalid_finals: Mutex<HashSet<String>>,
     removal_persistence: Mutex<Arc<dyn RemovalPersistence>>,
     next_operation_id: AtomicU64,
@@ -1178,6 +1253,7 @@ impl ModelAssetManager {
                 disk_space: Arc::new(SystemDiskSpace),
                 status,
                 active: Mutex::new(None),
+                recovery_required: AtomicBool::new(false),
                 invalid_finals: Mutex::new(HashSet::new()),
                 removal_persistence: Mutex::new(Arc::new(DurableRemovalPersistence)),
                 next_operation_id: AtomicU64::new(1),
@@ -1248,31 +1324,40 @@ impl ModelAssetManager {
             disk_space,
             status,
             active: Mutex::new(None),
+            recovery_required: AtomicBool::new(false),
             invalid_finals: Mutex::new(HashSet::new()),
             removal_persistence: Mutex::new(Arc::new(DurableRemovalPersistence)),
             next_operation_id: AtomicU64::new(1),
             initialization_error: None,
         }));
-        if let Some(plan) = inspection.validation {
-            manager.start_background_validation(plan);
+        if inspection.requires_validation {
+            manager.start_background_validation();
         }
         Ok(manager)
     }
 
     fn recover_staged_removals(storage: &SafeStorage) -> Result<(), ModelAssetError> {
-        let mut staging_directories = storage
-            .entry_names(None)
+        let mut staging_directories = Vec::new();
+        storage
+            .scan_entry_names(None, |name| {
+                if name
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(REMOVAL_STAGING_PREFIX))
+                {
+                    if staging_directories.len() >= REMOVAL_RECOVERY_MAX_ENTRIES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "too many model removal recovery directories",
+                        ));
+                    }
+                    staging_directories.push(PathBuf::from(name));
+                }
+                Ok(())
+            })
             .map_err(|source| ModelAssetError::Storage {
                 path: storage.root.clone(),
                 source,
-            })?
-            .into_iter()
-            .filter_map(|name| {
-                name.to_str()
-                    .filter(|name| name.starts_with(REMOVAL_STAGING_PREFIX))
-                    .map(PathBuf::from)
-            })
-            .collect::<Vec<_>>();
+            })?;
         staging_directories.sort();
         for staging_directory in staging_directories {
             Self::recover_staged_removal(storage, &staging_directory)?;
@@ -1284,8 +1369,64 @@ impl ModelAssetManager {
         storage: &SafeStorage,
         manifest: &AssetManifest,
     ) -> Result<(), ModelAssetError> {
+        Self::remove_crash_left_publications(
+            storage,
+            Path::new(OWNERSHIP_FILE),
+            OWNERSHIP_METADATA_MAX_BYTES,
+        )?;
         for file in &manifest.files {
+            let partial = partial_path(Path::new(&file.install_path));
+            Self::remove_crash_left_publications(
+                storage,
+                &partial_metadata_path(&partial),
+                PARTIAL_METADATA_MAX_BYTES,
+            )?;
             Self::recover_private_write(storage, manifest, file)?;
+        }
+        Ok(())
+    }
+
+    fn remove_crash_left_publications(
+        storage: &SafeStorage,
+        destination: &Path,
+        maximum_bytes: u64,
+    ) -> Result<(), ModelAssetError> {
+        let parent = destination.parent().unwrap_or_else(|| Path::new(""));
+        let destination_name = destination.file_name().ok_or(ModelAssetError::NotOwned)?;
+        let mut candidates = Vec::new();
+        match storage.scan_entry_names(Some(parent), |name| {
+            if is_private_write_name_for(&name, destination_name) {
+                if candidates.len() >= REMOVAL_RECOVERY_MAX_ENTRIES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "too many private model metadata publications",
+                    ));
+                }
+                candidates.push(name);
+            }
+            Ok(())
+        }) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(ModelAssetError::Storage {
+                    path: storage.absolute(parent),
+                    source,
+                });
+            }
+        }
+        for name in candidates {
+            let path = parent.join(name);
+            let identity = storage
+                .identity(&path)
+                .map_err(|_| ModelAssetError::NotOwned)?
+                .ok_or(ModelAssetError::NotOwned)?;
+            if identity.links != 1 || identity.size > maximum_bytes {
+                return Err(ModelAssetError::NotOwned);
+            }
+            storage
+                .remove_file_durable(&path)
+                .map_err(|_| ModelAssetError::NotOwned)?;
         }
         Ok(())
     }
@@ -1298,8 +1439,31 @@ impl ModelAssetManager {
         let partial = partial_path(Path::new(&file.install_path));
         let recovery = private_write_recovery_path(&partial);
         let parent = partial.parent().unwrap_or_else(|| Path::new(""));
-        let entries = match storage.entry_names(Some(parent)) {
-            Ok(entries) => entries,
+        let mut candidates = Vec::new();
+        let mut recovery_candidates = Vec::new();
+        let partial_name = partial.file_name().expect("manifest partial file name");
+        let recovery_name = recovery.file_name().expect("recovery file name");
+        let scan_result = storage.scan_entry_names(Some(parent), |name| {
+            let selected = if is_private_write_name_for(&name, partial_name) {
+                Some(&mut candidates)
+            } else if is_private_write_name_for(&name, recovery_name) {
+                Some(&mut recovery_candidates)
+            } else {
+                None
+            };
+            if let Some(selected) = selected {
+                if selected.len() >= REMOVAL_RECOVERY_MAX_ENTRIES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "too many private model download files",
+                    ));
+                }
+                selected.push(name);
+            }
+            Ok(())
+        });
+        match scan_result {
+            Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(source) => {
                 return Err(ModelAssetError::Storage {
@@ -1307,19 +1471,9 @@ impl ModelAssetManager {
                     source,
                 });
             }
-        };
-        let partial_name = partial.file_name().expect("manifest partial file name");
-        let recovery_name = recovery.file_name().expect("recovery file name");
-        let mut candidates = entries
-            .iter()
-            .filter(|name| is_private_write_name_for(name, partial_name))
-            .cloned()
-            .collect::<Vec<_>>();
+        }
         candidates.sort();
-        for name in entries
-            .iter()
-            .filter(|name| is_private_write_name_for(name, recovery_name))
-        {
+        for name in recovery_candidates {
             let path = parent.join(name);
             let identity = storage
                 .identity(&path)
@@ -1474,15 +1628,18 @@ impl ModelAssetManager {
                 OsString::from(format!("{REMOVAL_RECOVERY_FILE}.tmp")),
             ])
             .collect::<HashSet<_>>();
-        if storage
-            .entry_names(Some(staging_directory))
+        let mut unexpected_name = false;
+        storage
+            .scan_entry_names(Some(staging_directory), |name| {
+                unexpected_name |=
+                    !allowed_names.contains(&name) && !is_recovery_private_write_name(&name);
+                Ok(())
+            })
             .map_err(|source| ModelAssetError::Storage {
                 path: storage.absolute(staging_directory),
                 source,
-            })?
-            .iter()
-            .any(|name| !allowed_names.contains(name) && !is_recovery_private_write_name(name))
-        {
+            })?;
+        if unexpected_name {
             return Err(ModelAssetError::NotOwned);
         }
 
@@ -1526,6 +1683,9 @@ impl ModelAssetManager {
                 }
             }
         }
+        storage
+            .complete_recovery_mutations(&recovery_path)
+            .map_err(|_| ModelAssetError::NotOwned)?;
         Self::remove_recovery_metadata(storage, staging_directory)?;
         storage
             .remove_dir_durable(staging_directory)
@@ -1536,8 +1696,14 @@ impl ModelAssetManager {
         storage: &SafeStorage,
         staging_directory: &Path,
     ) -> Result<(), ModelAssetError> {
-        let entries = storage
-            .entry_names(Some(staging_directory))
+        let mut entries = Vec::with_capacity(2);
+        storage
+            .scan_entry_names(Some(staging_directory), |name| {
+                if entries.len() < 2 {
+                    entries.push(name);
+                }
+                Ok(())
+            })
             .map_err(|_| ModelAssetError::NotOwned)?;
         if entries.is_empty() {
             return storage
@@ -1571,14 +1737,25 @@ impl ModelAssetManager {
         storage: &SafeStorage,
         staging_directory: &Path,
     ) -> Result<(), ModelAssetError> {
-        let names = storage
-            .entry_names(Some(staging_directory))
+        let mut names = Vec::new();
+        storage
+            .scan_entry_names(Some(staging_directory), |name| {
+                if name == REMOVAL_RECOVERY_FILE
+                    || name == OsString::from(format!("{REMOVAL_RECOVERY_FILE}.tmp"))
+                    || is_recovery_private_write_name(&name)
+                {
+                    if names.len() >= REMOVAL_RECOVERY_MAX_ENTRIES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "too many private removal recovery files",
+                        ));
+                    }
+                    names.push(name);
+                }
+                Ok(())
+            })
             .map_err(|_| ModelAssetError::NotOwned)?;
-        for name in names.into_iter().filter(|name| {
-            name == REMOVAL_RECOVERY_FILE
-                || *name == OsString::from(format!("{REMOVAL_RECOVERY_FILE}.tmp"))
-                || is_recovery_private_write_name(name)
-        }) {
+        for name in names {
             let path = staging_directory.join(name);
             let Some(identity) = storage
                 .identity(&path)
@@ -1596,7 +1773,7 @@ impl ModelAssetManager {
         Ok(())
     }
 
-    fn start_background_validation(&self, plan: ValidationPlan) {
+    fn start_background_validation(&self) {
         let operation_id = self.0.next_operation_id.fetch_add(1, Ordering::Relaxed);
         let cancellation = CancellationToken::new();
         *self.0.active.lock().expect("model asset operation lock") = Some(ActiveOperation {
@@ -1610,7 +1787,7 @@ impl ModelAssetManager {
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
             let result = manager
-                .validate_existing_install(operation_id, cancellation, plan)
+                .validate_existing_install(operation_id, cancellation)
                 .await;
             manager.finish_operation(operation_id, result);
         });
@@ -1641,6 +1818,7 @@ impl ModelAssetManager {
         if let Some(error) = &self.0.initialization_error {
             return Err(ModelAssetError::Unavailable(error.clone()));
         }
+        self.reconcile_recovery_required()?;
         let mut active = self.0.active.lock().expect("model asset operation lock");
         if let Some(active) = active.as_ref() {
             return if active.kind == OperationKind::Download {
@@ -1738,6 +1916,7 @@ impl ModelAssetManager {
     }
 
     fn begin_removal(&self) -> Result<(u64, CancellationToken), ModelAssetError> {
+        self.reconcile_recovery_required()?;
         let mut active = self.0.active.lock().expect("model asset operation lock");
         if active.is_some() {
             return Err(ModelAssetError::OperationInProgress);
@@ -1759,6 +1938,88 @@ impl ModelAssetManager {
         status.message = Some("Verifying and removing Più-owned model assets.".into());
         self.publish(status);
         Ok((operation_id, cancellation))
+    }
+
+    fn reconcile_recovery_required(&self) -> Result<(), ModelAssetError> {
+        if !self.0.recovery_required.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Err(error) = Self::recover_staged_removals(self.storage())
+            .and_then(|()| Self::recover_private_writes(self.storage(), &self.0.manifest))
+        {
+            return Err(ModelAssetError::RecoveryRequired(error.to_string()));
+        }
+        let free = self.0.disk_space.available(&self.0.root)?;
+        let has_credentials = self.0.credentials.get()?.is_some();
+        let inspection =
+            Self::inspect_install(self.storage(), &self.0.manifest, free, has_credentials)?;
+        self.0.recovery_required.store(false, Ordering::Release);
+        *self.0.active.lock().expect("model asset operation lock") = None;
+        self.publish(inspection.status);
+        if inspection.requires_validation {
+            self.start_background_validation();
+        }
+        Ok(())
+    }
+
+    fn require_recovery(
+        &self,
+        operation: &ModelAssetError,
+        recovery: &ModelAssetError,
+    ) -> ModelAssetError {
+        self.0.recovery_required.store(true, Ordering::Release);
+        ModelAssetError::RecoveryRequired(format!(
+            "{operation}; rollback or reconciliation failed: {recovery}"
+        ))
+    }
+
+    fn rollback_or_require_recovery(
+        &self,
+        staging_root: &Path,
+        staged: &[StagedRemoval],
+        operation: ModelAssetError,
+    ) -> ModelAssetError {
+        match self.rollback_staged(staging_root, staged) {
+            Ok(()) => operation,
+            Err(recovery) => self.require_recovery(&operation, &recovery),
+        }
+    }
+
+    fn rollback_after_possible_stage(
+        &self,
+        staging_root: &Path,
+        staged: &mut Vec<StagedRemoval>,
+        original: &Path,
+        staged_path: &Path,
+        expected_size: u64,
+        operation: ModelAssetError,
+    ) -> ModelAssetError {
+        let original_exists = self.storage().metadata(original).ok().flatten().is_some();
+        let staged_identity = self.storage().identity(staged_path).ok().flatten();
+        match (original_exists, staged_identity) {
+            (true, None) => {}
+            (false, Some(identity)) if identity.links == 1 && identity.size == expected_size => {
+                if !staged.iter().any(|entry| entry.staged == staged_path) {
+                    staged.push(StagedRemoval {
+                        original: original.to_path_buf(),
+                        staged: staged_path.to_path_buf(),
+                        identity,
+                    });
+                }
+            }
+            _ => {
+                self.0.recovery_required.store(true, Ordering::Release);
+                return ModelAssetError::RecoveryRequired(format!(
+                    "{operation}; the staged namespace could not be reconciled"
+                ));
+            }
+        }
+        self.rollback_or_require_recovery(staging_root, staged, operation)
+    }
+
+    fn mark_recovery_required(&self, operation: ModelAssetError) -> ModelAssetError {
+        self.0.recovery_required.store(true, Ordering::Release);
+        ModelAssetError::RecoveryRequired(operation.to_string())
     }
 
     async fn perform_owned_removal(
@@ -1836,23 +2097,25 @@ impl ModelAssetManager {
             )
             .await
         {
-            let _ = Self::remove_abandoned_empty_staging(self.storage(), &staging_root);
-            return Err(error);
+            return match Self::remove_abandoned_empty_staging(self.storage(), &staging_root) {
+                Ok(()) => Err(error),
+                Err(recovery) => Err(self.require_recovery(&error, &recovery)),
+            };
         }
-        self.removal_persistence()
-            .commit_journal(
-                self.storage(),
-                &staging_root.join(REMOVAL_RECOVERY_FILE),
-                RemovalRecoveryPhase::Staging,
-            )
-            .map_err(|source| {
-                self.relative_storage_error(&staging_root.join(REMOVAL_RECOVERY_FILE), source)
-            })?;
+        if let Err(source) = self.removal_persistence().commit_journal(
+            self.storage(),
+            &staging_root.join(REMOVAL_RECOVERY_FILE),
+            RemovalRecoveryPhase::Staging,
+        ) {
+            let error =
+                self.relative_storage_error(&staging_root.join(REMOVAL_RECOVERY_FILE), source);
+            return Err(self.rollback_or_require_recovery(&staging_root, &[], error));
+        }
         let mut staged = Vec::with_capacity(marker.files.len() + 1);
         for (index, file) in marker.files.iter().enumerate() {
-            ensure_not_cancelled(cancellation).inspect_err(|_| {
-                let _ = self.rollback_staged(&staging_root, &staged);
-            })?;
+            if let Err(error) = ensure_not_cancelled(cancellation) {
+                return Err(self.rollback_or_require_recovery(&staging_root, &staged, error));
+            }
             let relative = Path::new(&file.install_path);
             let Some(metadata) = self
                 .storage()
@@ -1865,73 +2128,112 @@ impl ModelAssetManager {
                 || !metadata.is_file()
                 || metadata.len() != file.size_bytes
             {
-                self.rollback_staged(&staging_root, &staged)?;
-                return Err(ModelAssetError::NotOwned);
+                return Err(self.rollback_or_require_recovery(
+                    &staging_root,
+                    &staged,
+                    ModelAssetError::NotOwned,
+                ));
             }
             let staged_path = staging_root.join(format!("asset-{index}"));
             if let Err(source) =
                 self.removal_persistence()
                     .stage(self.storage(), relative, &staged_path)
             {
-                self.rollback_staged(&staging_root, &staged)?;
-                return Err(self.relative_storage_error(relative, source));
+                let error = self.relative_storage_error(relative, source);
+                return Err(self.rollback_after_possible_stage(
+                    &staging_root,
+                    &mut staged,
+                    relative,
+                    &staged_path,
+                    file.size_bytes,
+                    error,
+                ));
             }
-            let (hash, identity) = self
+            let hash_result = self
                 .sha256_relative_with_identity(&staged_path, cancellation)
                 .await
                 .map_err(|error| match error {
                     ModelAssetError::Cancelled => ModelAssetError::Cancelled,
                     _ => ModelAssetError::NotOwned,
-                })
-                .or_else(|error| {
-                    self.restore_staged_path(relative, &staged_path)?;
-                    self.rollback_staged(&staging_root, &staged)?;
-                    Err(error)
-                })?;
+                });
+            let (hash, identity) = match hash_result {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(self.rollback_after_possible_stage(
+                        &staging_root,
+                        &mut staged,
+                        relative,
+                        &staged_path,
+                        file.size_bytes,
+                        error,
+                    ));
+                }
+            };
             staged.push(StagedRemoval {
                 original: relative.to_path_buf(),
                 staged: staged_path,
                 identity,
             });
             if hash != file.sha256 || identity.size != file.size_bytes {
-                self.rollback_staged(&staging_root, &staged)?;
-                return Err(ModelAssetError::NotOwned);
+                return Err(self.rollback_or_require_recovery(
+                    &staging_root,
+                    &staged,
+                    ModelAssetError::NotOwned,
+                ));
             }
             after_verified(relative);
         }
 
-        ensure_not_cancelled(cancellation).inspect_err(|_| {
-            let _ = self.rollback_staged(&staging_root, &staged);
-        })?;
+        if let Err(error) = ensure_not_cancelled(cancellation) {
+            return Err(self.rollback_or_require_recovery(&staging_root, &staged, error));
+        }
         let staged_marker = staging_root.join("ownership-marker");
         if let Err(source) =
             self.removal_persistence()
                 .stage(self.storage(), marker_path, &staged_marker)
         {
-            self.rollback_staged(&staging_root, &staged)?;
-            return Err(self.relative_storage_error(marker_path, source));
+            let error = self.relative_storage_error(marker_path, source);
+            return Err(self.rollback_after_possible_stage(
+                &staging_root,
+                &mut staged,
+                marker_path,
+                &staged_marker,
+                marker_bytes.len() as u64,
+                error,
+            ));
         }
-        let (staged_marker_bytes, marker_identity) = self
+        let marker_result = self
             .storage()
             .read_bounded_with_identity(&staged_marker, OWNERSHIP_METADATA_MAX_BYTES)
-            .map_err(|_| ModelAssetError::NotOwned)
-            .or_else(|error| {
-                self.restore_staged_path(marker_path, &staged_marker)?;
-                self.rollback_staged(&staging_root, &staged)?;
-                Err(error)
-            })?;
+            .map_err(|_| ModelAssetError::NotOwned);
+        let (staged_marker_bytes, marker_identity) = match marker_result {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.rollback_after_possible_stage(
+                    &staging_root,
+                    &mut staged,
+                    marker_path,
+                    &staged_marker,
+                    marker_bytes.len() as u64,
+                    error,
+                ));
+            }
+        };
         staged.push(StagedRemoval {
             original: marker_path.to_path_buf(),
             staged: staged_marker,
             identity: marker_identity,
         });
         if staged_marker_bytes != marker_bytes || self.staged_identities_match(&staged).is_err() {
-            self.rollback_staged(&staging_root, &staged)?;
-            return Err(ModelAssetError::NotOwned);
+            return Err(self.rollback_or_require_recovery(
+                &staging_root,
+                &staged,
+                ModelAssetError::NotOwned,
+            ));
         }
-        ensure_not_cancelled(cancellation).inspect_err(|_| {
-            let _ = self.rollback_staged(&staging_root, &staged);
-        })?;
+        if let Err(error) = ensure_not_cancelled(cancellation) {
+            return Err(self.rollback_or_require_recovery(&staging_root, &staged, error));
+        }
         recovery_plan.phase = RemovalRecoveryPhase::Deleting;
         for entry in &mut recovery_plan.entries {
             entry.identity = staged
@@ -1939,8 +2241,11 @@ impl ModelAssetManager {
                 .find(|staged| staged.staged == entry.staged)
                 .map(|staged| staged.identity);
             if entry.identity.is_none() {
-                self.rollback_staged(&staging_root, &staged)?;
-                return Err(ModelAssetError::NotOwned);
+                return Err(self.rollback_or_require_recovery(
+                    &staging_root,
+                    &staged,
+                    ModelAssetError::NotOwned,
+                ));
             }
         }
         if let Err(error) = self
@@ -1951,36 +2256,50 @@ impl ModelAssetManager {
             )
             .await
         {
-            self.rollback_staged(&staging_root, &staged)?;
-            return Err(error);
+            return Err(self.rollback_or_require_recovery(&staging_root, &staged, error));
         }
-        self.removal_persistence()
-            .commit_journal(
-                self.storage(),
-                &staging_root.join(REMOVAL_RECOVERY_FILE),
-                RemovalRecoveryPhase::Deleting,
-            )
-            .map_err(|source| {
-                self.relative_storage_error(&staging_root.join(REMOVAL_RECOVERY_FILE), source)
-            })?;
+        if let Err(source) = self.removal_persistence().commit_journal(
+            self.storage(),
+            &staging_root.join(REMOVAL_RECOVERY_FILE),
+            RemovalRecoveryPhase::Deleting,
+        ) {
+            let error =
+                self.relative_storage_error(&staging_root.join(REMOVAL_RECOVERY_FILE), source);
+            return Err(self.rollback_or_require_recovery(&staging_root, &staged, error));
+        }
         for entry in &staged {
-            if self
-                .storage()
-                .identity(&entry.staged)
-                .map_err(|_| ModelAssetError::NotOwned)?
-                != Some(entry.identity)
-            {
-                self.rollback_staged(&staging_root, &staged)?;
-                return Err(ModelAssetError::NotOwned);
+            let identity = match self.storage().identity(&entry.staged) {
+                Ok(identity) => identity,
+                Err(_) => return Err(self.mark_recovery_required(ModelAssetError::NotOwned)),
+            };
+            if identity != Some(entry.identity) {
+                return Err(self.mark_recovery_required(ModelAssetError::NotOwned));
             }
-            self.removal_persistence()
+            if let Err(source) = self
+                .removal_persistence()
                 .delete(self.storage(), &entry.staged)
-                .map_err(|source| self.relative_storage_error(&entry.staged, source))?;
+            {
+                return Err(
+                    self.mark_recovery_required(self.relative_storage_error(&entry.staged, source))
+                );
+            }
         }
-        Self::remove_recovery_metadata(self.storage(), &staging_root)?;
-        self.storage()
-            .remove_dir_durable(&staging_root)
-            .map_err(|source| self.relative_storage_error(&staging_root, source))?;
+        if let Err(source) = self
+            .removal_persistence()
+            .complete_mutations(self.storage(), &staging_root.join(REMOVAL_RECOVERY_FILE))
+        {
+            return Err(self.mark_recovery_required(
+                self.relative_storage_error(&staging_root.join(REMOVAL_RECOVERY_FILE), source),
+            ));
+        }
+        if let Err(error) = Self::remove_recovery_metadata(self.storage(), &staging_root) {
+            return Err(self.mark_recovery_required(error));
+        }
+        if let Err(source) = self.storage().remove_dir_durable(&staging_root) {
+            return Err(
+                self.mark_recovery_required(self.relative_storage_error(&staging_root, source))
+            );
+        }
         self.0
             .invalid_finals
             .lock()
@@ -2042,6 +2361,14 @@ impl ModelAssetManager {
         for entry in staged.iter().rev() {
             if self
                 .storage()
+                .identity(&entry.staged)
+                .map_err(|_| ModelAssetError::NotOwned)?
+                != Some(entry.identity)
+            {
+                return Err(ModelAssetError::NotOwned);
+            }
+            if self
+                .storage()
                 .metadata(&entry.original)
                 .map_err(|_| ModelAssetError::NotOwned)?
                 .is_some()
@@ -2052,23 +2379,12 @@ impl ModelAssetManager {
                 .rename_durable(&entry.staged, &entry.original)
                 .map_err(|_| ModelAssetError::NotOwned)?;
         }
+        self.storage()
+            .complete_recovery_mutations(&staging_root.join(REMOVAL_RECOVERY_FILE))
+            .map_err(|_| ModelAssetError::NotOwned)?;
         Self::remove_recovery_metadata(self.storage(), staging_root)?;
         self.storage()
             .remove_dir_durable(staging_root)
-            .map_err(|_| ModelAssetError::NotOwned)
-    }
-
-    fn restore_staged_path(&self, original: &Path, staged: &Path) -> Result<(), ModelAssetError> {
-        if self
-            .storage()
-            .metadata(original)
-            .map_err(|_| ModelAssetError::NotOwned)?
-            .is_some()
-        {
-            return Err(ModelAssetError::NotOwned);
-        }
-        self.storage()
-            .rename_durable(staged, original)
             .map_err(|_| ModelAssetError::NotOwned)
     }
 
@@ -2141,7 +2457,6 @@ impl ModelAssetManager {
         &self,
         operation_id: u64,
         cancellation: CancellationToken,
-        plan: ValidationPlan,
     ) -> Result<(), ModelAssetError> {
         for file in &self.0.manifest.files {
             ensure_not_cancelled(&cancellation)?;
@@ -2172,9 +2487,6 @@ impl ModelAssetManager {
             }
         }
         ensure_not_cancelled(&cancellation)?;
-        if plan.migrate_legacy_marker {
-            self.write_ownership_marker(&cancellation).await?;
-        }
         self.publish_ready(operation_id, &cancellation)
     }
 
@@ -2315,7 +2627,7 @@ impl ModelAssetManager {
 
         let mut output = self
             .storage()
-            .create_private_write(&partial, false)
+            .create_private_write(&partial)
             .map_err(|source| self.relative_storage_error(&partial, source))?;
         let private_recovery_path = private_write_recovery_path(&partial);
         let private_recovery = PrivateWriteRecovery {
@@ -2324,8 +2636,16 @@ impl ModelAssetManager {
             temporary_path: output.temporary_path().to_path_buf(),
             partial: PartialMetadata::from_manifest(&self.0.manifest, manifest_file),
         };
-        self.write_json_atomic(&private_recovery_path, &private_recovery, cancellation)
-            .await?;
+        if let Err(error) = self
+            .write_json_atomic(&private_recovery_path, &private_recovery, cancellation)
+            .await
+        {
+            output
+                .discard()
+                .await
+                .map_err(|source| self.relative_storage_error(&partial, source))?;
+            return Err(error);
+        }
         if offset > 0 {
             let expected_identity = self
                 .storage()
@@ -2341,54 +2661,69 @@ impl ModelAssetManager {
                         ),
                     )
                 })?;
-            output
-                .adopt_existing(expected_identity)
-                .map_err(|source| self.relative_storage_error(&partial, source))?;
-        } else {
-            output.enable_publish_on_drop();
+            if let Err(source) = output.adopt_existing(expected_identity) {
+                output
+                    .discard()
+                    .await
+                    .map_err(|source| self.relative_storage_error(&partial, source))?;
+                self.remove_if_present_durable(&private_recovery_path)?;
+                return Err(self.relative_storage_error(&partial, source));
+            }
         }
         let mut stream = response.bytes_stream();
         let mut file_bytes = offset;
         let mut progress = TransferProgress::new(self.transferred_bytes(), offset);
-        loop {
-            let chunk = tokio::select! {
-                _ = cancellation.cancelled() => return Err(ModelAssetError::Cancelled),
-                result = tokio::time::timeout(self.0.network_timeouts.read, stream.next()) => {
-                    result.map_err(|_| ModelAssetError::NetworkTimeout("response data"))?
+        let transfer_result = async {
+            loop {
+                let chunk = tokio::select! {
+                    _ = cancellation.cancelled() => return Err(ModelAssetError::Cancelled),
+                    result = tokio::time::timeout(self.0.network_timeouts.read, stream.next()) => {
+                        result.map_err(|_| ModelAssetError::NetworkTimeout("response data"))?
+                    }
+                };
+                let Some(chunk) = chunk else { break };
+                let chunk = chunk?;
+                let chunk_bytes = chunk.len() as u64;
+                let actual = file_bytes.saturating_add(chunk_bytes);
+                if chunk_bytes > manifest_file.size_bytes.saturating_sub(file_bytes) {
+                    return Err(ModelAssetError::SizeMismatch {
+                        path: manifest_file.source_path.clone(),
+                        actual,
+                        expected: manifest_file.size_bytes,
+                    });
                 }
-            };
-            let Some(chunk) = chunk else { break };
-            let chunk = chunk?;
-            let chunk_bytes = chunk.len() as u64;
-            let actual = file_bytes.saturating_add(chunk_bytes);
-            if chunk_bytes > manifest_file.size_bytes.saturating_sub(file_bytes) {
+                output
+                    .write_all(&chunk)
+                    .await
+                    .map_err(|source| self.relative_storage_error(&partial, source))?;
+                file_bytes = actual;
+                if let Some(total) = progress.observe(file_bytes, manifest_file.size_bytes) {
+                    self.publish_progress(manifest_file, operation_id, total);
+                }
+            }
+            if file_bytes != manifest_file.size_bytes {
                 return Err(ModelAssetError::SizeMismatch {
                     path: manifest_file.source_path.clone(),
-                    actual,
+                    actual: file_bytes,
                     expected: manifest_file.size_bytes,
                 });
             }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = transfer_result {
             output
-                .write_all(&chunk)
+                .publish()
                 .await
                 .map_err(|source| self.relative_storage_error(&partial, source))?;
-            file_bytes = actual;
-            if let Some(total) = progress.observe(file_bytes, manifest_file.size_bytes) {
-                self.publish_progress(manifest_file, operation_id, total);
-            }
-        }
-        if file_bytes != manifest_file.size_bytes {
-            return Err(ModelAssetError::SizeMismatch {
-                path: manifest_file.source_path.clone(),
-                actual: file_bytes,
-                expected: manifest_file.size_bytes,
-            });
+            self.remove_if_present_durable(&private_recovery_path)?;
+            return Err(error);
         }
         output
             .publish()
             .await
             .map_err(|source| self.relative_storage_error(&partial, source))?;
-        self.remove_if_present(&private_recovery_path)?;
+        self.remove_if_present_durable(&private_recovery_path)?;
         let mut status = self.status();
         status.phase = ModelAssetPhase::Verifying;
         status.current_asset = Some(manifest_file.asset);
@@ -2466,13 +2801,18 @@ impl ModelAssetManager {
     }
 
     fn publish_operation_failure(&self, operation_id: u64, error: &ModelAssetError) {
+        let recovery_required = self.0.recovery_required.load(Ordering::Acquire);
         let mut active = self.0.active.lock().expect("model asset operation lock");
-        if active.as_ref().map(|active| active.operation_id) == Some(operation_id) {
+        if !recovery_required
+            && active.as_ref().map(|active| active.operation_id) == Some(operation_id)
+        {
             *active = None;
         }
         drop(active);
         let mut status = self.status();
-        status.operation_id = None;
+        if !recovery_required {
+            status.operation_id = None;
+        }
         status.current_asset = None;
         status.current_file = None;
         status.transferred_bytes = self.transferred_bytes();
@@ -2602,10 +2942,9 @@ impl ModelAssetManager {
                 status.error_code = Some(ModelAssetErrorCode::RevisionMismatch);
                 return Ok(InstallInspection {
                     status,
-                    validation: None,
+                    requires_validation: false,
                 });
             }
-            let marker_is_legacy = marker.schema_version == 0 && marker.matches_payload(manifest);
             let marker_is_current = marker.matches(manifest);
             let all_files_have_pinned_size = manifest.files.iter().all(|file| {
                 storage
@@ -2619,7 +2958,7 @@ impl ModelAssetManager {
                     })
                     .unwrap_or(false)
             });
-            if (marker_is_legacy || marker_is_current) && all_files_have_pinned_size {
+            if marker_is_current && all_files_have_pinned_size {
                 // Size is only a cheap candidate check. The model remains unavailable
                 // until cancellation-aware background SHA-256 validation completes.
                 status.phase = ModelAssetPhase::Verifying;
@@ -2629,9 +2968,7 @@ impl ModelAssetManager {
                 status.message = Some("Verifying installed model assets before use.".into());
                 return Ok(InstallInspection {
                     status,
-                    validation: Some(ValidationPlan {
-                        migrate_legacy_marker: marker_is_legacy,
-                    }),
+                    requires_validation: true,
                 });
             }
         }
@@ -2658,7 +2995,7 @@ impl ModelAssetManager {
         status.can_resume = status.transferred_bytes > 0;
         Ok(InstallInspection {
             status,
-            validation: None,
+            requires_validation: false,
         })
     }
 
@@ -2710,13 +3047,22 @@ impl ModelAssetManager {
         let bytes = serde_json::to_vec_pretty(value).expect("asset metadata serialization");
         let mut output = self
             .storage()
-            .create_private_write(path, false)
+            .create_private_write(path)
             .map_err(|source| self.relative_storage_error(path, source))?;
-        output
-            .write_all(&bytes)
-            .await
-            .map_err(|source| self.relative_storage_error(path, source))?;
-        ensure_not_cancelled(cancellation)?;
+        if let Err(source) = output.write_all(&bytes).await {
+            output
+                .discard()
+                .await
+                .map_err(|cleanup| self.relative_storage_error(path, cleanup))?;
+            return Err(self.relative_storage_error(path, source));
+        }
+        if let Err(error) = ensure_not_cancelled(cancellation) {
+            output
+                .discard()
+                .await
+                .map_err(|source| self.relative_storage_error(path, source))?;
+            return Err(error);
+        }
         output
             .publish()
             .await
@@ -2845,6 +3191,20 @@ impl ModelAssetManager {
         Ok(())
     }
 
+    fn remove_if_present_durable(&self, path: &Path) -> Result<(), ModelAssetError> {
+        if self
+            .storage()
+            .metadata(path)
+            .map_err(|source| self.relative_storage_error(path, source))?
+            .is_some()
+        {
+            self.storage()
+                .remove_file_durable(path)
+                .map_err(|source| self.relative_storage_error(path, source))?;
+        }
+        Ok(())
+    }
+
     fn clear_invalid_final(&self, install_path: &str) {
         self.0
             .invalid_finals
@@ -2913,11 +3273,8 @@ impl OwnershipMarker {
     }
 
     fn matches(&self, manifest: &AssetManifest) -> bool {
-        self.schema_version == 1 && self.matches_payload(manifest)
-    }
-
-    fn matches_payload(&self, manifest: &AssetManifest) -> bool {
-        self.owner == "ch.emin.piu"
+        self.schema_version == 1
+            && self.owner == "ch.emin.piu"
             && self.manifest_id == manifest.manifest_id
             && self.repository == manifest.repository
             && self.revision == manifest.revision
@@ -2934,7 +3291,7 @@ impl OwnershipMarker {
     }
 
     fn authorizes_removal(&self, manifest: &AssetManifest) -> bool {
-        if !matches!(self.schema_version, 0 | 1)
+        if self.schema_version != 1
             || self.owner != "ch.emin.piu"
             || self.repository != manifest.repository
             || self.revision.len() != 40
@@ -3122,46 +3479,123 @@ mod tests {
     #[derive(Default)]
     struct MemoryCredentials(Mutex<Option<String>>);
 
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    enum PersistenceEvent {
-        JournalCommitted(RemovalRecoveryPhase),
-        AssetStaged(PathBuf),
-        AssetDeleted(PathBuf),
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum CrashMutation {
+        Stage,
+        Delete,
     }
 
-    struct RecordingPersistenceObserver(Arc<Mutex<Vec<PersistenceEvent>>>);
+    struct CrashAfterDurableMutation {
+        mutation: CrashMutation,
+        fired: AtomicBool,
+    }
 
-    impl RemovalPersistence for RecordingPersistenceObserver {
+    impl CrashAfterDurableMutation {
+        fn new(mutation: CrashMutation) -> Self {
+            Self {
+                mutation,
+                fired: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl RemovalPersistence for CrashAfterDurableMutation {
         fn commit_journal(
             &self,
             storage: &SafeStorage,
             path: &Path,
             phase: RemovalRecoveryPhase,
         ) -> io::Result<()> {
-            DurableRemovalPersistence.commit_journal(storage, path, phase)?;
-            self.0
-                .lock()
-                .expect("persistence events")
-                .push(PersistenceEvent::JournalCommitted(phase));
-            Ok(())
+            DurableRemovalPersistence.commit_journal(storage, path, phase)
         }
 
         fn stage(&self, storage: &SafeStorage, from: &Path, to: &Path) -> io::Result<()> {
             DurableRemovalPersistence.stage(storage, from, to)?;
-            self.0
-                .lock()
-                .expect("persistence events")
-                .push(PersistenceEvent::AssetStaged(from.to_path_buf()));
+            if self.mutation == CrashMutation::Stage && !self.fired.swap(true, Ordering::AcqRel) {
+                panic!("simulated process loss after durable stage");
+            }
             Ok(())
         }
 
         fn delete(&self, storage: &SafeStorage, path: &Path) -> io::Result<()> {
             DurableRemovalPersistence.delete(storage, path)?;
-            self.0
-                .lock()
-                .expect("persistence events")
-                .push(PersistenceEvent::AssetDeleted(path.to_path_buf()));
+            if self.mutation == CrashMutation::Delete && !self.fired.swap(true, Ordering::AcqRel) {
+                panic!("simulated process loss after durable delete");
+            }
             Ok(())
+        }
+
+        fn complete_mutations(&self, storage: &SafeStorage, journal: &Path) -> io::Result<()> {
+            DurableRemovalPersistence.complete_mutations(storage, journal)
+        }
+    }
+
+    struct FailingPhaseBarrier {
+        phase: RemovalRecoveryPhase,
+        staged: AtomicU64,
+        deleted: AtomicU64,
+    }
+
+    impl FailingPhaseBarrier {
+        fn new(phase: RemovalRecoveryPhase) -> Self {
+            Self {
+                phase,
+                staged: AtomicU64::new(0),
+                deleted: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl RemovalPersistence for FailingPhaseBarrier {
+        fn commit_journal(
+            &self,
+            storage: &SafeStorage,
+            path: &Path,
+            phase: RemovalRecoveryPhase,
+        ) -> io::Result<()> {
+            if phase == self.phase {
+                return Err(io::Error::other("injected recovery phase barrier failure"));
+            }
+            DurableRemovalPersistence.commit_journal(storage, path, phase)
+        }
+
+        fn stage(&self, storage: &SafeStorage, from: &Path, to: &Path) -> io::Result<()> {
+            self.staged.fetch_add(1, Ordering::AcqRel);
+            DurableRemovalPersistence.stage(storage, from, to)
+        }
+
+        fn delete(&self, storage: &SafeStorage, path: &Path) -> io::Result<()> {
+            self.deleted.fetch_add(1, Ordering::AcqRel);
+            DurableRemovalPersistence.delete(storage, path)
+        }
+
+        fn complete_mutations(&self, storage: &SafeStorage, journal: &Path) -> io::Result<()> {
+            DurableRemovalPersistence.complete_mutations(storage, journal)
+        }
+    }
+
+    struct FailingCompletionSync;
+
+    impl RemovalPersistence for FailingCompletionSync {
+        fn commit_journal(
+            &self,
+            storage: &SafeStorage,
+            path: &Path,
+            phase: RemovalRecoveryPhase,
+        ) -> io::Result<()> {
+            DurableRemovalPersistence.commit_journal(storage, path, phase)
+        }
+
+        fn stage(&self, storage: &SafeStorage, from: &Path, to: &Path) -> io::Result<()> {
+            DurableRemovalPersistence.stage(storage, from, to)
+        }
+
+        fn delete(&self, storage: &SafeStorage, path: &Path) -> io::Result<()> {
+            DurableRemovalPersistence.delete(storage, path)
+        }
+
+        fn complete_mutations(&self, _storage: &SafeStorage, _journal: &Path) -> io::Result<()> {
+            Err(io::Error::other("injected full-sync failure"))
         }
     }
 
@@ -3580,9 +4014,18 @@ mod tests {
         wait_for_private_partial_bytes(&manager).await;
         running.abort();
         assert!(running.await.is_err());
-        let stopped_bytes = fs::metadata(manager.0.root.join(&partial))
-            .expect("stopped partial")
-            .len();
+        assert!(!manager.0.root.join(&partial).exists());
+        let stopped_bytes = fs::read_dir(manager.0.root.join("target"))
+            .expect("target directory")
+            .filter_map(Result::ok)
+            .find_map(|entry| {
+                is_private_write_name_for(
+                    &entry.file_name(),
+                    std::ffi::OsStr::new("model.bin.part"),
+                )
+                .then(|| entry.metadata().expect("private partial metadata").len())
+            })
+            .expect("crash-left private partial");
         assert!(stopped_bytes > 0 && stopped_bytes < bytes.len() as u64);
         drop(manager);
 
@@ -3616,7 +4059,7 @@ mod tests {
             .expect("partial provenance");
         let mut private = manager
             .storage()
-            .create_private_write(&partial, false)
+            .create_private_write(&partial)
             .expect("private download inode");
         let recovery = private_write_recovery_path(&partial);
         manager
@@ -3650,6 +4093,108 @@ mod tests {
         );
         assert!(!relaunched.0.root.join(private_path).exists());
         assert!(!relaunched.0.root.join(recovery).exists());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_private_write_never_publishes_or_removes_its_inode() {
+        let temporary = TempDir::new().expect("private write root");
+        let storage = SafeStorage::open(temporary.path().to_path_buf(), Path::new("models"))
+            .expect("safe storage");
+        let destination = Path::new("metadata.json");
+        let mut private = storage
+            .create_private_write(destination)
+            .expect("private metadata write");
+        private
+            .write_all(b"not yet published")
+            .await
+            .expect("private metadata bytes");
+        let private_path = private.temporary_path().to_path_buf();
+
+        drop(private);
+
+        assert!(!storage.absolute(destination).exists());
+        assert_eq!(
+            fs::read(storage.absolute(&private_path)).expect("retained private inode"),
+            b"not yet published"
+        );
+        storage
+            .remove_file_durable(&private_path)
+            .expect("test cleanup");
+    }
+
+    #[tokio::test]
+    async fn startup_removes_crash_left_marker_and_partial_metadata_publications() {
+        let bytes = b"private metadata recovery fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let credentials = Arc::new(MemoryCredentials::default());
+        let manager = test_manager(&temporary, &fixture, &bytes, credentials.clone(), u64::MAX);
+        let file = manager.0.manifest.files.first().expect("fixture file");
+        let marker = OwnershipMarker::from_manifest(&manager.0.manifest);
+        let partial = partial_path(Path::new(&file.install_path));
+        let partial_metadata = partial_metadata_path(&partial);
+        let metadata = PartialMetadata::from_manifest(&manager.0.manifest, file);
+
+        let mut private_marker = manager
+            .storage()
+            .create_private_write(Path::new(OWNERSHIP_FILE))
+            .expect("private marker");
+        private_marker
+            .write_all(&serde_json::to_vec(&marker).expect("marker JSON"))
+            .await
+            .expect("private marker bytes");
+        let private_marker_path = private_marker.temporary_path().to_path_buf();
+        drop(private_marker);
+        let mut private_metadata = manager
+            .storage()
+            .create_private_write(&partial_metadata)
+            .expect("private partial metadata");
+        private_metadata
+            .write_all(&serde_json::to_vec(&metadata).expect("metadata JSON"))
+            .await
+            .expect("private metadata bytes");
+        let private_metadata_path = private_metadata.temporary_path().to_path_buf();
+        drop(private_metadata);
+        drop(manager);
+
+        let relaunched = test_manager(&temporary, &fixture, &bytes, credentials, u64::MAX);
+
+        assert_eq!(relaunched.status().phase, ModelAssetPhase::Missing);
+        assert!(!relaunched.0.root.join(private_marker_path).exists());
+        assert!(!relaunched.0.root.join(private_metadata_path).exists());
+        assert!(!relaunched.0.root.join(OWNERSHIP_FILE).exists());
+        assert!(!relaunched.0.root.join(partial_metadata).exists());
+    }
+
+    #[tokio::test]
+    async fn startup_stops_scanning_at_the_bounded_namespace_limit() {
+        let bytes = b"bounded namespace fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let root = temporary.path().join("models");
+        fs::create_dir_all(&root).expect("model root");
+        for index in 0..=NAMESPACE_SCAN_MAX_ENTRIES {
+            fs::write(root.join(format!("unknown-{index}")), b"untouched")
+                .expect("adversarial namespace entry");
+        }
+        let manifest = fixture_manifest(&bytes);
+
+        let result = ModelAssetManager::new(
+            temporary.path().to_path_buf(),
+            PathBuf::from("models"),
+            manifest,
+            format!("{}/resolve/revision", fixture.base_url),
+            format!("{}/whoami", fixture.base_url),
+            Arc::new(MemoryCredentials::default()),
+            Arc::new(FixedDisk(AtomicU64::new(u64::MAX))),
+        );
+
+        assert!(matches!(result, Err(ModelAssetError::Storage { .. })));
+        assert_eq!(
+            fs::read(root.join(format!("unknown-{NAMESPACE_SCAN_MAX_ENTRIES}")))
+                .expect("last adversarial entry"),
+            b"untouched"
+        );
     }
 
     #[tokio::test]
@@ -4254,6 +4799,64 @@ mod tests {
         assert!(manager.0.root.join(OWNERSHIP_FILE).exists());
     }
 
+    #[tokio::test]
+    async fn failed_cancellation_rollback_stays_recovery_required_until_reconciled() {
+        let bytes = b"rollback failure fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+        let temporary = TempDir::new().expect("temporary model root");
+        let manager = test_manager(
+            &temporary,
+            &fixture,
+            &bytes,
+            Arc::new(MemoryCredentials::default()),
+            u64::MAX,
+        );
+        manager.start_download().expect("install owned file");
+        wait_for_phase(&manager, ModelAssetPhase::Ready).await;
+        let root = manager.0.root.clone();
+        let cancellation_manager = manager.clone();
+
+        let result = manager
+            .remove_owned_assets_with_hook(move |relative| {
+                fs::write(root.join(relative), b"rollback obstruction")
+                    .expect("create rollback obstruction");
+                assert!(cancellation_manager.cancel_download());
+            })
+            .await;
+
+        assert!(matches!(result, Err(ModelAssetError::RecoveryRequired(_))));
+        let failed = manager.status();
+        assert_eq!(failed.phase, ModelAssetPhase::Failed);
+        assert_eq!(failed.error_code, Some(ModelAssetErrorCode::Storage));
+        assert!(failed.operation_id.is_some());
+        assert!(manager.0.recovery_required.load(Ordering::Acquire));
+        assert!(
+            manager
+                .0
+                .active
+                .lock()
+                .expect("active recovery operation")
+                .is_some()
+        );
+        assert!(matches!(
+            manager.reconcile_recovery_required(),
+            Err(ModelAssetError::RecoveryRequired(_))
+        ));
+        assert!(manager.0.recovery_required.load(Ordering::Acquire));
+
+        fs::remove_file(manager.0.root.join("target/model.bin"))
+            .expect("remove rollback obstruction");
+        manager
+            .reconcile_recovery_required()
+            .expect("reconcile durable staging journal");
+        wait_for_phase(&manager, ModelAssetPhase::Ready).await;
+        assert!(!manager.0.recovery_required.load(Ordering::Acquire));
+        assert_eq!(
+            fs::read(manager.0.root.join("target/model.bin")).expect("restored owned asset"),
+            bytes
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn relaunch_recovers_interrupted_removal_before_and_after_commit() {
@@ -4445,7 +5048,7 @@ mod tests {
             .expect("removal staging");
         let mut journal = manager
             .storage()
-            .create_private_write(&staging.join(REMOVAL_RECOVERY_FILE), false)
+            .create_private_write(&staging.join(REMOVAL_RECOVERY_FILE))
             .expect("private recovery journal");
         journal
             .write_all(b"{\"schemaVersion\":")
@@ -4742,7 +5345,7 @@ mod tests {
         let outside = temporary.path().join("outside");
         fs::write(&outside, b"outside remains unchanged").expect("outside sentinel");
         let mut private = storage
-            .create_private_write(destination, false)
+            .create_private_write(destination)
             .expect("private write");
         let retained = storage.absolute(Path::new("retained-private-write"));
         fs::rename(storage.absolute(private.temporary_path()), &retained)
@@ -4768,8 +5371,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removal_commits_each_recovery_phase_before_its_durable_mutations() {
+    async fn durable_phase_boundaries_recover_semantically_after_abrupt_process_loss() {
         let bytes = b"durable removal fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+
+        for (mutation, expected_phase) in [
+            (CrashMutation::Stage, ModelAssetPhase::Ready),
+            (CrashMutation::Delete, ModelAssetPhase::Missing),
+        ] {
+            let temporary = TempDir::new().expect("temporary model root");
+            let credentials = Arc::new(MemoryCredentials::default());
+            let manager = test_manager(&temporary, &fixture, &bytes, credentials.clone(), u64::MAX);
+            manager.start_download().expect("install fixture");
+            wait_for_phase(&manager, ModelAssetPhase::Ready).await;
+            manager.set_removal_persistence(Arc::new(CrashAfterDurableMutation::new(mutation)));
+
+            let crashing_manager = manager.clone();
+            let crashed =
+                tokio::spawn(async move { crashing_manager.remove_owned_assets().await }).await;
+            assert!(
+                crashed.is_err(),
+                "the injected process loss must abort the operation"
+            );
+            drop(manager);
+
+            let relaunched = test_manager(&temporary, &fixture, &bytes, credentials, u64::MAX);
+            if expected_phase == ModelAssetPhase::Ready {
+                wait_for_phase(&relaunched, expected_phase).await;
+                assert_eq!(
+                    fs::read(relaunched.0.root.join("target/model.bin"))
+                        .expect("recovered staged asset"),
+                    bytes
+                );
+            } else {
+                assert_eq!(relaunched.status().phase, expected_phase);
+                assert!(!relaunched.0.root.join("target/model.bin").exists());
+                assert!(!relaunched.0.root.join(OWNERSHIP_FILE).exists());
+            }
+            assert!(
+                fs::read_dir(&relaunched.0.root)
+                    .expect("model root")
+                    .all(|entry| !entry
+                        .expect("model root entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(REMOVAL_STAGING_PREFIX))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_phase_barriers_prevent_the_destructive_phase_they_guard() {
+        let bytes = b"phase barrier failure fixture".to_vec();
+        let fixture = Fixture::start(bytes.clone()).await;
+
+        for phase in [
+            RemovalRecoveryPhase::Staging,
+            RemovalRecoveryPhase::Deleting,
+        ] {
+            let temporary = TempDir::new().expect("temporary model root");
+            let manager = test_manager(
+                &temporary,
+                &fixture,
+                &bytes,
+                Arc::new(MemoryCredentials::default()),
+                u64::MAX,
+            );
+            manager.start_download().expect("install fixture");
+            wait_for_phase(&manager, ModelAssetPhase::Ready).await;
+            let persistence = Arc::new(FailingPhaseBarrier::new(phase));
+            manager.set_removal_persistence(persistence.clone());
+
+            assert!(matches!(
+                manager.remove_owned_assets().await,
+                Err(ModelAssetError::Storage { .. })
+            ));
+
+            if phase == RemovalRecoveryPhase::Staging {
+                assert_eq!(persistence.staged.load(Ordering::Acquire), 0);
+            } else {
+                assert!(persistence.staged.load(Ordering::Acquire) > 0);
+            }
+            assert_eq!(persistence.deleted.load(Ordering::Acquire), 0);
+            assert_eq!(
+                fs::read(manager.0.root.join("target/model.bin")).expect("restored asset"),
+                bytes
+            );
+            assert!(manager.0.root.join(OWNERSHIP_FILE).exists());
+            assert!(
+                fs::read_dir(&manager.0.root)
+                    .expect("model root")
+                    .all(|entry| !entry
+                        .expect("model root entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(REMOVAL_STAGING_PREFIX))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_completion_full_sync_keeps_the_deleting_journal_for_recovery() {
+        let bytes = b"completion sync failure fixture".to_vec();
         let fixture = Fixture::start(bytes.clone()).await;
         let temporary = TempDir::new().expect("temporary model root");
         let manager = test_manager(
@@ -4781,43 +5484,34 @@ mod tests {
         );
         manager.start_download().expect("install fixture");
         wait_for_phase(&manager, ModelAssetPhase::Ready).await;
-        let events = Arc::new(Mutex::new(Vec::new()));
-        manager.set_removal_persistence(Arc::new(RecordingPersistenceObserver(events.clone())));
+        manager.set_removal_persistence(Arc::new(FailingCompletionSync));
+
+        assert!(matches!(
+            manager.remove_owned_assets().await,
+            Err(ModelAssetError::RecoveryRequired(_))
+        ));
+        let staging = fs::read_dir(&manager.0.root)
+            .expect("model root")
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(REMOVAL_STAGING_PREFIX)
+            })
+            .expect("retained removal recovery directory");
+        assert!(staging.path().join(REMOVAL_RECOVERY_FILE).exists());
+        assert!(!manager.0.root.join("target/model.bin").exists());
+        assert!(!manager.0.root.join(OWNERSHIP_FILE).exists());
+        assert!(manager.0.recovery_required.load(Ordering::Acquire));
 
         manager
-            .remove_owned_assets()
-            .await
-            .expect("durable removal");
+            .reconcile_recovery_required()
+            .expect("full-sync and clear the deleting journal");
 
-        let events = events.lock().expect("recorded persistence events");
-        let staging_commit = events
-            .iter()
-            .position(|event| {
-                *event == PersistenceEvent::JournalCommitted(RemovalRecoveryPhase::Staging)
-            })
-            .expect("staging journal commit");
-        let deleting_commit = events
-            .iter()
-            .position(|event| {
-                *event == PersistenceEvent::JournalCommitted(RemovalRecoveryPhase::Deleting)
-            })
-            .expect("deleting journal commit");
-        let first_stage = events
-            .iter()
-            .position(|event| matches!(event, PersistenceEvent::AssetStaged(_)))
-            .expect("staged asset");
-        let first_delete = events
-            .iter()
-            .position(|event| matches!(event, PersistenceEvent::AssetDeleted(_)))
-            .expect("deleted asset");
-        let last_stage = events
-            .iter()
-            .rposition(|event| matches!(event, PersistenceEvent::AssetStaged(_)))
-            .expect("last staged asset");
-
-        assert!(staging_commit < first_stage);
-        assert!(last_stage < deleting_commit);
-        assert!(deleting_commit < first_delete);
+        assert_eq!(manager.status().phase, ModelAssetPhase::Missing);
+        assert!(!staging.path().exists());
+        assert!(!manager.0.recovery_required.load(Ordering::Acquire));
     }
 
     #[cfg(unix)]
@@ -4958,7 +5652,7 @@ mod tests {
         symlink(&outside, &app_data).expect("replace visible app data path");
         let relative = Path::new("target/probe.bin");
         let mut file = storage
-            .create_private_write(relative, false)
+            .create_private_write(relative)
             .expect("write through retained capability");
         file.write_all(b"capability-bound")
             .await
@@ -4999,40 +5693,7 @@ mod tests {
             .expect("inspect mismatch");
 
         assert_eq!(status.status.phase, ModelAssetPhase::RevisionMismatch);
-        assert!(status.validation.is_none());
-    }
-
-    #[tokio::test]
-    async fn exact_legacy_ownership_marker_migrates_only_after_background_hashing() {
-        let bytes = b"legacy marker fixture".to_vec();
-        let fixture = Fixture::start(bytes.clone()).await;
-        let temporary = TempDir::new().expect("temporary model root");
-        let root = temporary.path().join("models");
-        fs::create_dir_all(root.join("target")).expect("target directory");
-        fs::write(root.join("target/model.bin"), &bytes).expect("model bytes");
-        let manifest = fixture_manifest(&bytes);
-        let mut marker = OwnershipMarker::from_manifest(&manifest);
-        marker.schema_version = 0;
-        fs::write(
-            root.join(OWNERSHIP_FILE),
-            serde_json::to_vec(&marker).expect("marker JSON"),
-        )
-        .expect("legacy marker write");
-
-        let manager = test_manager(
-            &temporary,
-            &fixture,
-            &bytes,
-            Arc::new(MemoryCredentials::default()),
-            u64::MAX,
-        );
-        assert_eq!(manager.status().phase, ModelAssetPhase::Verifying);
-        wait_for_phase(&manager, ModelAssetPhase::Ready).await;
-        let migrated: OwnershipMarker =
-            serde_json::from_slice(&fs::read(root.join(OWNERSHIP_FILE)).expect("migrated marker"))
-                .expect("migrated JSON");
-
-        assert_eq!(migrated.schema_version, 1);
+        assert!(!status.requires_validation);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5101,39 +5762,6 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_millis(250));
         assert!(matches!(result, Err(ModelAssetError::Storage { .. })));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn cancelling_background_hash_never_migrates_marker_or_publishes_ready() {
-        let bytes = vec![7; 16 * 1024 * 1024];
-        let fixture = Fixture::start(bytes.clone()).await;
-        let temporary = TempDir::new().expect("temporary model root");
-        let root = temporary.path().join("models");
-        fs::create_dir_all(root.join("target")).expect("target directory");
-        fs::write(root.join("target/model.bin"), &bytes).expect("model bytes");
-        let manifest = fixture_manifest(&bytes);
-        let mut marker = OwnershipMarker::from_manifest(&manifest);
-        marker.schema_version = 0;
-        fs::write(
-            root.join(OWNERSHIP_FILE),
-            serde_json::to_vec(&marker).expect("legacy marker JSON"),
-        )
-        .expect("legacy marker write");
-        let manager = test_manager(
-            &temporary,
-            &fixture,
-            &bytes,
-            Arc::new(MemoryCredentials::default()),
-            u64::MAX,
-        );
-
-        assert!(manager.cancel_download());
-        wait_for_phase(&manager, ModelAssetPhase::Cancelled).await;
-        let retained: OwnershipMarker =
-            serde_json::from_slice(&fs::read(root.join(OWNERSHIP_FILE)).expect("retained marker"))
-                .expect("retained marker JSON");
-        assert_eq!(retained.schema_version, 0);
-        assert_ne!(manager.status().phase, ModelAssetPhase::Ready);
     }
 
     #[test]
