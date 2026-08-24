@@ -26,11 +26,10 @@ pub struct HostRoundTripResponse {
     pub sent_at_ms: u64,
     #[ts(type = "number")]
     pub received_at_ms: u64,
-    pub schema_version: u32,
 }
 
 #[tauri::command]
-pub fn host_round_trip<R: Runtime>(
+pub async fn host_round_trip<R: Runtime>(
     app: AppHandle<R>,
     core: State<'_, ApplicationCore>,
     request: HostRoundTripRequest,
@@ -41,11 +40,15 @@ pub fn host_round_trip<R: Runtime>(
         .as_millis()
         .try_into()
         .map_err(|_| "system time does not fit in a 64-bit millisecond value")?;
+    let project_inbox = core.project_inbox();
+    tauri::async_runtime::spawn_blocking(move || project_inbox.ensure_storage_ready())
+        .await
+        .map_err(|_| "application storage worker stopped unexpectedly".to_owned())?
+        .map_err(|error| error.to_string())?;
     let response = HostRoundTripResponse {
         correlation_id: request.correlation_id,
         sent_at_ms: request.sent_at_ms,
         received_at_ms,
-        schema_version: core.schema_version().map_err(|error| error.to_string())?,
     };
     app.emit(HOST_ROUND_TRIP_EVENT, &response)
         .map_err(|error| format!("could not emit host round-trip event: {error}"))?;

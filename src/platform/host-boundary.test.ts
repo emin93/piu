@@ -33,7 +33,6 @@ vi.mock("@tauri-apps/api/core", () => ({
       const response: HostRoundTripResponse = {
         ...request,
         receivedAtMs: request.sentAtMs + 3,
-        schemaVersion: 1,
       };
       boundary.handler?.({ payload: response } as Event<HostRoundTripResponse>);
       return Promise.resolve(response);
@@ -49,7 +48,6 @@ beforeEach(() => {
 test("the generated client observes a matching production command and event", async () => {
   const result = await verifyHostBoundary();
 
-  expect(result.schemaVersion).toBe(1);
   expect(result.latencyMs).toBeGreaterThanOrEqual(0);
   expect(boundary.order).toEqual(["listen", "invoke", "unlisten"]);
 });

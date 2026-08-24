@@ -1,103 +1,279 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { useSystemAppearance } from "./hooks/use-system-appearance";
+import { Button } from "@/components/ui/button";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyTitle,
+} from "@/components/ui/empty";
+import { Skeleton } from "@/components/ui/skeleton";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { DeferredSurface, type DeferredSurfaceName } from "./features/deferred/DeferredSurface";
-import { EmptyInbox } from "./features/inbox/EmptyInbox";
+import { ProjectDraftController } from "./features/inbox/draft-controller";
+import { InboxWorkspace } from "./features/inbox/InboxWorkspace";
+import { useSystemAppearance } from "./hooks/use-system-appearance";
 import { verifyHostBoundary } from "./platform/host-boundary";
+import {
+  type InboxSnapshot,
+  listenToProjectInbox,
+  loadProjectInbox,
+  openRepository,
+  projectErrorMessage,
+  removeProject,
+  saveProjectDraft,
+} from "./platform/project-inbox";
 import { selectRepositoryDirectory } from "./platform/repository-picker";
+import { listenToWindowClose } from "./platform/window-lifecycle";
 
 interface AppProps {
   onOpenRepository?: () => void;
   surface?: "inbox" | DeferredSurfaceName;
+  visualReviewStartup?: "loading";
 }
+
+const EMPTY_INBOX: InboxSnapshot = { projects: [], drafts: [], chats: [] };
 
 function StartupFailure({ onRetry }: { onRetry: () => void }) {
   return (
-    <section className="startup-failure" aria-labelledby="startup-failure-title">
-      <p className="startup-failure__eyebrow">Application unavailable</p>
-      <h2 id="startup-failure-title">Più couldn't start</h2>
-      <p>Something interrupted startup. Retry to continue without changing your work.</p>
-      <button className="primary-action" type="button" onClick={onRetry}>
-        Retry
-      </button>
+    <Empty aria-labelledby="startup-failure-title" className="startup-state">
+      <EmptyHeader>
+        <EmptyTitle id="startup-failure-title">Più couldn&apos;t start</EmptyTitle>
+        <EmptyDescription>
+          Something interrupted startup. Retry to continue without changing your work.
+        </EmptyDescription>
+      </EmptyHeader>
+      <EmptyContent>
+        <Button onClick={onRetry} type="button">
+          Retry
+        </Button>
+      </EmptyContent>
+    </Empty>
+  );
+}
+
+function StartupLoading() {
+  return (
+    <section className="startup-loading" aria-live="polite" role="status">
+      <div className="startup-loading-copy">
+        <Skeleton className="h-3 w-20" />
+        <Skeleton className="h-5 w-32" />
+      </div>
+      <span className="sr-only">Opening your inbox</span>
     </section>
   );
 }
 
-export function App({ onOpenRepository, surface = "inbox" }: AppProps) {
+export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }: AppProps) {
   useSystemAppearance();
   const [hostStatus, setHostStatus] = useState<"checking" | "ready" | "failed">("checking");
+  const [snapshot, setSnapshot] = useState<InboxSnapshot>(EMPTY_INBOX);
+  const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
+  const [query, setQuery] = useState("");
   const [repositoryActionError, setRepositoryActionError] = useState<string>();
   const verificationGeneration = useRef(0);
-
-  const completeHostVerification = useCallback((generation: number) => {
-    void verifyHostBoundary().then(
-      () => {
-        if (verificationGeneration.current === generation) setHostStatus("ready");
+  const [drafts] = useState(() => {
+    const controller = new ProjectDraftController(
+      async (projectId, prompt) => {
+        await saveProjectDraft(projectId, prompt);
+        setSnapshot((current) => controller.overlay(current));
       },
-      () => {
-        if (verificationGeneration.current === generation) setHostStatus("failed");
+      {
+        toFailureMessage: (error) =>
+          projectErrorMessage(error, "Couldn't save this draft. Keep Più open and try again."),
       },
     );
-  }, []);
+    return controller;
+  });
 
-  const retryHostVerification = useCallback(() => {
+  const completeStartup = useCallback(
+    (generation: number) => {
+      void Promise.all([verifyHostBoundary(), loadProjectInbox()]).then(
+        ([, loadedSnapshot]) => {
+          if (verificationGeneration.current !== generation) return;
+          drafts.reconcile(loadedSnapshot);
+          setSnapshot(drafts.overlay(loadedSnapshot));
+          setHostStatus("ready");
+        },
+        () => {
+          if (verificationGeneration.current === generation) setHostStatus("failed");
+        },
+      );
+    },
+    [drafts],
+  );
+
+  const retryStartup = useCallback(() => {
     const generation = ++verificationGeneration.current;
     setHostStatus("checking");
-    completeHostVerification(generation);
-  }, [completeHostVerification]);
+    completeStartup(generation);
+  }, [completeStartup]);
 
-  const openRepository = useCallback(() => {
+  const flushAllDrafts = useCallback(() => drafts.flushAll(), [drafts]);
+
+  const openSelectedRepository = useCallback(() => {
+    void flushAllDrafts().catch(() => undefined);
     setRepositoryActionError(undefined);
     if (onOpenRepository) {
       onOpenRepository();
       return;
     }
-    void selectRepositoryDirectory().catch(() => {
-      setRepositoryActionError("Couldn't open the repository picker. Try again.");
-    });
-  }, [onOpenRepository]);
+    void (async () => {
+      let path: string | null;
+      try {
+        path = await selectRepositoryDirectory();
+      } catch {
+        setRepositoryActionError("Couldn't open the repository picker. Try again.");
+        return;
+      }
+      if (!path) return;
+      try {
+        const opened = await openRepository(path);
+        drafts.reconcile(opened.snapshot);
+        setSnapshot(drafts.overlay(opened.snapshot));
+        setSelectedProjectId(opened.focusedProjectId);
+        setQuery("");
+      } catch (error: unknown) {
+        setRepositoryActionError(
+          projectErrorMessage(error, "Couldn't open that repository. Try again."),
+        );
+      }
+    })();
+  }, [drafts, flushAllDrafts, onOpenRepository]);
+
+  const selectProject = useCallback(
+    (projectId: number | null) => {
+      void flushAllDrafts().catch(() => undefined);
+      setSelectedProjectId(projectId);
+    },
+    [flushAllDrafts],
+  );
+
+  const changeQuery = useCallback(
+    (nextQuery: string) => {
+      if (!query && nextQuery) void flushAllDrafts().catch(() => undefined);
+      setQuery(nextQuery);
+    },
+    [flushAllDrafts, query],
+  );
+
+  const removeSelectedProject = useCallback(
+    async (projectId: number) => {
+      const draftBeforeRemoval = drafts.get(projectId);
+      drafts.cancel(projectId);
+      try {
+        const nextSnapshot = await removeProject(projectId);
+        drafts.forget(projectId);
+        drafts.reconcile(nextSnapshot);
+        setSnapshot(drafts.overlay(nextSnapshot));
+        if (selectedProjectId === projectId) setSelectedProjectId(null);
+        return undefined;
+      } catch (error: unknown) {
+        if (draftBeforeRemoval.status.state === "saving") {
+          drafts.change(projectId, draftBeforeRemoval.prompt);
+        }
+        return projectErrorMessage(error, "Couldn't remove that project. Try again.");
+      }
+    },
+    [drafts, selectedProjectId],
+  );
 
   useEffect(() => {
+    if (visualReviewStartup === "loading") return;
     const generation = ++verificationGeneration.current;
-    completeHostVerification(generation);
+    completeStartup(generation);
     return () => {
       verificationGeneration.current += 1;
     };
-  }, [completeHostVerification]);
+  }, [completeStartup, visualReviewStartup]);
+
+  useEffect(() => {
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    void listenToProjectInbox((event) => {
+      if (disposed) return;
+      drafts.reconcile(event.snapshot);
+      setSnapshot(drafts.overlay(event.snapshot));
+      if (event.focusedProjectId !== null) setSelectedProjectId(event.focusedProjectId);
+    })
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else stopListening = unlisten;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, [drafts]);
+
+  useEffect(() => {
+    const flush = () => void flushAllDrafts().catch(() => undefined);
+    window.addEventListener("blur", flush);
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("blur", flush);
+      window.removeEventListener("pagehide", flush);
+      void flushAllDrafts().catch(() => undefined);
+    };
+  }, [flushAllDrafts]);
+
+  useEffect(() => {
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    void listenToWindowClose(flushAllDrafts).then((unlisten) => {
+      if (disposed) unlisten();
+      else stopListening = unlisten;
+    });
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, [flushAllDrafts]);
+
+  const selectedProject = snapshot.projects.find(({ id }) => id === selectedProjectId);
 
   return (
-    <div className="app-shell">
-      <header className="titlebar" data-tauri-drag-region>
-        <div className="wordmark" aria-label="Più">
-          <span className="wordmark__symbol" aria-hidden="true">
-            π
-          </span>
-          <span>Più</span>
-        </div>
-        <div className="titlebar__context">All projects</div>
-      </header>
-      <main className="workspace" aria-label="Più inbox">
-        <aside className="inbox-rail" aria-label="Chat inbox">
-          <div>
-            <p className="inbox-rail__label">Workspace</p>
-            <div className="inbox-rail__heading">
-              <h1>Inbox</h1>
-              <span aria-label="0 chats">0</span>
-            </div>
+    <TooltipProvider>
+      <div className="app-shell">
+        <header className="titlebar" data-tauri-drag-region>
+          <div className="wordmark" aria-label="Più">
+            <span className="wordmark-symbol" aria-hidden="true">
+              π
+            </span>
+            <span>Più</span>
           </div>
-          <p className="inbox-rail__hint">Unmerged chats from every open project appear here.</p>
-        </aside>
-        <div className="conversation-stage">
-          {hostStatus === "failed" ? (
-            <StartupFailure onRetry={retryHostVerification} />
-          ) : surface === "inbox" ? (
-            <EmptyInbox actionError={repositoryActionError} onOpenRepository={openRepository} />
-          ) : (
-            <DeferredSurface surface={surface} />
-          )}
-        </div>
-      </main>
-    </div>
+          <div className="titlebar-context">{selectedProject?.name ?? "All Projects"}</div>
+        </header>
+        {hostStatus === "checking" ? (
+          <main className="startup-workspace">
+            <StartupLoading />
+          </main>
+        ) : hostStatus === "failed" ? (
+          <main className="startup-workspace">
+            <StartupFailure onRetry={retryStartup} />
+          </main>
+        ) : surface === "inbox" ? (
+          <InboxWorkspace
+            actionError={repositoryActionError}
+            drafts={drafts}
+            onOpenRepository={openSelectedRepository}
+            onQueryChange={changeQuery}
+            onRemoveProject={removeSelectedProject}
+            onSelectProject={selectProject}
+            query={query}
+            selectedProjectId={selectedProjectId}
+            snapshot={snapshot}
+          />
+        ) : (
+          <main className="deferred-workspace">
+            <div className="conversation-stage">
+              <DeferredSurface surface={surface} />
+            </div>
+          </main>
+        )}
+      </div>
+    </TooltipProvider>
   );
 }

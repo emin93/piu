@@ -20,6 +20,10 @@ _Avoid_: AI SDK Pi Harness adapter, Pi SDK inside the desktop shell, sandbox bri
 The purpose-built macOS application used to open projects, chat with the agent, inspect tool calls and diffs, approve actions, and change models. Its single main window has a global chat inbox, a primary conversation view, and adjacent Diff, Files, and Terminal views, but no direct code editor.
 _Avoid_: Harness, runtime
 
+**Interface system**:
+The shared visual and interaction vocabulary used by every Più surface. It follows the Mac's current appearance, keeps desktop controls compact, and presents one consistent composer from a new draft through an active chat.
+_Avoid_: Theme picker, per-view styling, dashboard template, copied frontend
+
 **Più runtime state**:
 The application-owned Pi configuration, credentials, model routes, extensions, packages, skills, and sessions used by every chat. It never reads, modifies, imports, or synchronizes a standalone Pi installation's runtime state.
 _Avoid_: Shared `~/.pi/agent`, synchronized Pi configuration

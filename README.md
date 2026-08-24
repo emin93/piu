@@ -19,11 +19,17 @@ Install JavaScript dependencies with `npm ci`. The standard commands are:
 - `npm run dev` — launch the live Tauri development application
 - `npm run check` — run formatting, linting, type checks, frontend and Rust tests, Clippy, the frontend production build, and bundle-boundary verification
 - `npm run build` — build the Apple Silicon production application at `src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Più.app`
-- `npm run smoke:packaged` — launch the packaged executable with isolated temporary data and wait for the production host round trip
+- `npm run smoke:packaged` — verify the packaged Git runtime in a scrubbed environment, then launch the packaged executable with isolated temporary data
+
+Local packages are intentionally unsigned development artifacts. Their nested
+executables retain linker ad-hoc signatures, but the application has no final
+resource seal until the release-signing and notarization pipeline signs it.
 
 ## Dependency policy
 
 Più starts each implementation or upgrade from the latest stable compatible release of every direct dependency. Exact versions are pinned in `package.json`, `Cargo.toml`, `rust-toolchain.toml`, and their lockfiles. Prereleases, floating ranges, stale template pins, and compatibility-only packages require an explicit architectural decision.
+
+The application bundles the official arm64 macOS Git 2.55.0 runtime. Its pinned source, detached signature, build recipe, provenance, and GPL-2.0-only notice live under [`src-tauri/vendor/git`](src-tauri/vendor/git).
 
 ## Principles
 
@@ -35,4 +41,4 @@ Più starts each implementation or upgrade from the latest stable compatible rel
 
 ## License
 
-[MIT](LICENSE) © 2026 Emin
+Più is [MIT](LICENSE) licensed © 2026 Emin. Bundled third-party executables retain their own licenses; Git is distributed separately under GPL-2.0-only as documented in [`src-tauri/vendor/git`](src-tauri/vendor/git).

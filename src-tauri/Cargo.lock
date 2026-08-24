@@ -2304,6 +2304,7 @@ name = "piu"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "tauri",

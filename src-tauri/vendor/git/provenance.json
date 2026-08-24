@@ -1,0 +1,19 @@
+{
+  "name": "Git",
+  "version": "2.55.0",
+  "license": "GPL-2.0-only",
+  "source": "https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz",
+  "sourceSha256": "457fdb04dc8728e007d4688695e6912e6f680727920f2a40bf11eacc17505357",
+  "signature": "https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.sign",
+  "signatureSha256": "8673501946204c38ebfed09603c1f3a041ed8d12b31f0aa06a474d41e359e254",
+  "signingSubkeyFingerprint": "E1F036B1FEE7221FC778ECEFB0B5E88696AFE6CB",
+  "target": "aarch64-apple-darwin",
+  "minimumMacOSVersion": "15.0",
+  "buildEnvironment": {
+    "macOS": "26.6.2",
+    "sdk": "26.5",
+    "clang": "Apple clang 21.0.0 (clang-2100.1.1.101)",
+    "make": "GNU Make 3.81"
+  },
+  "builtAtUtc": "2026-08-24T18:41:13Z"
+}

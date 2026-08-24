@@ -1,13 +1,22 @@
 pub mod application;
 pub mod database;
+pub mod git_process;
 pub mod host_boundary;
+pub mod project_commands;
+pub mod project_inbox;
 
 const TEST_APP_DATA_DIR_ENV: &str = "PIU_TEST_APP_DATA_DIR";
 
 pub fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![host_boundary::host_round_trip])
+        .invoke_handler(tauri::generate_handler![
+            host_boundary::host_round_trip,
+            project_commands::load_project_inbox,
+            project_commands::open_repository,
+            project_commands::save_project_draft,
+            project_commands::remove_project,
+        ])
 }
 
 pub fn run() {
@@ -26,10 +35,12 @@ pub fn run() {
     configure_builder(tauri::Builder::default())
         .setup(|app| {
             let default_app_data = app.path().app_data_dir()?;
+            let resource_dir = app.path().resource_dir()?;
             let app_data = env::var_os(TEST_APP_DATA_DIR_ENV)
                 .map(PathBuf::from)
                 .unwrap_or(default_app_data);
-            let core = application::ApplicationCore::deferred(app_data.join("piu.sqlite3"));
+            let git = git_process::GitProcess::from_bundled_runtime(&resource_dir.join("git"));
+            let core = application::ApplicationCore::deferred(app_data.join("piu.sqlite3"), git);
             app.manage(core);
             tracing::info!("application core configured");
             Ok(())

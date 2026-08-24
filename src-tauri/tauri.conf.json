@@ -50,6 +50,9 @@
     "active": true,
     "targets": ["app"],
     "icon": ["icons/icon.icns", "icons/icon.png"],
+    "resources": {
+      "vendor/git/runtime/": "git/"
+    },
     "macOS": {
       "minimumSystemVersion": "15.0"
     }

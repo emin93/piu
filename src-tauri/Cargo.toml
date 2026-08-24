@@ -16,6 +16,7 @@ tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
+rustix = { version = "=1.1.4", features = ["process"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 tauri = { version = "=2.11.5", features = [] }
 tauri-plugin-dialog = "=2.7.2"

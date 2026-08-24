@@ -1,66 +1,51 @@
 use std::{
-    fs,
     path::{Path, PathBuf},
-    sync::{Mutex, PoisonError},
+    sync::Arc,
 };
 
 use thiserror::Error;
 
-use crate::database::{Database, DatabaseError};
+use crate::{
+    git_process::GitProcess,
+    project_inbox::{ProjectInbox, ProjectInboxError},
+};
 
 #[derive(Debug, Error)]
 pub enum ApplicationError {
-    #[error("could not prepare application data at {path}: {source}")]
-    AppData {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error(transparent)]
-    Database(#[from] DatabaseError),
-    #[error("application database lock is poisoned")]
-    DatabaseLock,
+    ProjectInbox(#[from] ProjectInboxError),
 }
 
 pub struct ApplicationCore {
-    database_path: PathBuf,
-    database: Mutex<Option<Database>>,
+    project_inbox: Arc<ProjectInbox>,
 }
 
 impl ApplicationCore {
-    pub fn open(database_path: &Path) -> Result<Self, ApplicationError> {
-        let core = Self::deferred(database_path.to_path_buf());
-        core.schema_version()?;
+    pub fn open(database_path: &Path, git: GitProcess) -> Result<Self, ApplicationError> {
+        let core = Self::deferred(database_path.to_path_buf(), git);
+        core.ensure_storage_ready()?;
         Ok(core)
     }
 
-    pub fn deferred(database_path: PathBuf) -> Self {
+    pub fn deferred(database_path: PathBuf, git: GitProcess) -> Self {
         Self {
-            database_path,
-            database: Mutex::new(None),
+            project_inbox: Arc::new(ProjectInbox::deferred_with_git(database_path, git)),
         }
     }
 
-    pub fn schema_version(&self) -> Result<u32, ApplicationError> {
-        let mut database = self
-            .database
-            .lock()
-            .map_err(PoisonError::into_inner)
-            .map_err(|_| ApplicationError::DatabaseLock)?;
-        if database.is_none() {
-            if let Some(parent) = self.database_path.parent() {
-                fs::create_dir_all(parent).map_err(|source| ApplicationError::AppData {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            }
-            *database = Some(Database::open(&self.database_path)?);
+    pub fn from_project_inbox(project_inbox: ProjectInbox) -> Self {
+        Self {
+            project_inbox: Arc::new(project_inbox),
         }
-        database
-            .as_ref()
-            .expect("database is initialized before use")
-            .schema_version()
-            .map_err(DatabaseError::Query)
-            .map_err(ApplicationError::Database)
+    }
+
+    pub fn ensure_storage_ready(&self) -> Result<(), ApplicationError> {
+        self.project_inbox
+            .ensure_storage_ready()
+            .map_err(ApplicationError::ProjectInbox)
+    }
+
+    pub fn project_inbox(&self) -> Arc<ProjectInbox> {
+        Arc::clone(&self.project_inbox)
     }
 }
