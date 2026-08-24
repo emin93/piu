@@ -42,7 +42,6 @@ beforeEach(() => {
   boundary.verify.mockResolvedValue({
     correlationId: "test-boundary",
     latencyMs: 2,
-    schemaVersion: 1,
   });
   repositoryPicker.open.mockReset();
   repositoryPicker.open.mockResolvedValue(null);

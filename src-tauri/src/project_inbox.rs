@@ -218,7 +218,7 @@ impl ProjectInbox {
             database: Mutex::new(None),
             repository_inspector,
         };
-        inbox.schema_version()?;
+        inbox.ensure_storage_ready()?;
         Ok(inbox)
     }
 
@@ -237,13 +237,8 @@ impl ProjectInbox {
         }
     }
 
-    pub fn schema_version(&self) -> Result<u32, ProjectInboxError> {
-        self.with_database(|database| {
-            database
-                .schema_version()
-                .map_err(DatabaseError::Query)
-                .map_err(ProjectInboxError::Database)
-        })
+    pub fn ensure_storage_ready(&self) -> Result<(), ProjectInboxError> {
+        self.with_database(|_| Ok(()))
     }
 
     pub fn open_repository(

@@ -1,8 +1,6 @@
 use std::fs;
 
-use piu_lib::{
-    application::ApplicationCore, database::CURRENT_SCHEMA_VERSION, git_process::GitProcess,
-};
+use piu_lib::{application::ApplicationCore, git_process::GitProcess};
 
 #[test]
 fn failed_application_core_startup_can_be_retried() {
@@ -14,9 +12,9 @@ fn failed_application_core_startup_can_be_retried() {
         GitProcess::with_executable("/usr/bin/git".into()),
     );
 
-    assert!(core.schema_version().is_err());
+    assert!(core.ensure_storage_ready().is_err());
 
     fs::remove_file(&blocked_directory).unwrap();
     fs::create_dir(&blocked_directory).unwrap();
-    assert_eq!(core.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    core.ensure_storage_ready().unwrap();
 }

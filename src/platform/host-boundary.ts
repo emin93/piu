@@ -10,7 +10,6 @@ const EVENT_TIMEOUT_MS = 2_000;
 export interface HostBoundaryVerification {
   correlationId: string;
   latencyMs: number;
-  schemaVersion: number;
 }
 
 export async function verifyHostBoundary(): Promise<HostBoundaryVerification> {
@@ -42,14 +41,13 @@ export async function verifyHostBoundary(): Promise<HostBoundaryVerification> {
     ]);
     if (
       event.correlationId !== response.correlationId ||
-      event.schemaVersion !== response.schemaVersion
+      event.receivedAtMs !== response.receivedAtMs
     ) {
       throw new Error("Più host command and event did not match");
     }
     return {
       correlationId: response.correlationId,
       latencyMs: Math.max(0, response.receivedAtMs - response.sentAtMs),
-      schemaVersion: response.schemaVersion,
     };
   } finally {
     if (eventTimeout !== undefined) window.clearTimeout(eventTimeout);

@@ -23,7 +23,7 @@ pub struct ApplicationCore {
 impl ApplicationCore {
     pub fn open(database_path: &Path, git: GitProcess) -> Result<Self, ApplicationError> {
         let core = Self::deferred(database_path.to_path_buf(), git);
-        core.schema_version()?;
+        core.ensure_storage_ready()?;
         Ok(core)
     }
 
@@ -39,9 +39,9 @@ impl ApplicationCore {
         }
     }
 
-    pub fn schema_version(&self) -> Result<u32, ApplicationError> {
+    pub fn ensure_storage_ready(&self) -> Result<(), ApplicationError> {
         self.project_inbox
-            .schema_version()
+            .ensure_storage_ready()
             .map_err(ApplicationError::ProjectInbox)
     }
 

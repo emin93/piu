@@ -1,7 +1,6 @@
 use std::{sync::mpsc, time::Duration};
 
 use piu_lib::application::ApplicationCore;
-use piu_lib::database::CURRENT_SCHEMA_VERSION;
 use piu_lib::git_process::GitProcess;
 use piu_lib::host_boundary::{HOST_ROUND_TRIP_EVENT, HostRoundTripRequest, HostRoundTripResponse};
 use tauri::{
@@ -57,5 +56,4 @@ fn typed_round_trip_crosses_the_command_and_event_boundary() {
 
     assert_eq!(response, event);
     assert_eq!(response.correlation_id, "boundary-7");
-    assert_eq!(response.schema_version, CURRENT_SCHEMA_VERSION);
 }
