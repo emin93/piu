@@ -26,6 +26,10 @@ const chatWorkspaces = vi.hoisted(() => ({
   openTerminal: vi.fn(),
   retry: vi.fn(),
 }));
+const modelAssets = vi.hoisted(() => ({
+  status: vi.fn(),
+  subscribe: vi.fn(),
+}));
 
 vi.mock("./platform/host-boundary", () => ({ verifyHostBoundary: boundary.verify }));
 vi.mock("./platform/repository-picker", () => ({
@@ -50,8 +54,31 @@ vi.mock("./platform/chat-workspaces", async (importOriginal) => ({
   openChatTerminal: chatWorkspaces.openTerminal,
   retryChatSetup: chatWorkspaces.retry,
 }));
+vi.mock("./platform/model-assets", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./platform/model-assets")>()),
+  getModelAssetStatus: modelAssets.status,
+  subscribeToModelAssetStatus: modelAssets.subscribe,
+}));
 
 const emptySnapshot = { projects: [], drafts: [], chats: [] };
+const missingModel = {
+  phase: "missing" as const,
+  repository: "orcarouter/Qwen3.8-27B-Uncensored-MLX",
+  revision: "0f88c40e9eff87740295f27654558fcb77e21ae5",
+  manifestId: "fixture",
+  totalBytes: 16_950_451_879,
+  transferredBytes: 0,
+  remainingBytes: 16_950_451_879,
+  currentFreeBytes: 100_000_000_000,
+  requiredFreeBytes: 18_024_193_703,
+  currentAsset: null,
+  currentFile: null,
+  operationId: null,
+  authenticationConfigured: false,
+  canResume: false,
+  errorCode: null,
+  message: null,
+};
 
 beforeEach(() => {
   boundary.verify.mockReset();
@@ -81,6 +108,10 @@ beforeEach(() => {
   chatWorkspaces.openTerminal.mockReset();
   chatWorkspaces.openTerminal.mockResolvedValue({ chatId: "chat-1" });
   chatWorkspaces.retry.mockReset();
+  modelAssets.status.mockReset();
+  modelAssets.status.mockResolvedValue(missingModel);
+  modelAssets.subscribe.mockReset();
+  modelAssets.subscribe.mockResolvedValue(() => undefined);
   windowLifecycle.beforeClose = undefined;
   windowLifecycle.listen.mockReset();
   windowLifecycle.listen.mockImplementation((beforeClose: () => Promise<void>) => {
@@ -138,6 +169,37 @@ test("first send creates a durable chat and moves into streamed setup", async ()
   expect(screen.getByRole("button", { name: "Open Terminal" })).toBeVisible();
 });
 
+test("Settings preserves the selected project and its draft when returning to Inbox", async () => {
+  installMatchMedia("light");
+  projectInbox.load.mockResolvedValueOnce({
+    projects: [{ id: 1, name: "Atlas", availability: "available", unmergedChatCount: 0 }],
+    drafts: [{ projectId: 1, prompt: "Keep this draft", updatedAtMs: 1 }],
+    chats: [],
+  });
+  const user = userEvent.setup();
+
+  render(<App />);
+
+  const draft = await screen.findByRole("textbox", { name: "Draft for Atlas" });
+  await user.click(screen.getByRole("button", { name: /Atlas, available/ }));
+  await user.type(draft, " while away");
+  await user.click(screen.getByRole("button", { name: "Settings" }));
+
+  expect(await screen.findByRole("heading", { name: "Settings" })).toBeVisible();
+  expect(screen.getByText("Settings", { selector: ".titlebar-context" })).toBeVisible();
+  expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Keep this draft while away");
+
+  await user.click(screen.getByRole("button", { name: "Back to Inbox" }));
+  expect(await screen.findByRole("textbox", { name: "Draft for Atlas" })).toHaveValue(
+    "Keep this draft while away",
+  );
+  expect(screen.getByRole("button", { name: /Atlas, available/ })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  expect(screen.getByText("Atlas", { selector: ".titlebar-context" })).toBeVisible();
+});
+
 test("the shell follows system appearance changes live", () => {
   const systemAppearance = installMatchMedia("dark");
 
@@ -157,7 +219,6 @@ test("the empty inbox action is keyboard reachable", async () => {
 
   expect(await screen.findByRole("heading", { name: "Open a repository to start" })).toBeVisible();
   const action = screen.getByRole("button", { name: "Open Repository" });
-  await user.tab();
   await user.tab();
   await user.tab();
   expect(action).toHaveFocus();

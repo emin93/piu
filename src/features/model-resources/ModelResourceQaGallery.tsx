@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Button } from "@/components/ui/button";
 import type { ModelAssetStatus } from "../../generated/ModelAssetStatus";
 import { ModelResourcePanel } from "./ModelResourcePanel";
 import { OnboardingModelResourceStep } from "./OnboardingModelResourceStep";
@@ -114,20 +115,24 @@ export function ModelResourceQaGallery() {
         Deterministic build-time QA gallery · production IPC disabled
       </div>
       <div className="model-resource-qa__context" aria-label="QA context">
-        <button
+        <Button
           type="button"
           aria-pressed={context === "settings"}
           onClick={() => setContext("settings")}
+          size="sm"
+          variant={context === "settings" ? "secondary" : "ghost"}
         >
           Settings context
-        </button>
-        <button
+        </Button>
+        <Button
           type="button"
           aria-pressed={context === "onboarding"}
           onClick={() => setContext("onboarding")}
+          size="sm"
+          variant={context === "onboarding" ? "secondary" : "ghost"}
         >
           Onboarding context
-        </button>
+        </Button>
       </div>
       {states.map(({ label, status }) => (
         <article key={label} aria-label={label}>

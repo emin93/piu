@@ -1,6 +1,27 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 
-import type { ModelAssetStatus } from "../../generated/ModelAssetStatus";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyTitle,
+} from "@/components/ui/empty";
+import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
+import type { ModelAssetStatus } from "@/generated/ModelAssetStatus";
 import {
   authorizeHuggingFace,
   cancelModelDownload,
@@ -8,7 +29,7 @@ import {
   removeModelAssets,
   startModelDownload,
   subscribeToModelAssetStatus,
-} from "../../platform/model-assets";
+} from "@/platform/model-assets";
 
 const phaseLabels: Record<ModelAssetStatus["phase"], string> = {
   missing: "Not downloaded",
@@ -21,16 +42,24 @@ const phaseLabels: Record<ModelAssetStatus["phase"], string> = {
   failed: "Needs attention",
   revisionMismatch: "Revision mismatch",
 };
+const GIGABYTE_FORMATTER = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 GB";
-  return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(bytes / 1_000_000_000)} GB`;
+  return `${GIGABYTE_FORMATTER.format(bytes / 1_000_000_000)} GB`;
 }
 
 function progress(status: ModelAssetStatus): number {
   return status.totalBytes === 0
     ? 0
     : Math.min(100, Math.round((status.transferredBytes / status.totalBytes) * 100));
+}
+
+function statusVariant(phase: ModelAssetStatus["phase"]): "destructive" | "outline" | "secondary" {
+  if (phase === "failed" || phase === "revisionMismatch" || phase === "authenticationRequired") {
+    return "destructive";
+  }
+  return phase === "ready" ? "secondary" : "outline";
 }
 
 interface ModelResourcePanelProps {
@@ -47,7 +76,6 @@ export function ModelResourcePanel({
 }: ModelResourcePanelProps) {
   const headingId = useId();
   const tokenId = useId();
-  const dialogTitleId = useId();
   const [status, setStatus] = useState<ModelAssetStatus | undefined>(statusOverride);
   const [initialization, setInitialization] = useState<"loading" | "ready" | "failed">(
     statusOverride ? "ready" : "loading",
@@ -59,8 +87,6 @@ export function ModelResourcePanel({
   const [confirmRemoval, setConfirmRemoval] = useState(dialogOpenForQa);
   const removeButtonRef = useRef<HTMLButtonElement>(null);
   const cancelRemovalRef = useRef<HTMLButtonElement>(null);
-  const confirmRemovalRef = useRef<HTMLButtonElement>(null);
-  const dialogWasOpen = useRef(dialogOpenForQa);
 
   useEffect(() => {
     if (statusOverride) return;
@@ -95,16 +121,6 @@ export function ModelResourcePanel({
     };
   }, [initializationAttempt, statusOverride]);
 
-  useEffect(() => {
-    if (confirmRemoval) {
-      dialogWasOpen.current = true;
-      cancelRemovalRef.current?.focus();
-    } else if (dialogWasOpen.current) {
-      dialogWasOpen.current = false;
-      removeButtonRef.current?.focus();
-    }
-  }, [confirmRemoval]);
-
   const perform = useCallback(async (action: () => Promise<unknown>) => {
     setBusy(true);
     setError(undefined);
@@ -119,24 +135,32 @@ export function ModelResourcePanel({
 
   if (initialization === "failed") {
     return (
-      <section className="model-resource-card model-resource-card--failure">
-        <p className="settings-eyebrow">Models & resources</p>
-        <h2>Model resources unavailable</h2>
-        <p className="resource-error" role="alert">
-          {error ?? "Più couldn’t reach its model resource service."}
-        </p>
-        <button
-          className="secondary-action"
-          type="button"
-          onClick={() => {
-            setInitialization("loading");
-            setStatus(undefined);
-            setError(undefined);
-            setInitializationAttempt((attempt) => attempt + 1);
-          }}
-        >
-          Retry
-        </button>
+      <section aria-label="Models & resources" className="model-resource-panel">
+        <Empty className="model-resource-empty">
+          <EmptyHeader>
+            <EmptyTitle>Model resources unavailable</EmptyTitle>
+            <EmptyDescription>
+              Più couldn&apos;t reach the local model resource service.
+            </EmptyDescription>
+          </EmptyHeader>
+          <EmptyContent>
+            <p className="resource-error" role="alert">
+              {error ?? "Try again to reconnect."}
+            </p>
+            <Button
+              onClick={() => {
+                setInitialization("loading");
+                setStatus(undefined);
+                setError(undefined);
+                setInitializationAttempt((attempt) => attempt + 1);
+              }}
+              type="button"
+              variant="outline"
+            >
+              Retry
+            </Button>
+          </EmptyContent>
+        </Empty>
       </section>
     );
   }
@@ -144,8 +168,18 @@ export function ModelResourcePanel({
   const currentStatus = statusOverride ?? status;
   if (initialization === "loading" || !currentStatus) {
     return (
-      <section className="model-resource-card" aria-busy="true">
-        <p className="model-resource-card__loading">Checking model resources…</p>
+      <section
+        aria-busy="true"
+        aria-label="Models & resources"
+        className="model-resource-panel model-resource-panel--loading"
+        role="status"
+      >
+        <div className="model-resource-loading-copy">
+          <Skeleton className="h-3 w-28" />
+          <Skeleton className="h-5 w-44" />
+        </div>
+        <Skeleton className="h-7 w-24" />
+        <span className="sr-only">Checking model resources…</span>
       </section>
     );
   }
@@ -158,50 +192,35 @@ export function ModelResourcePanel({
   const transferRelevant =
     downloading || currentStatus.canResume || currentStatus.phase === "cancelled";
   const qaMode = statusOverride !== undefined;
-
-  const closeRemoval = () => setConfirmRemoval(false);
-  const keepFocusInDialog = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      closeRemoval();
-      return;
-    }
-    if (event.key !== "Tab") return;
-    if (event.shiftKey && document.activeElement === cancelRemovalRef.current) {
-      event.preventDefault();
-      confirmRemovalRef.current?.focus();
-    } else if (!event.shiftKey && document.activeElement === confirmRemovalRef.current) {
-      event.preventDefault();
-      cancelRemovalRef.current?.focus();
-    }
-  };
+  const progressValue = progress(currentStatus);
 
   return (
-    <section className="model-resource-card" aria-labelledby={headingId}>
-      <header className="model-resource-card__header">
+    <section aria-labelledby={headingId} className="model-resource-panel">
+      <header className="model-resource-header">
         <div>
           <p className="settings-eyebrow">
             {context === "onboarding" ? "Required resource" : "Models & resources"}
           </p>
           <h2 id={headingId}>Local model</h2>
         </div>
-        <span
+        <Badge
+          aria-atomic="true"
+          aria-live="polite"
           className={`resource-status resource-status--${currentStatus.phase}`}
           role="status"
-          aria-live="polite"
-          aria-atomic="true"
+          variant={statusVariant(currentStatus.phase)}
         >
           {phaseLabels[currentStatus.phase]}
-        </span>
+        </Badge>
       </header>
 
-      <div className="model-resource-card__identity">
+      <div className="model-resource-identity">
         <strong>Qwen 3.8 27B · 4-bit</strong>
         <span>MTP drafter</span>
       </div>
-      <p className="model-resource-card__copy">
-        Più installs this exact pinned model and drafter in managed application storage. Local
-        inference stays off until it is needed.
+      <p className="model-resource-copy">
+        Più installs and verifies this exact model in managed application storage. It loads only
+        when a local conversation needs it.
       </p>
 
       <dl className="resource-metrics">
@@ -229,19 +248,20 @@ export function ModelResourcePanel({
                   ? "MTP drafter"
                   : "Model"}
             </span>
+            <span className="font-mono">{progressValue}%</span>
+          </div>
+          <progress aria-label="Model download progress" max="100" value={progressValue} />
+          <div className="resource-progress__detail">
+            <span className="font-mono" title={currentStatus.currentFile ?? undefined}>
+              {currentStatus.currentFile ?? "Ready to resume"}
+            </span>
             <span>
               {formatBytes(currentStatus.transferredBytes)} of{" "}
-              {formatBytes(currentStatus.totalBytes)} · {progress(currentStatus)}%
+              {formatBytes(currentStatus.totalBytes)}
+              {currentStatus.remainingBytes > 0
+                ? ` · ${formatBytes(currentStatus.remainingBytes)} remaining`
+                : ""}
             </span>
-          </div>
-          <progress
-            max="100"
-            value={progress(currentStatus)}
-            aria-label="Model download progress"
-          />
-          <div className="resource-progress__detail">
-            <span>{currentStatus.currentFile ?? "Ready to resume"}</span>
-            <span>{formatBytes(currentStatus.remainingBytes)} remaining</span>
           </div>
         </div>
       ) : null}
@@ -258,22 +278,18 @@ export function ModelResourcePanel({
           }}
         >
           <label htmlFor={tokenId}>Hugging Face access token</label>
-          <div>
-            <input
-              id={tokenId}
-              type="password"
+          <div className="resource-auth__controls">
+            <Input
               autoComplete="off"
-              value={token}
               disabled={qaMode}
+              id={tokenId}
               onChange={(event) => setToken(event.currentTarget.value)}
+              type="password"
+              value={token}
             />
-            <button
-              className="secondary-action"
-              type="submit"
-              disabled={busy || !token.trim() || qaMode}
-            >
+            <Button disabled={busy || !token.trim() || qaMode} type="submit" variant="outline">
               Connect Hugging Face
-            </button>
+            </Button>
           </div>
           <p>The token is validated, then stored only in macOS Keychain.</p>
         </form>
@@ -295,9 +311,7 @@ export function ModelResourcePanel({
 
       <div className="resource-actions">
         {downloading || removing ? (
-          <button
-            className="secondary-action"
-            type="button"
+          <Button
             disabled={(busy && !removing) || qaMode}
             onClick={() => {
               if (removing) {
@@ -308,73 +322,61 @@ export function ModelResourcePanel({
                 void perform(cancelModelDownload);
               }
             }}
+            type="button"
+            variant="outline"
           >
             {removing ? "Cancel removal" : "Cancel download"}
-          </button>
+          </Button>
         ) : removable ? (
-          <button
-            ref={removeButtonRef}
-            className="danger-action"
-            type="button"
+          <Button
             disabled={busy}
             onClick={() => setConfirmRemoval(true)}
+            ref={removeButtonRef}
+            type="button"
+            variant="destructive"
           >
             {mismatch ? "Remove old model" : "Remove model"}
-          </button>
+          </Button>
         ) : (
-          <button
-            className="primary-action"
-            type="button"
+          <Button
             disabled={busy || authenticationNeeded || qaMode}
             onClick={() => void perform(startModelDownload)}
+            type="button"
           >
             {currentStatus.canResume ? "Resume download" : "Download model"}
-          </button>
+          </Button>
         )}
       </div>
 
-      {confirmRemoval ? (
-        <div className="dialog-backdrop">
-          <div
-            className="removal-confirmation"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby={dialogTitleId}
-            onKeyDown={keepFocusInDialog}
-          >
-            <h3 id={dialogTitleId}>{mismatch ? "Remove old model?" : "Remove local model?"}</h3>
-            <p>
-              Più verifies every file recorded by its ownership marker before removal. Unknown or
-              changed files stay untouched.
-            </p>
-            <div>
-              <button
-                ref={cancelRemovalRef}
-                className="secondary-action"
-                type="button"
-                onClick={closeRemoval}
-              >
-                Keep model
-              </button>
-              <button
-                ref={confirmRemovalRef}
-                className="danger-action"
-                type="button"
-                disabled={busy || qaMode}
-                onClick={() => {
-                  closeRemoval();
-                  void perform(async () => {
-                    const next = await removeModelAssets();
-                    setStatus(next);
-                  });
-                }}
-              >
-                Confirm removal
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
+      <AlertDialog onOpenChange={setConfirmRemoval} open={confirmRemoval}>
+        <AlertDialogContent finalFocus={removeButtonRef} initialFocus={cancelRemovalRef}>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {mismatch ? "Remove old model?" : "Remove local model?"}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              Più verifies every file in its ownership record before removal. Unknown or changed
+              files stay untouched.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel ref={cancelRemovalRef}>Keep model</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={busy || qaMode}
+              onClick={() => {
+                setConfirmRemoval(false);
+                void perform(async () => {
+                  const next = await removeModelAssets();
+                  setStatus(next);
+                });
+              }}
+              variant="destructive"
+            >
+              Confirm removal
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </section>
   );
 }

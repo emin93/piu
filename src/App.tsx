@@ -76,6 +76,7 @@ function StartupLoading() {
 
 export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }: AppProps) {
   useSystemAppearance();
+  const [activeSurface, setActiveSurface] = useState<"inbox" | DeferredSurfaceName>(surface);
   const [hostStatus, setHostStatus] = useState<"checking" | "ready" | "failed">("checking");
   const [snapshot, setSnapshot] = useState<InboxSnapshot>(EMPTY_INBOX);
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
@@ -123,6 +124,13 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
   }, [completeStartup]);
 
   const flushAllDrafts = useCallback(() => drafts.flushAll(), [drafts]);
+
+  const openSettings = useCallback(() => {
+    void flushAllDrafts().catch(() => undefined);
+    setActiveSurface("settings");
+  }, [flushAllDrafts]);
+
+  const closeDeferredSurface = useCallback(() => setActiveSurface("inbox"), []);
 
   const openSelectedRepository = useCallback(() => {
     void flushAllDrafts().catch(() => undefined);
@@ -319,6 +327,8 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
   }, [flushAllDrafts]);
 
   const selectedProject = snapshot.projects.find(({ id }) => id === selectedProjectId);
+  const titlebarContext =
+    activeSurface === "settings" ? "Settings" : (selectedProject?.name ?? "All Projects");
 
   return (
     <TooltipProvider>
@@ -330,7 +340,7 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
             </span>
             <span>Più</span>
           </div>
-          <div className="titlebar-context">{selectedProject?.name ?? "All Projects"}</div>
+          <div className="titlebar-context">{titlebarContext}</div>
         </header>
         {hostStatus === "checking" ? (
           <main className="startup-workspace">
@@ -340,7 +350,7 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
           <main className="startup-workspace">
             <StartupFailure onRetry={retryStartup} />
           </main>
-        ) : surface === "inbox" ? (
+        ) : activeSurface === "inbox" ? (
           <InboxWorkspace
             actionError={repositoryActionError}
             drafts={drafts}
@@ -348,6 +358,7 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
             onCreateChat={createProjectChat}
             onOpenRepository={openSelectedRepository}
             onOpenTerminal={openTerminal}
+            onOpenSettings={openSettings}
             onQueryChange={changeQuery}
             onRemoveProject={removeSelectedProject}
             onRetrySetup={retrySetup}
@@ -362,7 +373,7 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
         ) : (
           <main className="deferred-workspace">
             <div className="conversation-stage">
-              <DeferredSurface surface={surface} />
+              <DeferredSurface onClose={closeDeferredSurface} surface={activeSurface} />
             </div>
           </main>
         )}

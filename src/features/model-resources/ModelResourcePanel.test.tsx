@@ -104,14 +104,14 @@ test("ready resources require confirmation before ownership-safe removal", async
 
   const remove = await screen.findByRole("button", { name: "Remove model" });
   await user.click(remove);
-  const dialog = screen.getByRole("dialog", { name: "Remove local model?" });
+  const dialog = screen.getByRole("alertdialog", { name: "Remove local model?" });
   expect(dialog).toBeVisible();
   expect(assets.remove).not.toHaveBeenCalled();
   const keep = screen.getByRole("button", { name: "Keep model" });
-  expect(keep).toHaveFocus();
+  await waitFor(() => expect(keep).toHaveFocus());
   await user.keyboard("{Escape}");
-  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  expect(remove).toHaveFocus();
+  expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  await waitFor(() => expect(remove).toHaveFocus());
 
   await user.click(remove);
   await user.click(screen.getByRole("button", { name: "Confirm removal" }));
@@ -131,7 +131,7 @@ test("an active removal closes confirmation and remains cancellable", async () =
 
   await user.click(await screen.findByRole("button", { name: "Remove model" }));
   await user.click(screen.getByRole("button", { name: "Confirm removal" }));
-  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
   assets.listener?.({
     ...missing,
     phase: "removing",
@@ -153,11 +153,11 @@ test("the removal dialog traps keyboard focus with the safe action first", async
   const keep = screen.getByRole("button", { name: "Keep model" });
   const confirm = screen.getByRole("button", { name: "Confirm removal" });
 
-  expect(keep).toHaveFocus();
+  await waitFor(() => expect(keep).toHaveFocus());
   await user.tab({ shift: true });
-  expect(confirm).toHaveFocus();
+  await waitFor(() => expect(confirm).toHaveFocus());
   await user.tab();
-  expect(keep).toHaveFocus();
+  await waitFor(() => expect(keep).toHaveFocus());
 });
 
 test("initialization failures stop loading and offer a finite retry", async () => {
