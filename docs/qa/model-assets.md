@@ -23,8 +23,9 @@ The normal release build omits the variable and renders the production IPC-backe
 context toggle is local-only and renders the same fixtures either in Settings or through the
 reusable `OnboardingModelResourceStep` shell; it never changes application or model state.
 
-The arm64 `.app` was opened at its configured 1180 × 760 window size. macOS accessibility and
-pixel output were inspected for these states in both system appearances:
+The arm64 `.app` was opened at its configured 1180 × 760 window size. The native macOS window
+captures include the one-point title-bar extent and are committed as 2360 × 1522, 2× RGBA PNGs.
+macOS accessibility and pixel output were inspected for these states in both system appearances:
 
 - download progress;
 - integrity verification;
@@ -43,21 +44,22 @@ mismatch states. Representative top and recovery pixels are committed below. No 
 made; the test also asserts that every production platform mock remains untouched.
 
 The removal dialogs exposed `aria-modal`, their labelled heading and copy, `Keep model` as initial
-focus, and `Confirm removal`. The original dark system appearance was restored after capture.
+focus, and `Confirm removal`. The system Light appearance was restored after capture.
 
 ## Evidence
 
-- [Dark progress and metrics](evidence/model-assets-gallery-dark-top.png)
-- [Dark ready and mismatch recovery](evidence/model-assets-gallery-dark-recovery.png)
-- [Dark old-revision recovery dialog](evidence/model-assets-recovery-dialog-dark.png)
-- [Light progress and metrics](evidence/model-assets-gallery-light-top.png)
-- [Light ready and mismatch recovery](evidence/model-assets-gallery-light-recovery.png)
-- [Light ready-state removal dialog](evidence/model-assets-removal-dialog-light.png)
-- [Light old-revision recovery dialog](evidence/model-assets-recovery-dialog-light.png)
-- [Dark onboarding progress](evidence/model-assets-onboarding-dark.jpeg)
-- [Dark onboarding ready and mismatch recovery](evidence/model-assets-onboarding-dark-recovery.jpeg)
-- [Light onboarding progress](evidence/model-assets-onboarding-light.jpeg)
-- [Light onboarding ready and mismatch recovery](evidence/model-assets-onboarding-light-recovery.jpeg)
+- [Light Settings progress and metrics](evidence/model-assets-settings-light-top.png)
+- [Light Settings ready and old-revision recovery](evidence/model-assets-settings-light-recovery.png)
+- [Dark Settings progress and metrics](evidence/model-assets-settings-dark-top.png)
+- [Dark Settings ready and old-revision recovery](evidence/model-assets-settings-dark-recovery.png)
+- [Light onboarding progress](evidence/model-assets-onboarding-light-top.png)
+- [Light onboarding old-revision recovery](evidence/model-assets-onboarding-light-recovery.png)
+- [Dark onboarding progress](evidence/model-assets-onboarding-dark-top.png)
+- [Dark onboarding old-revision recovery](evidence/model-assets-onboarding-dark-recovery.png)
+- [Light ready-state removal dialog](evidence/model-assets-ready-dialog-light.png)
+- [Dark ready-state removal dialog](evidence/model-assets-ready-dialog-dark.png)
+- [Light old-revision removal dialog](evidence/model-assets-mismatch-dialog-light.png)
+- [Dark old-revision removal dialog](evidence/model-assets-mismatch-dialog-dark.png)
 
 ## Contrast
 
