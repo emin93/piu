@@ -79,20 +79,45 @@
   margin-top: 14px;
 }
 
+.conversation-input-options {
+  display: grid;
+  gap: 6px;
+}
+
+.conversation-input-options > button {
+  justify-content: flex-start;
+  white-space: normal;
+}
+
 .conversation-transcript-scroll {
+  height: 100%;
   min-height: 0;
   overflow: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
 }
 
-.conversation-transcript {
+.conversation-static-transcript {
   display: grid;
   align-content: end;
   width: min(48rem, calc(100% - 48px));
   min-height: 100%;
   margin-inline: auto;
   padding: 32px 0 24px;
+}
+
+.conversation-transcript,
+.conversation-transcript-footer {
+  width: min(48rem, calc(100% - 48px));
+  margin-inline: auto;
+}
+
+.conversation-transcript-header {
+  height: 32px;
+}
+
+.conversation-transcript-footer {
+  padding-bottom: 24px;
 }
 
 .conversation-message {
@@ -106,7 +131,7 @@
   contain-intrinsic-size: auto 84px;
 }
 
-.conversation-message:first-child {
+.conversation-transcript-item:first-child .conversation-message {
   border-top-color: transparent;
 }
 
@@ -141,6 +166,18 @@
   white-space: pre-wrap;
 }
 
+.conversation-message-body {
+  min-width: 0;
+}
+
+.conversation-message-queue {
+  margin: 5px 0 0;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
 .conversation-tool,
 .conversation-usage,
 .conversation-turn-state {
@@ -160,13 +197,15 @@
   color: var(--muted-foreground);
 }
 
-.conversation-reasoning-row + .conversation-message[data-role="assistant"] {
+.conversation-transcript-item[data-transcript-kind="reasoning"]
+  + .conversation-transcript-item[data-transcript-role="assistant"]
+  .conversation-message {
   padding-top: 8px;
   border-top-color: transparent;
 }
 
-.conversation-reasoning-row
-  + .conversation-message[data-role="assistant"]
+.conversation-transcript-item[data-transcript-kind="reasoning"]
+  + .conversation-transcript-item[data-transcript-role="assistant"]
   .conversation-message-role {
   visibility: hidden;
 }
@@ -216,6 +255,10 @@
 
 .conversation-tool[data-status="failed"] {
   border-left-color: var(--destructive);
+}
+
+.conversation-tool[data-status="interrupted"] {
+  border-left-color: var(--muted-foreground);
 }
 
 .conversation-tool-trigger,
@@ -361,7 +404,9 @@
 }
 
 @media (max-width: 960px) {
-  .conversation-transcript {
+  .conversation-static-transcript,
+  .conversation-transcript,
+  .conversation-transcript-footer {
     width: min(48rem, calc(100% - 32px));
   }
 

@@ -10,6 +10,7 @@ use crate::{
         ChatSetupChangedEvent, ChatTerminalRequest, ChatWorkspaceError, CreatedChat,
     },
     project_inbox::{DraftSummary, InboxSnapshot, OpenRepositoryOutcome, ProjectInboxError},
+    prompt_attachments::PromptAttachment,
 };
 
 pub const PROJECT_INBOX_CHANGED_EVENT: &str = "project-inbox://changed";
@@ -40,6 +41,8 @@ pub struct SaveProjectDraftRequest {
     #[ts(type = "number")]
     pub project_id: i64,
     pub prompt: String,
+    #[serde(default)]
+    pub attachments: Vec<PromptAttachment>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -57,6 +60,8 @@ pub struct CreateChatRequest {
     #[ts(type = "number")]
     pub project_id: i64,
     pub prompt: String,
+    #[serde(default)]
+    pub attachments: Vec<PromptAttachment>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -64,6 +69,14 @@ pub struct CreateChatRequest {
 #[ts(export, export_to = "../../src/generated/")]
 pub struct ChatIdRequest {
     pub chat_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct RenameChatRequest {
+    pub chat_id: String,
+    pub title: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
@@ -92,8 +105,10 @@ pub enum ProjectCommandErrorCode {
     ProjectHasUnmergedChats,
     ProjectNotFound,
     ChatNotFound,
+    InvalidChatTitle,
     RepositoryInspectionFailed,
     StorageUnavailable,
+    InvalidAttachment,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -115,6 +130,7 @@ pub enum ChatWorkspaceCommandErrorCode {
     SetupAlreadyRunning,
     CreationFailed,
     StorageUnavailable,
+    InvalidAttachment,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -149,6 +165,11 @@ impl From<ChatWorkspaceError> for ChatWorkspaceCommandError {
             ChatWorkspaceError::SetupAlreadyRunning => Self {
                 code: ChatWorkspaceCommandErrorCode::SetupAlreadyRunning,
                 message: "Setup is already running for this chat.".into(),
+            },
+            ChatWorkspaceError::Inbox(ProjectInboxError::Attachment(_)) => Self {
+                code: ChatWorkspaceCommandErrorCode::InvalidAttachment,
+                message: "One of those attachments is no longer valid. Remove it and try again."
+                    .into(),
             },
             ChatWorkspaceError::WorktreeStorage(_)
             | ChatWorkspaceError::Inbox(ProjectInboxError::AppData(_))
@@ -199,6 +220,15 @@ impl From<ProjectInboxError> for ProjectCommandError {
                 code: ProjectCommandErrorCode::ChatNotFound,
                 message: "That chat is no longer in Più.".into(),
             },
+            ProjectInboxError::InvalidChatTitle => Self {
+                code: ProjectCommandErrorCode::InvalidChatTitle,
+                message: "Give this chat a title before saving.".into(),
+            },
+            ProjectInboxError::Attachment(_) => Self {
+                code: ProjectCommandErrorCode::InvalidAttachment,
+                message: "One of those attachments is no longer valid. Remove it and try again."
+                    .into(),
+            },
             ProjectInboxError::GitProcess(_) => Self {
                 code: ProjectCommandErrorCode::RepositoryInspectionFailed,
                 message: "Più couldn’t inspect that repository. Try again.".into(),
@@ -208,6 +238,7 @@ impl From<ProjectInboxError> for ProjectCommandError {
             | ProjectInboxError::DatabaseLock
             | ProjectInboxError::ChatSessionAlreadyBound { .. }
             | ProjectInboxError::InvalidChatSessionReference { .. }
+            | ProjectInboxError::InvalidAttachmentState
             | ProjectInboxError::SystemClock => Self {
                 code: ProjectCommandErrorCode::StorageUnavailable,
                 message: "Più couldn’t save this change. Try again.".into(),
@@ -253,7 +284,10 @@ pub async fn save_project_draft(
     request: SaveProjectDraftRequest,
 ) -> Result<DraftSummary, ProjectCommandError> {
     let inbox = core.project_inbox();
-    blocking_project_operation(move || inbox.save_draft(request.project_id, &request.prompt)).await
+    blocking_project_operation(move || {
+        inbox.save_draft(request.project_id, &request.prompt, &request.attachments)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -276,6 +310,26 @@ pub async fn remove_project<R: Runtime>(
 }
 
 #[tauri::command]
+pub async fn rename_chat<R: Runtime>(
+    app: AppHandle<R>,
+    core: State<'_, ApplicationCore>,
+    request: RenameChatRequest,
+) -> Result<InboxSnapshot, ProjectCommandError> {
+    let inbox = core.project_inbox();
+    let snapshot =
+        blocking_project_operation(move || inbox.rename_chat(&request.chat_id, &request.title))
+            .await?;
+    emit_change(
+        &app,
+        ProjectInboxChangedEvent {
+            snapshot: snapshot.clone(),
+            focused_project_id: None,
+        },
+    )?;
+    Ok(snapshot)
+}
+
+#[tauri::command]
 pub async fn create_chat<R: Runtime>(
     app: AppHandle<R>,
     core: State<'_, ApplicationCore>,
@@ -284,7 +338,7 @@ pub async fn create_chat<R: Runtime>(
     let workspaces = core.chat_workspaces();
     let setup_workspaces = Arc::clone(&workspaces);
     let CreatedChat { chat, snapshot } = blocking_chat_operation(move || {
-        workspaces.create_chat(request.project_id, &request.prompt)
+        workspaces.create_chat(request.project_id, &request.prompt, &request.attachments)
     })
     .await?;
     let chat_id = chat.id.clone();

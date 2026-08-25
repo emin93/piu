@@ -14,6 +14,7 @@ export type { ProjectSummary } from "../generated/ProjectSummary";
 import type { InboxSnapshot } from "../generated/InboxSnapshot";
 import type { DraftSummary } from "../generated/DraftSummary";
 import type { OpenRepositoryResponse } from "../generated/OpenRepositoryResponse";
+import type { PromptAttachment } from "../generated/PromptAttachment";
 
 const PROJECT_INBOX_CHANGED_EVENT = "project-inbox://changed";
 const PROJECT_COMMAND_ERROR_CODES = new Set<ProjectCommandErrorCode>([
@@ -21,8 +22,11 @@ const PROJECT_COMMAND_ERROR_CODES = new Set<ProjectCommandErrorCode>([
   "repositoryInaccessible",
   "projectHasUnmergedChats",
   "projectNotFound",
+  "chatNotFound",
+  "invalidChatTitle",
   "repositoryInspectionFailed",
   "storageUnavailable",
+  "invalidAttachment",
 ]);
 
 export function loadProjectInbox() {
@@ -33,14 +37,22 @@ export function openRepository(path: string) {
   return invoke<OpenRepositoryResponse>("open_repository", { request: { path } });
 }
 
-export function saveProjectDraft(projectId: number, prompt: string) {
+export function saveProjectDraft(
+  projectId: number,
+  prompt: string,
+  attachments: readonly PromptAttachment[],
+) {
   return invoke<DraftSummary>("save_project_draft", {
-    request: { projectId, prompt },
+    request: { attachments, projectId, prompt },
   });
 }
 
 export function removeProject(projectId: number) {
   return invoke<InboxSnapshot>("remove_project", { request: { projectId } });
+}
+
+export function renameChat(chatId: string, title: string) {
+  return invoke<InboxSnapshot>("rename_chat", { request: { chatId, title } });
 }
 
 export function listenToProjectInbox(onChange: (event: ProjectInboxChangedEvent) => void) {

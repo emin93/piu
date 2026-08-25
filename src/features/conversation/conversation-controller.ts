@@ -1,9 +1,15 @@
-import type { ConversationAdapter, ConversationEvent } from "@/platform/conversations";
+import type {
+  ConversationAdapter,
+  ConversationEvent,
+  ConversationInputAnswer,
+} from "@/platform/conversations";
+import type { PromptAttachment } from "@/platform/prompt-attachments";
 
 import { ConversationStore } from "./conversation-store";
 
 const STOPPED_CONVERSATION = {
   failure: null,
+  inputRequest: null,
   items: [],
   phase: "stopped",
 } as const;
@@ -42,10 +48,11 @@ export class ConversationController {
     for (const event of pendingEvents) this.store.apply(event);
   }
 
-  send(text: string) {
+  send(text: string, attachments: readonly PromptAttachment[] = []) {
     const trimmedText = text.trim();
-    if (!trimmedText) return Promise.resolve();
+    if (!trimmedText && attachments.length === 0) return Promise.resolve();
     return this.#adapter.prompt({
+      attachments,
       chatId: this.#chatId,
       streamingBehavior: "steer",
       text: trimmedText,
@@ -54,6 +61,10 @@ export class ConversationController {
 
   stop() {
     return this.#adapter.stop(this.#chatId);
+  }
+
+  answerInput(requestId: string, answer: ConversationInputAnswer) {
+    return this.#adapter.answerInput(this.#chatId, requestId, answer);
   }
 
   dispose() {

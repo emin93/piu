@@ -4,6 +4,7 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ProjectDraftController } from "@/features/inbox/draft-controller";
+import { ChatActivityController } from "@/features/inbox/chat-activity-controller";
 import { InboxWorkspace } from "@/features/inbox/InboxWorkspace";
 import { ChatSetupController } from "@/features/inbox/setup-controller";
 import type { ConversationAdapter, ConversationEvent } from "@/platform/conversations";
@@ -41,6 +42,15 @@ const readySetup = {
   signal: null,
 };
 
+const performanceAttachments = Array.from({ length: 3 }, (_, index) => ({
+  content: "A".repeat(2 * 1024 * 1024),
+  id: `performance-attachment-${index}`,
+  kind: "image" as const,
+  mimeType: "image/png",
+  name: `reference-${index + 1}.png`,
+  sizeBytes: 2 * 1024 * 1024,
+}));
+
 const snapshot: InboxSnapshot = {
   chats: Array.from({ length: 24 }, (_, index) => ({
     branchName: `agent/performance-chat-${index}`,
@@ -53,7 +63,14 @@ const snapshot: InboxSnapshot = {
     setup: readySetup,
     title: `Performance conversation ${index}`,
   })),
-  drafts: [],
+  drafts: [
+    {
+      attachments: performanceAttachments,
+      projectId: 1,
+      prompt: "",
+      updatedAtMs: 1_730_000_000_000,
+    },
+  ],
   projects: [{ availability: "available", id: 1, name: "Atlas", unmergedChatCount: 24 }],
 };
 
@@ -61,12 +78,14 @@ function conversationItems(chatId: string) {
   const items = Array.from({ length: 180 }, (_, index) => ({
     id: `${chatId}-message-${index}`,
     kind: "message" as const,
+    queued: false,
     role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
     text: `Representative transcript line ${index}. This text exercises wrapping and progressive transcript rendering in the production conversation surface.`,
   }));
   items.push({
     id: `stream-${chatId}`,
     kind: "message",
+    queued: false,
     role: "assistant",
     text: `Conversation marker ${chatId}`,
   });
@@ -142,7 +161,16 @@ function PerformanceReview() {
     streaming: [],
   });
   const eventReceivers = useRef(new Map<string, (event: ConversationEvent) => void>());
-  const drafts = useMemo(() => new ProjectDraftController(() => Promise.resolve(undefined)), []);
+  const drafts = useMemo(() => {
+    const controller = new ProjectDraftController(() => Promise.resolve(undefined));
+    controller.reconcile(snapshot);
+    return controller;
+  }, []);
+  const activities = useMemo(() => {
+    const controller = new ChatActivityController();
+    controller.reconcile(snapshot.chats.map((chat) => chat.id));
+    return controller;
+  }, []);
   const setups = useMemo(() => {
     const controller = new ChatSetupController();
     controller.reconcile(snapshot);
@@ -150,13 +178,19 @@ function PerformanceReview() {
   }, []);
   const adapter = useMemo<ConversationAdapter>(
     () => ({
+      answerInput: () => Promise.resolve(undefined),
       connect(chatId, onEvent) {
         eventReceivers.current.set(chatId, onEvent);
         return Promise.resolve({
           disconnect: () => {
             eventReceivers.current.delete(chatId);
           },
-          snapshot: { failure: null, items: conversationItems(chatId), phase: "running" },
+          snapshot: {
+            failure: null,
+            inputRequest: null,
+            items: conversationItems(chatId),
+            phase: "running",
+          },
         });
       },
       prompt: () => Promise.resolve(undefined),
@@ -314,6 +348,7 @@ function PerformanceReview() {
     <TooltipProvider>
       <Profiler id="issue-5-production-ui" onRender={profile}>
         <InboxWorkspace
+          activities={activities}
           actionError={undefined}
           conversationAdapter={adapter}
           conversationRevision={0}
@@ -325,6 +360,7 @@ function PerformanceReview() {
           onOpenTerminal={() => Promise.resolve(undefined)}
           onQueryChange={() => undefined}
           onRemoveProject={() => Promise.resolve(undefined)}
+          onRenameChat={() => Promise.resolve(undefined)}
           onRequestCodexSignIn={() => undefined}
           onRetrySetup={() => Promise.resolve(undefined)}
           onSelectChat={setSelectedChatId}

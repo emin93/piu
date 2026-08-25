@@ -5,11 +5,13 @@ use ts_rs::TS;
 
 use crate::{
     chat_runtime_host::{
-        ChatRuntimeChangedEvent, ChatRuntimeHost, ChatRuntimeHostError, ConversationSnapshot,
+        ChatRuntimeChangedEvent, ChatRuntimeHost, ChatRuntimeHostError, ConversationInputAnswer,
+        ConversationSnapshot,
     },
     chat_workspaces::ChatWorkspaceError,
     pi_rpc::PiRpcError,
     project_inbox::ProjectInboxError,
+    prompt_attachments::{PromptAttachment, PromptAttachmentError},
 };
 
 pub const CHAT_RUNTIME_CHANGED_EVENT: &str = "chat-runtime://changed";
@@ -35,6 +37,8 @@ pub struct ConversationPromptRequest {
     pub chat_id: String,
     pub streaming_behavior: ConversationStreamingBehavior,
     pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<PromptAttachment>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -43,6 +47,15 @@ pub struct ConversationPromptRequest {
 pub struct ChatRuntimeMessageRequest {
     pub chat_id: String,
     pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct AnswerConversationInputRequest {
+    pub chat_id: String,
+    pub request_id: String,
+    pub answer: ConversationInputAnswer,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -57,6 +70,10 @@ pub enum ChatRuntimeCommandErrorCode {
     AuthenticationRequired,
     ConversationFailed,
     StorageUnavailable,
+    InvalidAttachment,
+    ModelMediaUnsupported,
+    InputNotPending,
+    InvalidInputAnswer,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -78,9 +95,28 @@ impl From<ChatRuntimeHostError> for ChatRuntimeCommandError {
                 code: ChatRuntimeCommandErrorCode::NotActive,
                 message: "Open the chat before sending that action.".into(),
             },
+            ChatRuntimeHostError::InputNotPending { .. } => Self {
+                code: ChatRuntimeCommandErrorCode::InputNotPending,
+                message: "That question is no longer waiting for an answer.".into(),
+            },
+            ChatRuntimeHostError::InvalidInputAnswer => Self {
+                code: ChatRuntimeCommandErrorCode::InvalidInputAnswer,
+                message: "Choose one of the answers shown by Pi.".into(),
+            },
             ChatRuntimeHostError::SetupIncomplete { .. } => Self {
                 code: ChatRuntimeCommandErrorCode::SetupIncomplete,
                 message: "Finish the repository setup before starting the agent.".into(),
+            },
+            ChatRuntimeHostError::Attachment(PromptAttachmentError::ModelMediaUnsupported) => {
+                Self {
+                    code: ChatRuntimeCommandErrorCode::ModelMediaUnsupported,
+                    message: "The selected model doesn’t accept image attachments.".into(),
+                }
+            }
+            ChatRuntimeHostError::Attachment(_) => Self {
+                code: ChatRuntimeCommandErrorCode::InvalidAttachment,
+                message: "One of those attachments is no longer valid. Remove it and try again."
+                    .into(),
             },
             ChatRuntimeHostError::Workspace(ChatWorkspaceError::Inbox(
                 ProjectInboxError::ChatNotFound { .. },
@@ -189,7 +225,7 @@ pub async fn send_chat_message(
     host: State<'_, ChatRuntimeHost>,
     request: ConversationPromptRequest,
 ) -> Result<(), ChatRuntimeCommandError> {
-    host.send(&request.chat_id, &request.text)
+    host.send_with_attachments(&request.chat_id, &request.text, &request.attachments)
         .await
         .map_err(Into::into)
 }
@@ -210,6 +246,16 @@ pub async fn abort_chat_turn(
     request: OpenChatRuntimeRequest,
 ) -> Result<(), ChatRuntimeCommandError> {
     host.abort(&request.chat_id).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn answer_conversation_input(
+    host: State<'_, ChatRuntimeHost>,
+    request: AnswerConversationInputRequest,
+) -> Result<(), ChatRuntimeCommandError> {
+    host.answer_input(&request.chat_id, &request.request_id, request.answer)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]

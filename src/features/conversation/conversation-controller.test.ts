@@ -12,10 +12,11 @@ test("the controller connects once and always sends active messages as steering"
     emit = onEvent;
     return Promise.resolve({
       disconnect,
-      snapshot: { phase: "running", items: [], failure: null } as const,
+      snapshot: { failure: null, inputRequest: null, items: [], phase: "running" } as const,
     });
   });
   const adapter: ConversationAdapter = {
+    answerInput: vi.fn().mockResolvedValue(undefined),
     connect,
     prompt,
     stop: vi.fn().mockResolvedValue(undefined),
@@ -25,11 +26,19 @@ test("the controller connects once and always sends active messages as steering"
   await controller.connect();
   await controller.send("  Keep the tests focused.  ");
   emit?.({
+    beforeItemId: null,
     type: "item-added",
-    item: { id: "assistant-1", kind: "message", role: "assistant", text: "On it." },
+    item: {
+      id: "assistant-1",
+      kind: "message",
+      queued: false,
+      role: "assistant",
+      text: "On it.",
+    },
   });
 
   expect(prompt).toHaveBeenCalledWith({
+    attachments: [],
     chatId: "chat-42",
     text: "Keep the tests focused.",
     streamingBehavior: "steer",

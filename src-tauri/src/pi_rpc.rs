@@ -75,6 +75,13 @@ pub struct PiRpcDiagnostics {
     pub stderr_was_truncated: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PiRpcExtensionUiResponse {
+    Value(String),
+    Confirmed(bool),
+    Cancelled,
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum PiRpcError {
     #[error("Pi child executable and working directory must use absolute paths")]
@@ -259,6 +266,49 @@ impl PiRpcChild {
     ) -> Result<PiRpcResponse, PiRpcError> {
         self.request_with_timeout(command, cancellation, self.request_timeout)
             .await
+    }
+
+    pub async fn respond_extension_ui(
+        &self,
+        request_id: &str,
+        response: PiRpcExtensionUiResponse,
+    ) -> Result<(), PiRpcError> {
+        if request_id.is_empty() {
+            return Err(PiRpcError::InvalidCommand(
+                "an extension UI response needs Pi's request id".into(),
+            ));
+        }
+        if let Some(error) = self.shared.terminal_error() {
+            return Err(error);
+        }
+        let mut command = serde_json::json!({
+            "type": "extension_ui_response",
+            "id": request_id,
+        });
+        let object = command
+            .as_object_mut()
+            .expect("the fixed extension UI response is an object");
+        match response {
+            PiRpcExtensionUiResponse::Value(value) => {
+                object.insert("value".into(), Value::String(value));
+            }
+            PiRpcExtensionUiResponse::Confirmed(confirmed) => {
+                object.insert("confirmed".into(), Value::Bool(confirmed));
+            }
+            PiRpcExtensionUiResponse::Cancelled => {
+                object.insert("cancelled".into(), Value::Bool(true));
+            }
+        }
+        let mut frame = serde_json::to_vec(&command)
+            .map_err(|error| PiRpcError::InvalidCommand(error.to_string()))?;
+        frame.push(b'\n');
+        match timeout(self.request_timeout, self.shared.writer.send(frame)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(self.shared.terminal_error().unwrap_or(PiRpcError::Stopped)),
+            Err(_) => Err(PiRpcError::RequestTimedOut {
+                command: "extension_ui_response".into(),
+            }),
+        }
     }
 
     pub fn diagnostics(&self) -> PiRpcDiagnostics {

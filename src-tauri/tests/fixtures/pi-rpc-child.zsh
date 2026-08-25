@@ -77,6 +77,16 @@ while IFS= read -r line; do
   id="$(request_id "$line")"
   type="$(request_type "$line")"
   case "$mode" in
+    extension-ui)
+      if [[ "$type" == "extension_ui_response" ]]; then
+        print -r -- "$line" > "$record_dir/extension-ui-response"
+      else
+        if [[ "$type" == "begin_extension_ui" ]]; then
+          printf '{"type":"extension_ui_request","id":"extension-request-17","method":"select","title":"Choose","options":["Keep both","Replace"]}\n'
+        fi
+        printf '{"id":"%s","type":"response","command":"%s","success":true,"data":{"accepted":true}}\n' "$id" "$type"
+      fi
+      ;;
     normal|stderr-burst|graceful-descendant)
       printf '{"type":"agent_start","fixture":"event-before-response"}\n'
       printf '{"id":"%s","type":"response","command":"%s","success":true,"data":{"accepted":true}}\n' "$id" "$type"

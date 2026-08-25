@@ -5,10 +5,13 @@ import type { ChatRuntimeChangedEvent } from "../generated/ChatRuntimeChangedEve
 import type { ChatRuntimeCommandError } from "../generated/ChatRuntimeCommandError";
 import type { ChatRuntimeCommandErrorCode } from "../generated/ChatRuntimeCommandErrorCode";
 import type { ConversationEvent as NativeConversationEvent } from "../generated/ConversationEvent";
+import type { ConversationInputAnswer } from "../generated/ConversationInputAnswer";
+import type { ConversationInputRequest } from "../generated/ConversationInputRequest";
 import type { ConversationItem as NativeConversationItem } from "../generated/ConversationItem";
 import type { ConversationPromptRequest as NativeConversationPromptRequest } from "../generated/ConversationPromptRequest";
 import type { ConversationSnapshot as NativeConversationSnapshot } from "../generated/ConversationSnapshot";
 import type { OpenChatRuntimeRequest } from "../generated/OpenChatRuntimeRequest";
+import type { PromptAttachment } from "../generated/PromptAttachment";
 
 const CHAT_RUNTIME_CHANGED_EVENT = "chat-runtime://changed";
 const CHAT_RUNTIME_ERROR_CODES = new Set<ChatRuntimeCommandErrorCode>([
@@ -20,16 +23,21 @@ const CHAT_RUNTIME_ERROR_CODES = new Set<ChatRuntimeCommandErrorCode>([
   "authenticationRequired",
   "conversationFailed",
   "storageUnavailable",
+  "invalidAttachment",
+  "modelMediaUnsupported",
+  "inputNotPending",
+  "invalidInputAnswer",
 ]);
 
 export interface ConversationMessage {
   id: string;
   kind: "message";
+  queued: boolean;
   role: "user" | "assistant";
   text: string;
 }
 
-export type ConversationToolStatus = "running" | "succeeded" | "failed";
+export type ConversationToolStatus = "running" | "succeeded" | "failed" | "interrupted";
 
 export interface ConversationTool {
   detail: string;
@@ -56,10 +64,11 @@ export interface ConversationUsage {
 export type ConversationItem =
   ConversationMessage | ConversationReasoning | ConversationTool | ConversationUsage;
 
-export type ConversationPhase = "idle" | "running" | "stopped" | "failed";
+export type ConversationPhase = "idle" | "running" | "stopped" | "failed" | "interrupted";
 
 export interface ConversationSnapshot {
   failure: string | null;
+  inputRequest: ConversationInputRequest | null;
   items: readonly ConversationItem[];
   phase: ConversationPhase;
 }
@@ -71,8 +80,15 @@ export interface ConversationTextDelta {
 }
 
 export interface ConversationItemAdded {
+  beforeItemId: string | null;
   item: ConversationItem;
   type: "item-added";
+}
+
+export interface ConversationMessageQueueChanged {
+  itemId: string;
+  queued: boolean;
+  type: "message-queue-changed";
 }
 
 export interface ConversationReasoningDelta {
@@ -101,8 +117,23 @@ export interface ConversationTurnStarted {
   type: "turn-started";
 }
 
+export interface ConversationInputRequested {
+  request: ConversationInputRequest;
+  type: "input-requested";
+}
+
+export interface ConversationInputResolved {
+  requestId: string;
+  type: "input-resolved";
+}
+
 export interface ConversationTurnStopped {
   type: "turn-stopped";
+}
+
+export interface ConversationTurnInterrupted {
+  message: string;
+  type: "turn-interrupted";
 }
 
 export interface ConversationUsageUpdate {
@@ -115,13 +146,17 @@ export interface ConversationUsageUpdate {
 
 export type ConversationEvent =
   | ConversationItemAdded
+  | ConversationMessageQueueChanged
   | ConversationReasoningDelta
   | ConversationTextDelta
   | ConversationToolUpdate
   | ConversationTurnCompleted
   | ConversationTurnFailed
+  | ConversationInputRequested
+  | ConversationInputResolved
   | ConversationTurnStarted
   | ConversationTurnStopped
+  | ConversationTurnInterrupted
   | ConversationUsageUpdate;
 
 export interface ConversationConnection {
@@ -130,6 +165,7 @@ export interface ConversationConnection {
 }
 
 export interface ConversationPromptRequest {
+  attachments: readonly PromptAttachment[];
   chatId: string;
   streamingBehavior: "steer";
   text: string;
@@ -141,8 +177,15 @@ export interface ConversationAdapter {
     onEvent: (event: ConversationEvent) => void,
   ) => Promise<ConversationConnection>;
   prompt: (request: ConversationPromptRequest) => Promise<void>;
+  answerInput: (
+    chatId: string,
+    requestId: string,
+    answer: ConversationInputAnswer,
+  ) => Promise<void>;
   stop: (chatId: string) => Promise<void>;
 }
+
+export type { ConversationInputAnswer, ConversationInputRequest };
 
 export function conversationErrorMessage(error: unknown, fallback: string) {
   if (
@@ -173,6 +216,7 @@ function mapNativeItem(item: NativeConversationItem): ConversationItem {
       return {
         id: item.id,
         kind: "message",
+        queued: item.queued,
         role: item.role,
         text: item.text,
       };
@@ -200,7 +244,17 @@ function mapNativeItem(item: NativeConversationItem): ConversationItem {
 function mapNativeEvent(event: NativeConversationEvent): ConversationEvent {
   switch (event.type) {
     case "item-added":
-      return { item: mapNativeItem(event.item), type: "item-added" };
+      return {
+        beforeItemId: event.beforeItemId,
+        item: mapNativeItem(event.item),
+        type: "item-added",
+      };
+    case "message-queue-changed":
+      return {
+        itemId: event.itemId,
+        queued: event.queued,
+        type: "message-queue-changed",
+      };
     case "text-delta":
       return { delta: event.delta, itemId: event.itemId, type: "text-delta" };
     case "reasoning-delta":
@@ -222,10 +276,16 @@ function mapNativeEvent(event: NativeConversationEvent): ConversationEvent {
       };
     case "turn-started":
       return { type: "turn-started" };
+    case "input-requested":
+      return { request: event.request, type: "input-requested" };
+    case "input-resolved":
+      return { requestId: event.requestId, type: "input-resolved" };
     case "turn-completed":
       return { type: "turn-completed" };
     case "turn-stopped":
       return { type: "turn-stopped" };
+    case "turn-interrupted":
+      return { message: event.message, type: "turn-interrupted" };
     case "turn-failed":
       return { message: event.message, type: "turn-failed" };
   }
@@ -234,6 +294,7 @@ function mapNativeEvent(event: NativeConversationEvent): ConversationEvent {
 function mapNativeSnapshot(snapshot: NativeConversationSnapshot): ConversationSnapshot {
   return {
     failure: snapshot.failure,
+    inputRequest: snapshot.inputRequest,
     items: snapshot.items.map(mapNativeItem),
     phase: snapshot.phase,
   };
@@ -277,11 +338,27 @@ export const tauriConversationAdapter: ConversationAdapter = {
     };
   },
   prompt(request) {
-    const nativeRequest: NativeConversationPromptRequest = request;
+    const nativeRequest: NativeConversationPromptRequest = {
+      ...request,
+      attachments: [...request.attachments],
+    };
     return invoke<void>("send_chat_message", { request: nativeRequest });
+  },
+  answerInput(chatId, requestId, answer) {
+    return invoke<void>("answer_conversation_input", {
+      request: { answer, chatId, requestId },
+    });
   },
   stop(chatId) {
     const request: OpenChatRuntimeRequest = { chatId };
     return invoke<void>("abort_chat_turn", { request });
   },
 };
+
+export async function listenToConversationEvents(
+  onEvent: (chatId: string, event: ConversationEvent) => void,
+) {
+  return listen<ChatRuntimeChangedEvent>(CHAT_RUNTIME_CHANGED_EVENT, ({ payload }) => {
+    onEvent(payload.chatId, mapNativeEvent(payload.event));
+  });
+}

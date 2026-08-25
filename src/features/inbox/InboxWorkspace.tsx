@@ -2,6 +2,7 @@ import {
   ChevronDownIcon,
   FolderPlusIcon,
   MoreHorizontalIcon,
+  PencilIcon,
   SearchIcon,
   SettingsIcon,
   Trash2Icon,
@@ -32,6 +33,20 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -44,8 +59,10 @@ import { Separator } from "@/components/ui/separator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ChatSummary, InboxSnapshot, ProjectSummary } from "@/platform/project-inbox";
 import type { ConversationAdapter } from "@/platform/conversations";
+import type { PromptAttachment } from "@/platform/prompt-attachments";
 
 import { ChatComposer } from "./ChatComposer";
+import { ChatActivityController } from "./chat-activity-controller";
 import { EmptyInbox } from "./EmptyInbox";
 import { type DraftPersistenceStatus, ProjectDraftController } from "./draft-controller";
 import { composerProject, selectInbox } from "./inbox-model";
@@ -55,17 +72,23 @@ import { SidebarResizeHandle } from "./SidebarResizeHandle";
 
 interface InboxWorkspaceProps {
   actionError: string | undefined;
+  activities: ChatActivityController;
   conversationAdapter: ConversationAdapter;
   conversationRevision: number;
   drafts: ProjectDraftController;
   onCancelSetup: (chatId: string) => Promise<string | undefined>;
-  onCreateChat: (projectId: number, prompt: string) => Promise<string | undefined>;
+  onCreateChat: (
+    projectId: number,
+    prompt: string,
+    attachments: readonly PromptAttachment[],
+  ) => Promise<string | undefined>;
   onOpenRepository: () => void;
   onOpenTerminal: (chatId: string) => Promise<string | undefined>;
   onOpenSettings: () => void;
   onRequestCodexSignIn: () => void;
   onQueryChange: (query: string) => void;
   onRemoveProject: (projectId: number) => Promise<string | undefined>;
+  onRenameChat: (chatId: string, title: string) => Promise<string | undefined>;
   onRetrySetup: (chatId: string) => Promise<string | undefined>;
   onSelectChat: (chatId: string) => void;
   onSelectProject: (projectId: number | null) => void;
@@ -220,51 +243,111 @@ function SelectedChatStage({
 }
 
 const ChatRow = memo(function ChatRow({
+  activities,
   chat,
+  onRename,
   onSelect,
   selected,
   setups,
 }: {
+  activities: ChatActivityController;
   chat: ChatSummary;
+  onRename: (trigger: HTMLButtonElement) => void;
   onSelect: () => void;
   selected: boolean;
   setups: ChatSetupController;
 }) {
+  const selectTriggerRef = useRef<HTMLButtonElement>(null);
   const subscribe = useCallback(
     (listener: () => void) => setups.subscribe(chat.id, listener),
     [chat.id, setups],
   );
   const getSnapshot = useCallback(() => setups.get(chat.id), [chat.id, setups]);
   const setup = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const activityStore = activities.chat(chat.id);
+  const activity = useSyncExternalStore(
+    activityStore.subscribe,
+    activityStore.getSnapshot,
+    activityStore.getSnapshot,
+  );
+  const rowPhase =
+    setup.phase === "succeeded" || setup.phase === "notRequired" ? activity.phase : setup.phase;
   return (
-    <li className="chat-row" data-chat-id={chat.id}>
-      <Button
-        aria-label={`${chat.title}, ${setup.phase}`}
-        aria-pressed={selected}
-        className="chat-row-select"
-        onClick={onSelect}
-        type="button"
-        variant="ghost"
-      >
-        <span aria-hidden="true" className="chat-setup-indicator" data-phase={setup.phase} />
-        <span className="chat-row-copy">
-          <span className="chat-row-title" title={chat.title}>
-            {chat.title}
-          </span>
-          <span className="chat-row-metadata">
-            <span>{chat.projectName}</span>
-            <span aria-hidden="true">/</span>
-            <span className="font-mono" title={chat.branchName}>
-              {chat.branchName}
+    <li
+      className="chat-row"
+      data-activity={activity.phase}
+      data-chat-id={chat.id}
+      data-unread={activity.unread || undefined}
+    >
+      <ContextMenu>
+        <ContextMenuTrigger className="chat-row-context-trigger">
+          <Button
+            aria-label={`${chat.title}, ${rowPhase}${activity.unread ? ", unread" : ""}`}
+            aria-pressed={selected}
+            className="chat-row-select"
+            onClick={onSelect}
+            ref={selectTriggerRef}
+            type="button"
+            variant="ghost"
+          >
+            <span aria-hidden="true" className="chat-setup-indicator" data-phase={rowPhase} />
+            <span className="chat-row-copy">
+              <span className="chat-row-title" id={`chat-${chat.id}-title`} title={chat.title}>
+                {chat.title}
+              </span>
+              <span className="chat-row-metadata">
+                <span>{chat.projectName}</span>
+                <span aria-hidden="true">/</span>
+                <span className="font-mono" title={chat.branchName}>
+                  {chat.branchName}
+                </span>
+              </span>
             </span>
-          </span>
-        </span>
-        {chat.pullRequestNumber !== null ? (
-          <Badge className="font-mono" variant="outline">
-            #{chat.pullRequestNumber}
-          </Badge>
-        ) : null}
-      </Button>
+            {chat.pullRequestNumber !== null ? (
+              <Badge className="font-mono" variant="outline">
+                #{chat.pullRequestNumber}
+              </Badge>
+            ) : null}
+          </Button>
+        </ContextMenuTrigger>
+        <ContextMenuContent className="w-40">
+          <ContextMenuItem
+            onClick={() => {
+              if (selectTriggerRef.current) onRename(selectTriggerRef.current);
+            }}
+          >
+            <PencilIcon aria-hidden="true" />
+            Rename chat
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
+
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button
+              aria-describedby={`chat-${chat.id}-title`}
+              aria-label="More chat actions"
+              className="chat-actions-trigger"
+              size="icon-sm"
+              type="button"
+              variant="ghost"
+            />
+          }
+        >
+          <MoreHorizontalIcon aria-hidden="true" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-40">
+          <DropdownMenuItem
+            onClick={() => {
+              if (selectTriggerRef.current) onRename(selectTriggerRef.current);
+            }}
+          >
+            <PencilIcon aria-hidden="true" />
+            Rename chat
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
     </li>
   );
 });
@@ -355,6 +438,7 @@ function SearchStage({ count }: { count: number }) {
 
 export function InboxWorkspace({
   actionError,
+  activities,
   conversationAdapter,
   conversationRevision,
   drafts,
@@ -366,6 +450,7 @@ export function InboxWorkspace({
   onRequestCodexSignIn,
   onQueryChange,
   onRemoveProject,
+  onRenameChat,
   onRetrySetup,
   onSelectChat,
   onSelectProject,
@@ -381,6 +466,12 @@ export function InboxWorkspace({
   const [removing, setRemoving] = useState(false);
   const removalCancelRef = useRef<HTMLButtonElement>(null);
   const removalTriggerRef = useRef<HTMLButtonElement>(null);
+  const [chatPendingRename, setChatPendingRename] = useState<ChatSummary>();
+  const [renameTitle, setRenameTitle] = useState("");
+  const [renameError, setRenameError] = useState<string>();
+  const [renaming, setRenaming] = useState(false);
+  const renameInputRef = useRef<HTMLInputElement>(null);
+  const renameTriggerRef = useRef<HTMLButtonElement>(null);
   const selection = useMemo(
     () => selectInbox(snapshot, { projectId: selectedProjectId, query }),
     [query, selectedProjectId, snapshot],
@@ -404,6 +495,21 @@ export function InboxWorkspace({
     else closeRemovalDialog();
   }, [closeRemovalDialog, onRemoveProject, projectPendingRemoval]);
 
+  const closeRenameDialog = useCallback(() => {
+    setChatPendingRename(undefined);
+    setRenameError(undefined);
+  }, []);
+
+  const confirmRename = useCallback(async () => {
+    if (!chatPendingRename || !renameTitle.trim()) return;
+    setRenaming(true);
+    setRenameError(undefined);
+    const error = await onRenameChat(chatPendingRename.id, renameTitle);
+    setRenaming(false);
+    if (error) setRenameError(error);
+    else closeRenameDialog();
+  }, [chatPendingRename, closeRenameDialog, onRenameChat, renameTitle]);
+
   const pendingRemovalHasDraft = projectPendingRemoval
     ? Boolean(drafts.get(projectPendingRemoval.id).prompt)
     : false;
@@ -414,7 +520,7 @@ export function InboxWorkspace({
       <aside
         aria-label="Chat inbox navigation"
         className="inbox-sidebar"
-        inert={projectPendingRemoval ? true : undefined}
+        inert={projectPendingRemoval || chatPendingRename ? true : undefined}
       >
         <div className="sidebar-header">
           <div className="sidebar-title-row">
@@ -518,8 +624,15 @@ export function InboxWorkspace({
                 <ul aria-label="Active chats" className="chat-list">
                   {selection.unmergedChats.map((chat) => (
                     <ChatRow
+                      activities={activities}
                       chat={chat}
                       key={chat.id}
+                      onRename={(trigger) => {
+                        renameTriggerRef.current = trigger;
+                        setRenameTitle(chat.title);
+                        setRenameError(undefined);
+                        setChatPendingRename(chat);
+                      }}
                       onSelect={() => onSelectChat(chat.id)}
                       selected={selectedChatId === chat.id}
                       setups={setups}
@@ -548,8 +661,15 @@ export function InboxWorkspace({
                   <ul aria-label="Merged chats" className="chat-list chat-list-merged">
                     {selection.mergedChats.map((chat) => (
                       <ChatRow
+                        activities={activities}
                         chat={chat}
                         key={chat.id}
+                        onRename={(trigger) => {
+                          renameTriggerRef.current = trigger;
+                          setRenameTitle(chat.title);
+                          setRenameError(undefined);
+                          setChatPendingRename(chat);
+                        }}
                         onSelect={() => onSelectChat(chat.id)}
                         selected={selectedChatId === chat.id}
                         setups={setups}
@@ -580,7 +700,7 @@ export function InboxWorkspace({
       <section
         aria-label="Chat workspace"
         className="conversation-stage"
-        inert={projectPendingRemoval ? true : undefined}
+        inert={projectPendingRemoval || chatPendingRename ? true : undefined}
       >
         {snapshot.projects.length === 0 ? (
           <EmptyInbox actionError={actionError} onOpenRepository={onOpenRepository} />
@@ -639,6 +759,68 @@ export function InboxWorkspace({
           </AlertDialogContent>
         ) : null}
       </AlertDialog>
+
+      <Dialog
+        onOpenChange={(open) => {
+          if (!open && !renaming) closeRenameDialog();
+        }}
+        open={Boolean(chatPendingRename)}
+      >
+        {chatPendingRename ? (
+          <DialogContent
+            finalFocus={renameTriggerRef}
+            initialFocus={renameInputRef}
+            showCloseButton={false}
+          >
+            <form
+              className="grid gap-4"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void confirmRename();
+              }}
+            >
+              <DialogHeader>
+                <DialogTitle>Rename chat</DialogTitle>
+                <DialogDescription>
+                  The branch and worktree keep their current names.
+                </DialogDescription>
+              </DialogHeader>
+              <label className="grid gap-1.5">
+                <span className="text-xs font-medium">Title</span>
+                <Input
+                  aria-invalid={Boolean(renameError)}
+                  maxLength={72}
+                  onChange={(event) => {
+                    setRenameTitle(event.target.value);
+                    setRenameError(undefined);
+                  }}
+                  onFocus={(event) => event.currentTarget.select()}
+                  ref={renameInputRef}
+                  value={renameTitle}
+                />
+              </label>
+              {renameError ? (
+                <p className="dialog-error" role="alert">
+                  {renameError}
+                </p>
+              ) : null}
+              <DialogFooter>
+                <Button
+                  disabled={renaming}
+                  onClick={closeRenameDialog}
+                  type="button"
+                  variant="outline"
+                >
+                  Cancel
+                </Button>
+                <Button disabled={renaming || !renameTitle.trim()} type="submit">
+                  {renaming ? "Saving" : "Save"}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        ) : null}
+      </Dialog>
     </main>
   );
 }

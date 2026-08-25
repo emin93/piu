@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, expect, test, vi } from "vitest";
 
 import { App } from "./App";
+import type { ConversationEvent } from "./platform/conversations";
 import { installMatchMedia } from "./test/match-media";
 
 const boundary = vi.hoisted(() => ({ verify: vi.fn() }));
@@ -36,9 +37,15 @@ const modelAssets = vi.hoisted(() => ({
   subscribe: vi.fn(),
 }));
 const conversationRuntime = vi.hoisted(() => ({
+  answerInput: vi.fn(),
   connect: vi.fn(),
+  listen: vi.fn(),
+  onEvent: undefined as ((chatId: string, event: ConversationEvent) => void) | undefined,
   prompt: vi.fn(),
   stop: vi.fn(),
+}));
+const promptAttachments = vi.hoisted(() => ({
+  select: vi.fn(),
 }));
 
 vi.mock("./platform/host-boundary", () => ({ verifyHostBoundary: boundary.verify }));
@@ -76,11 +83,17 @@ vi.mock("./platform/model-assets", async (importOriginal) => ({
 }));
 vi.mock("./platform/conversations", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./platform/conversations")>()),
+  listenToConversationEvents: conversationRuntime.listen,
   tauriConversationAdapter: {
+    answerInput: conversationRuntime.answerInput,
     connect: conversationRuntime.connect,
     prompt: conversationRuntime.prompt,
     stop: conversationRuntime.stop,
   },
+}));
+vi.mock("./platform/prompt-attachments", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./platform/prompt-attachments")>()),
+  selectPromptAttachments: promptAttachments.select,
 }));
 vi.mock("./features/auth/CodexSignInDialog", () => ({
   default: ({ onComplete, open }: { onComplete: () => void; open: boolean }) =>
@@ -131,7 +144,12 @@ beforeEach(() => {
   projectInbox.open.mockReset();
   projectInbox.remove.mockReset();
   projectInbox.saveDraft.mockReset();
-  projectInbox.saveDraft.mockResolvedValue({ projectId: 1, prompt: "", updatedAtMs: 1 });
+  projectInbox.saveDraft.mockResolvedValue({
+    attachments: [],
+    projectId: 1,
+    prompt: "",
+    updatedAtMs: 1,
+  });
   projectInbox.listen.mockReset();
   projectInbox.listen.mockResolvedValue(() => undefined);
   chatWorkspaces.cancel.mockReset();
@@ -153,11 +171,23 @@ beforeEach(() => {
   conversationRuntime.connect.mockReset();
   conversationRuntime.connect.mockResolvedValue({
     disconnect: vi.fn(),
-    snapshot: { failure: null, items: [], phase: "idle" },
+    snapshot: { failure: null, inputRequest: null, items: [], phase: "idle" },
   });
+  conversationRuntime.answerInput.mockReset();
+  conversationRuntime.answerInput.mockResolvedValue(undefined);
+  conversationRuntime.listen.mockReset();
+  conversationRuntime.onEvent = undefined;
+  conversationRuntime.listen.mockImplementation(
+    (onEvent: (chatId: string, event: ConversationEvent) => void) => {
+      conversationRuntime.onEvent = onEvent;
+      return Promise.resolve(() => undefined);
+    },
+  );
   conversationRuntime.prompt.mockReset();
   conversationRuntime.prompt.mockResolvedValue(undefined);
   conversationRuntime.stop.mockReset();
+  promptAttachments.select.mockReset();
+  promptAttachments.select.mockResolvedValue({ outcome: "cancelled" });
   conversationRuntime.stop.mockResolvedValue(undefined);
   windowLifecycle.resolveRequest = undefined;
   windowLifecycle.listen.mockReset();
@@ -205,6 +235,7 @@ test("Codex sign-in reconnects the selected chat without replacing it", async ()
           {
             id: "restored",
             kind: "message",
+            queued: false,
             role: "assistant",
             text: "Signed in and restored.",
           },
@@ -270,6 +301,7 @@ test("selecting a search result opens that chat and clears the query", async () 
         {
           id: "search-result",
           kind: "message",
+          queued: false,
           role: "assistant",
           text: "This is the selected chat.",
         },
@@ -289,6 +321,102 @@ test("selecting a search result opens that chat and clears the query", async () 
   expect(
     screen.getByText("Repair repository indexing", { selector: ".titlebar-context" }),
   ).toBeVisible();
+});
+
+test("background activity becomes unread without reordering chats and clears on selection", async () => {
+  installMatchMedia("light");
+  const setup = {
+    attempt: 1,
+    exitCode: 0,
+    failure: null,
+    log: "",
+    phase: "succeeded" as const,
+    signal: null,
+  };
+  projectInbox.load.mockResolvedValueOnce({
+    chats: [
+      {
+        branchName: "agent/newer",
+        createdAtMs: 20,
+        id: "chat-newer",
+        mergeState: "unmerged" as const,
+        projectId: 1,
+        projectName: "Atlas",
+        pullRequestNumber: null,
+        setup,
+        title: "Newer chat",
+      },
+      {
+        branchName: "agent/older",
+        createdAtMs: 10,
+        id: "chat-older",
+        mergeState: "unmerged" as const,
+        projectId: 1,
+        projectName: "Atlas",
+        pullRequestNumber: null,
+        setup,
+        title: "Older chat",
+      },
+    ],
+    drafts: [],
+    projects: [{ availability: "available", id: 1, name: "Atlas", unmergedChatCount: 2 }],
+  });
+  const user = userEvent.setup();
+
+  render(<App />);
+  const rows = await screen.findByRole("list", { name: "Active chats" });
+  expect(
+    Array.from(rows.querySelectorAll<HTMLElement>("[data-chat-id]")).map(
+      (row) => row.dataset.chatId,
+    ),
+  ).toEqual(["chat-newer", "chat-older"]);
+
+  act(() => {
+    conversationRuntime.onEvent?.("chat-older", {
+      request: {
+        id: "input-1",
+        kind: "confirm",
+        message: "Continue?",
+        options: [],
+        placeholder: null,
+        prefill: null,
+        title: "Confirm change",
+      },
+      type: "input-requested",
+    });
+  });
+
+  const olderRow = rows.querySelector<HTMLElement>('[data-chat-id="chat-older"]');
+  expect(olderRow).toHaveAttribute("data-activity", "needs-input");
+  expect(olderRow).toHaveAttribute("data-unread", "true");
+  expect(screen.getByRole("button", { name: "Older chat, needs-input, unread" })).toBeVisible();
+  expect(
+    Array.from(rows.querySelectorAll<HTMLElement>("[data-chat-id]")).map(
+      (row) => row.dataset.chatId,
+    ),
+  ).toEqual(["chat-newer", "chat-older"]);
+
+  await user.click(screen.getByRole("button", { name: "Older chat, needs-input, unread" }));
+  expect(olderRow).not.toHaveAttribute("data-unread");
+
+  const search = screen.getByRole("searchbox", { name: "Search chats" });
+  await user.type(search, "Older");
+  act(() => {
+    conversationRuntime.onEvent?.("chat-older", { type: "turn-completed" });
+  });
+  expect(rows.querySelector('[data-chat-id="chat-older"]')).toHaveAttribute("data-unread", "true");
+  await user.clear(search);
+  expect(rows.querySelector('[data-chat-id="chat-older"]')).not.toHaveAttribute("data-unread");
+
+  act(() => {
+    conversationRuntime.onEvent?.("chat-newer", {
+      message: "The Pi runtime stopped unexpectedly.",
+      type: "turn-interrupted",
+    });
+  });
+  const newerRow = rows.querySelector<HTMLElement>('[data-chat-id="chat-newer"]');
+  expect(newerRow).toHaveAttribute("data-activity", "interrupted");
+  expect(newerRow).toHaveAttribute("data-unread", "true");
 });
 
 test("first send creates a durable chat and moves into streamed setup", async () => {
@@ -324,7 +452,7 @@ test("first send creates a durable chat and moves into streamed setup", async ()
 
   await user.click(screen.getByRole("button", { name: "Send message" }));
 
-  expect(chatWorkspaces.create).toHaveBeenCalledWith(1, "Repair the parser");
+  expect(chatWorkspaces.create).toHaveBeenCalledWith(1, "Repair the parser", []);
   expect(await screen.findByRole("heading", { name: "Setting up worktree" })).toBeVisible();
   expect(screen.getByLabelText("Setup output")).toHaveTextContent("Installing dependencies");
   expect(screen.queryByRole("textbox", { name: "Draft for Atlas" })).not.toBeInTheDocument();
@@ -340,11 +468,61 @@ test("first send creates a durable chat and moves into streamed setup", async ()
   expect(screen.getByRole("button", { name: "Open Terminal" })).toBeVisible();
 });
 
+test("a selected attachment is previewed, persisted, and included in chat creation", async () => {
+  installMatchMedia("light");
+  const project = { id: 1, name: "Atlas", availability: "available", unmergedChatCount: 0 };
+  const attachment = {
+    content: "public boundary",
+    id: "attachment-notes",
+    kind: "text" as const,
+    mimeType: "text/plain",
+    name: "notes.txt",
+    sizeBytes: 15,
+  };
+  projectInbox.load.mockResolvedValueOnce({ projects: [project], drafts: [], chats: [] });
+  promptAttachments.select.mockResolvedValueOnce({
+    attachments: [attachment],
+    outcome: "selected",
+  });
+  const chat = {
+    id: "chat-attachment",
+    projectId: 1,
+    projectName: "Atlas",
+    title: "Use the notes",
+    branchName: "agent/chat-attachment",
+    pullRequestNumber: null,
+    createdAtMs: 10,
+    mergeState: "unmerged",
+    setup: {
+      phase: "pending",
+      failure: null,
+      exitCode: null,
+      signal: null,
+      attempt: 0,
+      log: "",
+    },
+  };
+  chatWorkspaces.create.mockResolvedValueOnce({
+    chat,
+    snapshot: { projects: [{ ...project, unmergedChatCount: 1 }], drafts: [], chats: [chat] },
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Attach files" }));
+  expect(screen.getByRole("list", { name: "Attached files" })).toHaveTextContent("notes.txt");
+  await waitFor(() => expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "", [attachment]));
+
+  await user.type(screen.getByRole("textbox", { name: "Draft for Atlas" }), "Use the notes");
+  await user.click(screen.getByRole("button", { name: "Send message" }));
+  expect(chatWorkspaces.create).toHaveBeenCalledWith(1, "Use the notes", [attachment]);
+});
+
 test("Settings preserves the selected project and its draft when returning to Inbox", async () => {
   installMatchMedia("light");
   projectInbox.load.mockResolvedValueOnce({
     projects: [{ id: 1, name: "Atlas", availability: "available", unmergedChatCount: 0 }],
-    drafts: [{ projectId: 1, prompt: "Keep this draft", updatedAtMs: 1 }],
+    drafts: [{ attachments: [], projectId: 1, prompt: "Keep this draft", updatedAtMs: 1 }],
     chats: [],
   });
   const user = userEvent.setup();
@@ -360,7 +538,7 @@ test("Settings preserves the selected project and its draft when returning to In
   const backToInbox = screen.getByRole("button", { name: "Back to Inbox" });
   await waitFor(() => expect(backToInbox).toHaveFocus());
   expect(screen.getByText("Settings", { selector: ".titlebar-context" })).toBeVisible();
-  expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Keep this draft while away");
+  expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Keep this draft while away", []);
 
   await user.click(backToInbox);
   expect(await screen.findByRole("textbox", { name: "Draft for Atlas" })).toHaveValue(
@@ -407,7 +585,7 @@ test("launch keeps All Projects selected and focuses the first available project
       { id: 1, name: "Atlas", availability: "available", unmergedChatCount: 0 },
       { id: 2, name: "Beacon", availability: "available", unmergedChatCount: 0 },
     ],
-    drafts: [{ projectId: 1, prompt: "Continue the parser work", updatedAtMs: 1 }],
+    drafts: [{ attachments: [], projectId: 1, prompt: "Continue the parser work", updatedAtMs: 1 }],
     chats: [],
   });
 
@@ -494,7 +672,9 @@ test("draft changes update immediately and cross the persistence boundary", asyn
 
   expect(screen.getByRole("textbox", { name: "Draft for Atlas" })).toHaveValue("Fix parsing");
   expect(screen.getByText("Saving")).toBeVisible();
-  await waitFor(() => expect(projectInbox.saveDraft).toHaveBeenLastCalledWith(1, "Fix parsing"));
+  await waitFor(() =>
+    expect(projectInbox.saveDraft).toHaveBeenLastCalledWith(1, "Fix parsing", []),
+  );
   expect(projectInbox.saveDraft).toHaveBeenCalledTimes(1);
   expect(await screen.findByText("Saved locally")).toBeVisible();
 });
@@ -513,7 +693,7 @@ test("draft navigation flushes the pending value before the debounce", async () 
   await user.type(screen.getByRole("textbox", { name: "Draft for Atlas" }), "Flush me");
   await user.click(screen.getByRole("button", { name: "All Projects, 1 project" }));
 
-  expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Flush me");
+  expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Flush me", []);
 });
 
 test("a native close waits for the pending draft flush and owned runtimes", async () => {
@@ -533,7 +713,7 @@ test("a native close waits for the pending draft flush and owned runtimes", asyn
   });
 
   expect(runtimeLifecycle.hasActive).toHaveBeenCalledOnce();
-  expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Close safely");
+  expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Close safely", []);
   expect(runtimeLifecycle.shutdown).toHaveBeenCalledOnce();
   expect(runtimeLifecycle.exit).toHaveBeenCalledOnce();
 });
@@ -577,7 +757,7 @@ test("confirming an active-turn close persists drafts, stops runtimes, and exits
   await user.click(await screen.findByRole("button", { name: "Stop and quit" }));
 
   await waitFor(() => expect(runtimeLifecycle.exit).toHaveBeenCalledOnce());
-  expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Close safely");
+  expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Close safely", []);
   expect(runtimeLifecycle.shutdown).toHaveBeenCalledOnce();
 });
 
@@ -684,6 +864,7 @@ test("the conversation visual review state opens the first chat", async () => {
         {
           id: "review-response",
           kind: "message",
+          queued: false,
           role: "assistant",
           text: "The packaged runtime is responding.",
         },

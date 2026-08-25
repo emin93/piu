@@ -2,4 +2,4 @@
 import type { ConversationRole } from "./ConversationRole";
 import type { ConversationToolStatus } from "./ConversationToolStatus";
 
-export type ConversationItem = { "kind": "message", id: string, role: ConversationRole, text: string, } | { "kind": "reasoning", id: string, text: string, } | { "kind": "tool", detail: string, id: string, name: string, status: ConversationToolStatus, } | { "kind": "usage", cacheReadTokens: number | null, id: string, inputTokens: number, outputTokens: number, };
+export type ConversationItem = { "kind": "message", id: string, queued: boolean, role: ConversationRole, text: string, } | { "kind": "reasoning", id: string, text: string, } | { "kind": "tool", detail: string, id: string, name: string, status: ConversationToolStatus, } | { "kind": "usage", cacheReadTokens: number | null, id: string, inputTokens: number, outputTokens: number, };

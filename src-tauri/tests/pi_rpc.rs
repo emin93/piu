@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use piu_lib::pi_rpc::{PiRpcChild, PiRpcError, PiRpcPolicy, PiRpcProcessSpec};
+use piu_lib::pi_rpc::{
+    PiRpcChild, PiRpcError, PiRpcExtensionUiResponse, PiRpcPolicy, PiRpcProcessSpec,
+};
 use serde_json::json;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -97,6 +99,59 @@ async fn readiness_command_and_events_cross_the_supervised_child_seam() {
             .unwrap()
             .trim(),
         "isolated"
+    );
+
+    child
+        .shutdown()
+        .await
+        .expect("child should stop gracefully");
+}
+
+#[tokio::test]
+async fn extension_ui_responses_preserve_pi_request_ids_without_creating_pending_requests() {
+    let fixture = TempDir::new().expect("fixture should be created");
+    let child = PiRpcChild::launch(fixture_spec(&fixture, "extension-ui"), test_policy())
+        .await
+        .expect("correlated get_state should establish readiness");
+    let mut events = child.subscribe();
+
+    child
+        .request(
+            json!({ "type": "begin_extension_ui" }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("fixture should acknowledge the trigger");
+
+    let event = events
+        .recv()
+        .await
+        .expect("fixture should request user input");
+    assert_eq!(event.kind, "extension_ui_request");
+    assert_eq!(event.payload["id"], "extension-request-17");
+
+    child
+        .respond_extension_ui(
+            "extension-request-17",
+            PiRpcExtensionUiResponse::Value("Keep both".into()),
+        )
+        .await
+        .expect("one-way UI response should be written without awaiting an acknowledgement");
+
+    let response = child
+        .request(
+            json!({ "type": "after_extension_ui" }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a later correlated request should remain healthy");
+    assert_eq!(response.command, "after_extension_ui");
+    assert_eq!(response.data, Some(json!({ "accepted": true })));
+    assert_eq!(
+        std::fs::read_to_string(fixture.path().join("extension-ui-response"))
+            .expect("fixture should record the response")
+            .trim(),
+        r#"{"id":"extension-request-17","type":"extension_ui_response","value":"Keep both"}"#
     );
 
     child

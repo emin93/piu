@@ -3,6 +3,11 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "
 
 import { ProductComposer } from "@/components/ProductComposer";
 import { Button } from "@/components/ui/button";
+import {
+  PromptAttachmentButton,
+  PromptAttachmentTray,
+} from "@/features/attachments/PromptAttachments";
+import type { PromptAttachment } from "@/platform/prompt-attachments";
 import type { ProjectSummary } from "@/platform/project-inbox";
 
 import { ProjectDraftController, type DraftPersistenceStatus } from "./draft-controller";
@@ -10,7 +15,11 @@ import { ProjectDraftController, type DraftPersistenceStatus } from "./draft-con
 interface ChatComposerProps {
   drafts: ProjectDraftController;
   layout?: "centered" | "docked";
-  onSubmit?: (projectId: number, prompt: string) => Promise<string | undefined>;
+  onSubmit?: (
+    projectId: number,
+    prompt: string,
+    attachments: readonly PromptAttachment[],
+  ) => Promise<string | undefined>;
   project: ProjectSummary;
 }
 
@@ -35,19 +44,31 @@ export function ChatComposer({
   );
   const getSnapshot = useCallback(() => drafts.get(project.id), [drafts, project.id]);
   const draft = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
-  const hasRetainedDraft = !available && Boolean(draft.prompt.trim());
+  const hasRetainedDraft =
+    !available && (Boolean(draft.prompt.trim()) || draft.attachments.length > 0);
   const [submitting, setSubmitting] = useState(false);
   const [submissionError, setSubmissionError] = useState<string>();
+  const [attachmentError, setAttachmentError] = useState<string>();
 
   const submit = useCallback(async () => {
     const prompt = draft.prompt.trim();
-    if (!onSubmit || !prompt || submitting) return;
+    if (!onSubmit || (!prompt && draft.attachments.length === 0) || submitting) return;
     setSubmitting(true);
     setSubmissionError(undefined);
-    const error = await onSubmit(project.id, prompt);
+    const error = await onSubmit(project.id, prompt, draft.attachments);
     setSubmitting(false);
     if (error) setSubmissionError(error);
-  }, [draft.prompt, onSubmit, project.id, submitting]);
+  }, [draft.attachments, draft.prompt, onSubmit, project.id, submitting]);
+
+  const removeAttachment = useCallback(
+    (attachmentId: string) => {
+      drafts.changeAttachments(
+        project.id,
+        draft.attachments.filter((attachment) => attachment.id !== attachmentId),
+      );
+    },
+    [draft.attachments, drafts, project.id],
+  );
 
   useEffect(() => {
     if (!available) return;
@@ -79,10 +100,19 @@ export function ChatComposer({
 
       {available ? (
         <ProductComposer
+          attachments={
+            <PromptAttachmentTray
+              attachments={draft.attachments}
+              disabled={submitting}
+              onRemove={removeAttachment}
+            />
+          }
           actions={
             <Button
               aria-label="Send message"
-              disabled={!onSubmit || !draft.prompt.trim() || submitting}
+              disabled={
+                !onSubmit || (!draft.prompt.trim() && draft.attachments.length === 0) || submitting
+              }
               size="icon"
               type="submit"
             >
@@ -92,7 +122,7 @@ export function ChatComposer({
           ariaDescribedBy="draft-persistence-status"
           ariaLabel={`Draft for ${project.name}`}
           error={
-            draft.status.state === "failed" || submissionError
+            draft.status.state === "failed" || submissionError || attachmentError
               ? {
                   action:
                     draft.status.state === "failed" ? (
@@ -109,13 +139,23 @@ export function ChatComposer({
                     <>
                       {draft.status.state === "failed" ? <span>{draft.status.message}</span> : null}
                       {submissionError ? <span>{submissionError}</span> : null}
+                      {attachmentError ? <span>{attachmentError}</span> : null}
                     </>
                   ),
                 }
               : undefined
           }
           inputRef={textareaRef}
+          inputReadOnly={submitting}
           layout={layout}
+          leadingActions={
+            <PromptAttachmentButton
+              attachments={draft.attachments}
+              disabled={submitting}
+              onChange={(attachments) => drafts.changeAttachments(project.id, attachments)}
+              onError={setAttachmentError}
+            />
+          }
           onSubmit={() => void submit()}
           onValueChange={(value) => drafts.change(project.id, value)}
           placeholder="Describe what you want to change"
@@ -132,6 +172,7 @@ export function ChatComposer({
         />
       ) : hasRetainedDraft ? (
         <ProductComposer
+          attachments={<PromptAttachmentTray attachments={draft.attachments} />}
           ariaLabel={`Retained draft for ${project.name}`}
           layout={layout}
           readOnly

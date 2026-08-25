@@ -19,6 +19,7 @@ const CURRENT_SCHEMA: &str = r#"
     CREATE TABLE IF NOT EXISTS chat_drafts (
         project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
         prompt TEXT NOT NULL,
+        attachments_json TEXT NOT NULL,
         updated_at_ms INTEGER NOT NULL
     );
 
@@ -51,6 +52,7 @@ const CURRENT_SCHEMA: &str = r#"
         setup_signal INTEGER,
         setup_attempt INTEGER NOT NULL,
         setup_log TEXT NOT NULL,
+        initial_attachments_json TEXT NOT NULL,
         pi_session_id TEXT UNIQUE,
         pi_session_path TEXT UNIQUE,
         CHECK (
@@ -73,6 +75,7 @@ const CURRENT_SCHEMA: &str = r#"
         project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
         project_name TEXT NOT NULL,
         prompt TEXT NOT NULL,
+        attachments_json TEXT NOT NULL,
         title TEXT NOT NULL,
         branch_name TEXT NOT NULL UNIQUE,
         worktree_path TEXT NOT NULL UNIQUE,
