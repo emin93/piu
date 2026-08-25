@@ -1354,7 +1354,11 @@ impl ChatRuntimeHost {
             } else if should_start {
                 ConversationPhase::Running
             } else if stored_session.is_some() {
-                ConversationPhase::Stopped
+                if persisted_turn_completed(&messages) {
+                    ConversationPhase::Idle
+                } else {
+                    ConversationPhase::Stopped
+                }
             } else {
                 ConversationPhase::Idle
             },
@@ -2157,6 +2161,25 @@ fn first_user_text(messages: &[Value]) -> Option<String> {
             .then(|| message_content_text(message.get("content")))
             .flatten()
     })
+}
+
+fn persisted_turn_completed(messages: &[Value]) -> bool {
+    messages
+        .iter()
+        .rev()
+        .find(|message| {
+            matches!(
+                message.get("role").and_then(Value::as_str),
+                Some("user" | "assistant")
+            )
+        })
+        .is_some_and(|message| {
+            message.get("role").and_then(Value::as_str) == Some("assistant")
+                && !matches!(
+                    message.get("stopReason").and_then(Value::as_str),
+                    Some("aborted" | "error")
+                )
+        })
 }
 
 fn message_content_text(content: Option<&Value>) -> Option<String> {
