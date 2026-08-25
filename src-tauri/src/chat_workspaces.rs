@@ -57,6 +57,12 @@ pub struct ChatTerminalRequest {
     pub chat_id: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ChatAgentLaunchContext {
+    pub worktree_path: PathBuf,
+    pub setup: ChatSetupSummary,
+}
+
 #[derive(Debug, Error)]
 pub enum ChatWorkspaceError {
     #[error("the first message cannot be empty")]
@@ -401,6 +407,17 @@ impl ChatWorkspaces {
         self.validate_chat_workspace(chat_id)?;
         Ok(ChatTerminalRequest {
             chat_id: chat_id.to_owned(),
+        })
+    }
+
+    pub(crate) fn agent_launch_context(
+        &self,
+        chat_id: &str,
+    ) -> Result<ChatAgentLaunchContext, ChatWorkspaceError> {
+        let (ownership, _) = self.validate_chat_workspace(chat_id)?;
+        Ok(ChatAgentLaunchContext {
+            worktree_path: ownership.worktree_path,
+            setup: self.inbox.chat_setup(chat_id)?,
         })
     }
 
@@ -1007,15 +1024,24 @@ mod tests {
         remote: PathBuf,
     }
 
+    fn isolated_git_command(executable: &str) -> Command {
+        let mut command = Command::new(executable);
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_COUNT", "0");
+        command
+    }
+
     impl RemoteFixture {
         fn new() -> Self {
             let root = tempfile::tempdir().expect("temporary Git fixture");
             let working = root.path().join("working");
             let remote = root.path().join("remote.git");
-            run(Command::new("/usr/bin/git")
+            run(isolated_git_command("/usr/bin/git")
                 .args(["init", "--bare", "--initial-branch=main"])
                 .arg(&remote));
-            run(Command::new("/usr/bin/git")
+            run(isolated_git_command("/usr/bin/git")
                 .args(["init", "--initial-branch=main"])
                 .arg(&working));
             let fixture = Self {
@@ -1043,7 +1069,7 @@ mod tests {
         }
 
         fn git_command(&self) -> Command {
-            let mut command = Command::new("/usr/bin/git");
+            let mut command = isolated_git_command("/usr/bin/git");
             command.arg("-C").arg(&self.working);
             command
         }
@@ -1165,39 +1191,39 @@ mod tests {
             .fetch_origin_main(&fixture.remote.working)
             .unwrap();
         let publisher = tempfile::tempdir().unwrap();
-        run(Command::new("/usr/bin/git")
+        run(isolated_git_command("/usr/bin/git")
             .arg("clone")
             .arg(&fixture.remote.remote)
             .arg(publisher.path()));
-        run(Command::new("/usr/bin/git")
+        run(isolated_git_command("/usr/bin/git")
             .args(["-C"])
             .arg(publisher.path())
             .args(["config", "user.name", "Publisher"]));
-        run(Command::new("/usr/bin/git")
+        run(isolated_git_command("/usr/bin/git")
             .args(["-C"])
             .arg(publisher.path())
             .args(["config", "user.email", "publisher@example.invalid"]));
         fs::write(publisher.path().join("fresh.txt"), "fresh\n").unwrap();
-        run(Command::new("/usr/bin/git")
+        run(isolated_git_command("/usr/bin/git")
             .args(["-C"])
             .arg(publisher.path())
             .args(["add", "fresh.txt"]));
-        run(Command::new("/usr/bin/git")
+        run(isolated_git_command("/usr/bin/git")
             .args(["-C"])
             .arg(publisher.path())
             .args(["commit", "-m", "fresh remote commit"]));
-        run(Command::new("/usr/bin/git")
+        run(isolated_git_command("/usr/bin/git")
             .args(["-C"])
             .arg(publisher.path())
             .args(["push", "origin", "main"]));
-        let remote_head = run(Command::new("/usr/bin/git")
+        let remote_head = run(isolated_git_command("/usr/bin/git")
             .arg("--git-dir")
             .arg(&fixture.remote.remote)
             .args(["rev-parse", "refs/heads/main"]));
 
         let created = fixture.create("Repair parser ownership now");
         let worktree = fixture.worktrees.join(&created.chat.id);
-        let worktree_head = run(Command::new("/usr/bin/git")
+        let worktree_head = run(isolated_git_command("/usr/bin/git")
             .arg("-C")
             .arg(&worktree)
             .args(["rev-parse", "HEAD"]));
@@ -1264,7 +1290,7 @@ mod tests {
         let fixture = WorkspaceFixture::new(RemoteFixture::new());
         let original_repository = fixture.remote.working.with_extension("opened-repository");
         fs::rename(&fixture.remote.working, &original_repository).unwrap();
-        run(Command::new("/usr/bin/git")
+        run(isolated_git_command("/usr/bin/git")
             .arg("clone")
             .arg(&fixture.remote.remote)
             .arg(&fixture.remote.working));
@@ -1592,7 +1618,7 @@ mod tests {
             .unwrap();
         let original_repository = fixture.remote.working.with_extension("original-source");
         fs::rename(&fixture.remote.working, &original_repository).unwrap();
-        run(Command::new("/usr/bin/git")
+        run(isolated_git_command("/usr/bin/git")
             .arg("clone")
             .arg(&fixture.remote.remote)
             .arg(&fixture.remote.working));

@@ -279,8 +279,7 @@
 }
 
 .sidebar-error,
-.dialog-error,
-.composer-error {
+.dialog-error {
   margin: 0;
   color: var(--destructive);
   font-size: 11px;
@@ -393,8 +392,12 @@
   white-space: nowrap;
 }
 
+.project-row-name,
+.draft-row-prompt {
+  color: var(--sidebar-foreground);
+}
+
 .project-row-name {
-  color: inherit;
   font-size: 12px;
   font-weight: 540;
 }
@@ -519,6 +522,7 @@
 }
 
 .chat-row-copy {
+  display: grid;
   min-width: 0;
 }
 
@@ -548,6 +552,18 @@
 .chat-row-metadata span:first-child {
   flex: none;
   max-width: 42%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-row-metadata span:nth-child(2) {
+  flex: none;
+}
+
+.chat-row-metadata span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .sidebar-zero-copy {
@@ -584,15 +600,25 @@
   z-index: 2;
   width: 4px;
   height: 100%;
-  background: var(--sidebar-border);
+  background: transparent;
   cursor: col-resize;
   touch-action: none;
 }
 
 .sidebar-resize-handle::after {
   position: absolute;
-  inset: 0 -2px;
+  top: 0;
+  bottom: 0;
+  left: 1px;
+  width: 1px;
+  background: var(--sidebar-border);
   content: "";
+}
+
+html[data-inbox-sidebar-resizing] {
+  cursor: col-resize;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .sidebar-resize-handle::before {
@@ -637,6 +663,7 @@
 
 .composer-stage[data-composer-layout="docked"] {
   align-self: end;
+  width: min(48rem, calc(100% - 64px));
   margin-bottom: 24px;
   transform: translateY(0);
 }
@@ -689,52 +716,67 @@
   text-overflow: ellipsis;
 }
 
-.composer-shell {
+.product-composer {
+  width: 100%;
   overflow: hidden;
   border: 1px solid var(--input);
   border-radius: 12px;
   background: var(--card);
   box-shadow:
     0 1px 0 color-mix(in oklab, var(--foreground) 4%, transparent),
-    0 8px 16px color-mix(in oklab, var(--foreground) 5%, transparent);
+    0 8px 20px color-mix(in oklab, var(--foreground) 5%, transparent);
 }
 
-.composer-shell:focus-within {
+.product-composer[data-composer-layout="docked"] {
+  width: min(48rem, 100%);
+  margin-inline: auto;
+}
+
+.product-composer:focus-within {
   border-color: color-mix(in oklab, var(--ring) 72%, var(--input));
   box-shadow:
     0 0 0 2px color-mix(in oklab, var(--ring) 22%, transparent),
-    0 8px 16px color-mix(in oklab, var(--foreground) 5%, transparent);
+    0 8px 20px color-mix(in oklab, var(--foreground) 5%, transparent);
 }
 
-.composer-input {
+.product-composer-input {
   min-height: 104px;
   resize: none;
   border: 0;
   border-radius: 0;
   background: transparent;
   padding: 12px 16px 8px;
+  color: var(--foreground);
+  caret-color: var(--foreground);
   font-family: var(--font-sans);
   font-size: 14px;
   line-height: 1.48;
   box-shadow: none;
 }
 
-.composer-input:focus-visible {
+.product-composer[data-composer-layout="docked"] .product-composer-input {
+  min-height: 72px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.product-composer-input:focus-visible {
   border: 0;
   box-shadow: none;
 }
 
-.composer-shell-readonly {
+.product-composer[data-composer-readonly="true"] {
   background: color-mix(in oklab, var(--card) 72%, var(--background));
   box-shadow: none;
 }
 
-.composer-shell-readonly .composer-input {
+.product-composer[data-composer-readonly="true"] .product-composer-input {
   color: var(--muted-foreground);
 }
 
-.composer-footer {
+.product-composer-footer {
   display: flex;
+  gap: 12px;
   align-items: center;
   justify-content: space-between;
   min-height: 40px;
@@ -743,16 +785,36 @@
   font-size: 11px;
 }
 
-.composer-error {
+.product-composer-status {
+  min-width: 0;
+}
+
+.product-composer-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.product-composer-error {
   display: flex;
   gap: 8px;
   align-items: center;
   justify-content: space-between;
+  margin: 0;
   padding: 0 16px 12px;
+  color: var(--destructive);
+  font-size: 11px;
+  line-height: 1.45;
 }
 
-.composer-error > span {
+.product-composer-error-copy {
+  display: grid;
+  gap: 8px;
   min-width: 0;
+}
+
+.product-composer-error-copy > span {
+  display: block;
 }
 
 .setup-stage {
@@ -915,6 +977,34 @@
 .startup-loading-copy {
   display: grid;
   gap: 8px;
+}
+
+.lazy-dialog-backdrop {
+  position: fixed;
+  z-index: 50;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: color-mix(in oklab, var(--foreground) 45%, transparent);
+}
+
+.lazy-dialog-card {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  background: var(--popover);
+  padding: 14px 16px;
+  color: var(--muted-foreground);
+  box-shadow: 0 16px 42px color-mix(in oklab, var(--foreground) 14%, transparent);
+  font-size: 12px;
+}
+
+.lazy-dialog-card svg {
+  width: 14px;
+  height: 14px;
+  animation: setup-spin 0.8s linear infinite;
 }
 
 .deferred-workspace .conversation-stage {

@@ -206,6 +206,8 @@ impl From<ProjectInboxError> for ProjectCommandError {
             ProjectInboxError::AppData(_)
             | ProjectInboxError::Database(_)
             | ProjectInboxError::DatabaseLock
+            | ProjectInboxError::ChatSessionAlreadyBound { .. }
+            | ProjectInboxError::InvalidChatSessionReference { .. }
             | ProjectInboxError::SystemClock => Self {
                 code: ProjectCommandErrorCode::StorageUnavailable,
                 message: "Più couldn’t save this change. Try again.".into(),

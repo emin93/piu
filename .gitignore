@@ -8,6 +8,10 @@ dist/
 coverage/
 src-tauri/gen/
 src-tauri/target/
+src-tauri/vendor/agent-runtime/.agent-runtime-staging-*/
+src-tauri/vendor/agent-runtime/.cache/
+src-tauri/vendor/agent-runtime/runtime/
+src-tauri/vendor/agent-runtime/runtime.previous-*/
 
 work/
 outputs/

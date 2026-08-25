@@ -1,0 +1,6 @@
+{
+  "build": {
+    "beforeBuildCommand": "npx tsc -p scripts/performance/tsconfig.json && npm exec vite -- build --config scripts/performance/issue-5.vite.config.ts",
+    "frontendDist": "../work/issue-5-performance-dist"
+  }
+}

@@ -7,9 +7,14 @@ import { installMatchMedia } from "./test/match-media";
 
 const boundary = vi.hoisted(() => ({ verify: vi.fn() }));
 const repositoryPicker = vi.hoisted(() => ({ open: vi.fn() }));
+const runtimeLifecycle = vi.hoisted(() => ({
+  exit: vi.fn(),
+  hasActive: vi.fn(),
+  shutdown: vi.fn(),
+}));
 const windowLifecycle = vi.hoisted(() => ({
-  beforeClose: undefined as (() => Promise<void>) | undefined,
   listen: vi.fn(),
+  resolveRequest: undefined as (() => Promise<void>) | undefined,
 }));
 const projectInbox = vi.hoisted(() => ({
   listen: vi.fn(),
@@ -30,10 +35,20 @@ const modelAssets = vi.hoisted(() => ({
   status: vi.fn(),
   subscribe: vi.fn(),
 }));
+const conversationRuntime = vi.hoisted(() => ({
+  connect: vi.fn(),
+  prompt: vi.fn(),
+  stop: vi.fn(),
+}));
 
 vi.mock("./platform/host-boundary", () => ({ verifyHostBoundary: boundary.verify }));
 vi.mock("./platform/repository-picker", () => ({
   selectRepositoryDirectory: repositoryPicker.open,
+}));
+vi.mock("./platform/runtime-lifecycle", () => ({
+  exitApplication: runtimeLifecycle.exit,
+  hasActiveAgentTurn: runtimeLifecycle.hasActive,
+  shutdownRuntimeProcesses: runtimeLifecycle.shutdown,
 }));
 vi.mock("./platform/window-lifecycle", () => ({
   listenToWindowClose: windowLifecycle.listen,
@@ -58,6 +73,22 @@ vi.mock("./platform/model-assets", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./platform/model-assets")>()),
   getModelAssetStatus: modelAssets.status,
   subscribeToModelAssetStatus: modelAssets.subscribe,
+}));
+vi.mock("./platform/conversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./platform/conversations")>()),
+  tauriConversationAdapter: {
+    connect: conversationRuntime.connect,
+    prompt: conversationRuntime.prompt,
+    stop: conversationRuntime.stop,
+  },
+}));
+vi.mock("./features/auth/CodexSignInDialog", () => ({
+  default: ({ onComplete, open }: { onComplete: () => void; open: boolean }) =>
+    open ? (
+      <button onClick={onComplete} type="button">
+        Complete test sign-in
+      </button>
+    ) : null,
 }));
 
 const emptySnapshot = { projects: [], drafts: [], chats: [] };
@@ -89,6 +120,12 @@ beforeEach(() => {
   });
   repositoryPicker.open.mockReset();
   repositoryPicker.open.mockResolvedValue(null);
+  runtimeLifecycle.hasActive.mockReset();
+  runtimeLifecycle.hasActive.mockResolvedValue(false);
+  runtimeLifecycle.shutdown.mockReset();
+  runtimeLifecycle.shutdown.mockResolvedValue(undefined);
+  runtimeLifecycle.exit.mockReset();
+  runtimeLifecycle.exit.mockResolvedValue(undefined);
   projectInbox.load.mockReset();
   projectInbox.load.mockResolvedValue(emptySnapshot);
   projectInbox.open.mockReset();
@@ -113,12 +150,145 @@ beforeEach(() => {
   modelAssets.status.mockResolvedValue(missingModel);
   modelAssets.subscribe.mockReset();
   modelAssets.subscribe.mockResolvedValue(() => undefined);
-  windowLifecycle.beforeClose = undefined;
+  conversationRuntime.connect.mockReset();
+  conversationRuntime.connect.mockResolvedValue({
+    disconnect: vi.fn(),
+    snapshot: { failure: null, items: [], phase: "idle" },
+  });
+  conversationRuntime.prompt.mockReset();
+  conversationRuntime.prompt.mockResolvedValue(undefined);
+  conversationRuntime.stop.mockReset();
+  conversationRuntime.stop.mockResolvedValue(undefined);
+  windowLifecycle.resolveRequest = undefined;
   windowLifecycle.listen.mockReset();
-  windowLifecycle.listen.mockImplementation((beforeClose: () => Promise<void>) => {
-    windowLifecycle.beforeClose = beforeClose;
+  windowLifecycle.listen.mockImplementation((resolveRequest: () => Promise<void>) => {
+    windowLifecycle.resolveRequest = resolveRequest;
     return Promise.resolve(() => undefined);
   });
+});
+
+test("Codex sign-in reconnects the selected chat without replacing it", async () => {
+  installMatchMedia("light");
+  const chat = {
+    id: "chat-auth",
+    projectId: 1,
+    projectName: "Atlas",
+    title: "Continue with Codex",
+    branchName: "agent/chat-auth",
+    pullRequestNumber: null,
+    createdAtMs: 10,
+    mergeState: "unmerged" as const,
+    setup: {
+      phase: "succeeded" as const,
+      failure: null,
+      exitCode: 0,
+      signal: null,
+      attempt: 1,
+      log: "",
+    },
+  };
+  projectInbox.load.mockResolvedValueOnce({
+    projects: [{ id: 1, name: "Atlas", availability: "available", unmergedChatCount: 1 }],
+    drafts: [],
+    chats: [chat],
+  });
+  conversationRuntime.connect
+    .mockResolvedValueOnce({
+      disconnect: vi.fn(),
+      snapshot: { failure: null, items: [], phase: "stopped" },
+    })
+    .mockResolvedValueOnce({
+      disconnect: vi.fn(),
+      snapshot: {
+        failure: null,
+        items: [
+          {
+            id: "restored",
+            kind: "message",
+            role: "assistant",
+            text: "Signed in and restored.",
+          },
+        ],
+        phase: "idle",
+      },
+    });
+  conversationRuntime.prompt.mockRejectedValueOnce({
+    code: "authenticationRequired",
+    message: "Sign in to Codex to continue this conversation.",
+  });
+  const user = userEvent.setup();
+
+  render(<App />);
+  await user.click(await screen.findByRole("button", { name: /Continue with Codex/ }));
+  expect(screen.getByText("Continue with Codex", { selector: ".titlebar-context" })).toBeVisible();
+  const composer = await screen.findByRole("textbox", { name: "Message Più" });
+  await user.type(composer, "Keep this while signing in.");
+  await user.click(screen.getByRole("button", { name: "Send message" }));
+  await user.click(await screen.findByRole("button", { name: "Sign in to Codex" }));
+  await user.click(await screen.findByRole("button", { name: "Complete test sign-in" }));
+
+  expect(await screen.findByText("Signed in and restored.")).toBeVisible();
+  expect(screen.getByRole("textbox", { name: "Message Più" })).toHaveValue(
+    "Keep this while signing in.",
+  );
+  expect(conversationRuntime.connect).toHaveBeenCalledTimes(2);
+  expect(conversationRuntime.connect).toHaveBeenNthCalledWith(1, "chat-auth", expect.any(Function));
+  expect(conversationRuntime.connect).toHaveBeenNthCalledWith(2, "chat-auth", expect.any(Function));
+  expect(screen.queryByRole("button", { name: "Complete test sign-in" })).not.toBeInTheDocument();
+});
+
+test("selecting a search result opens that chat and clears the query", async () => {
+  installMatchMedia("light");
+  const chat = {
+    id: "chat-search",
+    projectId: 1,
+    projectName: "Atlas",
+    title: "Repair repository indexing",
+    branchName: "agent/chat-search",
+    pullRequestNumber: null,
+    createdAtMs: 10,
+    mergeState: "unmerged" as const,
+    setup: {
+      phase: "succeeded" as const,
+      failure: null,
+      exitCode: 0,
+      signal: null,
+      attempt: 1,
+      log: "",
+    },
+  };
+  projectInbox.load.mockResolvedValueOnce({
+    projects: [{ id: 1, name: "Atlas", availability: "available", unmergedChatCount: 1 }],
+    drafts: [],
+    chats: [chat],
+  });
+  conversationRuntime.connect.mockResolvedValueOnce({
+    disconnect: vi.fn(),
+    snapshot: {
+      failure: null,
+      items: [
+        {
+          id: "search-result",
+          kind: "message",
+          role: "assistant",
+          text: "This is the selected chat.",
+        },
+      ],
+      phase: "idle",
+    },
+  });
+  const user = userEvent.setup();
+
+  render(<App />);
+  const search = await screen.findByRole("searchbox", { name: "Search chats" });
+  await user.type(search, "indexing");
+  await user.click(screen.getByRole("button", { name: /Repair repository indexing/ }));
+
+  expect(search).toHaveValue("");
+  expect(await screen.findByText("This is the selected chat.")).toBeVisible();
+  expect(
+    screen.getByText("Repair repository indexing", { selector: ".titlebar-context" }),
+  ).toBeVisible();
 });
 
 test("first send creates a durable chat and moves into streamed setup", async () => {
@@ -346,7 +516,7 @@ test("draft navigation flushes the pending value before the debounce", async () 
   expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Flush me");
 });
 
-test("a native close waits for the pending draft flush", async () => {
+test("a native close waits for the pending draft flush and owned runtimes", async () => {
   installMatchMedia("light");
   projectInbox.load.mockResolvedValueOnce({
     projects: [{ id: 1, name: "Atlas", availability: "available", unmergedChatCount: 0 }],
@@ -359,10 +529,56 @@ test("a native close waits for the pending draft flush", async () => {
   await user.type(screen.getByRole("textbox", { name: "Draft for Atlas" }), "Close safely");
 
   await act(async () => {
-    await windowLifecycle.beforeClose?.();
+    await windowLifecycle.resolveRequest?.();
   });
 
+  expect(runtimeLifecycle.hasActive).toHaveBeenCalledOnce();
   expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Close safely");
+  expect(runtimeLifecycle.shutdown).toHaveBeenCalledOnce();
+  expect(runtimeLifecycle.exit).toHaveBeenCalledOnce();
+});
+
+test("cancelling an active-turn close leaves the agent and window running", async () => {
+  installMatchMedia("light");
+  runtimeLifecycle.hasActive.mockResolvedValue(true);
+  const user = userEvent.setup();
+  render(<App />);
+
+  await act(async () => {
+    await windowLifecycle.resolveRequest?.();
+  });
+
+  expect(await screen.findByRole("alertdialog")).toHaveTextContent(
+    "Active agent work will be stopped",
+  );
+  await user.click(screen.getByRole("button", { name: "Keep working" }));
+
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+  expect(runtimeLifecycle.shutdown).not.toHaveBeenCalled();
+  expect(runtimeLifecycle.exit).not.toHaveBeenCalled();
+});
+
+test("confirming an active-turn close persists drafts, stops runtimes, and exits the app", async () => {
+  installMatchMedia("light");
+  runtimeLifecycle.hasActive.mockResolvedValue(true);
+  projectInbox.load.mockResolvedValueOnce({
+    projects: [{ id: 1, name: "Atlas", availability: "available", unmergedChatCount: 0 }],
+    drafts: [],
+    chats: [],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.click(await screen.findByRole("button", { name: /Atlas, available/ }));
+  await user.type(screen.getByRole("textbox", { name: "Draft for Atlas" }), "Close safely");
+
+  await act(async () => {
+    await windowLifecycle.resolveRequest?.();
+  });
+  await user.click(await screen.findByRole("button", { name: "Stop and quit" }));
+
+  await waitFor(() => expect(runtimeLifecycle.exit).toHaveBeenCalledOnce());
+  expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Close safely");
+  expect(runtimeLifecycle.shutdown).toHaveBeenCalledOnce();
 });
 
 test("a failed draft save never claims the draft is saved", async () => {
@@ -381,7 +597,7 @@ test("a failed draft save never claims the draft is saved", async () => {
 
   expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't save this draft");
   expect(screen.queryByText("Saved locally")).not.toBeInTheDocument();
-  await expect(windowLifecycle.beforeClose?.()).rejects.toThrow("could not be saved");
+  await expect(windowLifecycle.resolveRequest?.()).rejects.toThrow("could not be saved");
 });
 
 test("a repository picker failure is explained in product language", async () => {
@@ -404,14 +620,82 @@ test("the shell verifies the typed host boundary without exposing internals", as
   expect(screen.queryByText(/core ready|schema 1/i)).not.toBeInTheDocument();
 });
 
+test("every visible titlebar surface remains a native window drag region", async () => {
+  installMatchMedia("light");
+
+  render(<App />);
+
+  await screen.findByRole("main", { name: "Più inbox" });
+  const titlebar = document.querySelector<HTMLElement>(".titlebar");
+  expect(titlebar).toHaveAttribute("data-tauri-drag-region");
+  expect(titlebar?.querySelectorAll("*:not([data-tauri-drag-region])")).toHaveLength(0);
+});
+
 test("startup presents a stable non-interactive loading state", () => {
   installMatchMedia("light");
 
-  render(<App visualReviewStartup="loading" />);
+  render(<App visualReviewState="loading" />);
 
   expect(screen.getByRole("status")).toHaveTextContent("Opening your inbox");
   expect(screen.queryByRole("button", { name: "Open Repository" })).not.toBeInTheDocument();
   expect(boundary.verify).not.toHaveBeenCalled();
+});
+
+test("the close confirmation has a deterministic visual review state", async () => {
+  installMatchMedia("light");
+
+  render(<App visualReviewState="closeConfirmation" />);
+
+  expect(await screen.findByRole("alertdialog")).toHaveTextContent("Stop active work and quit?");
+  expect(screen.getByRole("button", { name: "Keep working" })).toBeEnabled();
+});
+
+test("the conversation visual review state opens the first chat", async () => {
+  installMatchMedia("light");
+  projectInbox.load.mockResolvedValueOnce({
+    projects: [{ id: 1, name: "Atlas", availability: "available", unmergedChatCount: 1 }],
+    drafts: [],
+    chats: [
+      {
+        id: "chat-review",
+        projectId: 1,
+        projectName: "Atlas",
+        title: "Review the runtime",
+        branchName: "agent/chat-review",
+        pullRequestNumber: null,
+        createdAtMs: 10,
+        mergeState: "unmerged" as const,
+        setup: {
+          phase: "succeeded" as const,
+          failure: null,
+          exitCode: 0,
+          signal: null,
+          attempt: 1,
+          log: "",
+        },
+      },
+    ],
+  });
+  conversationRuntime.connect.mockResolvedValueOnce({
+    disconnect: vi.fn(),
+    snapshot: {
+      failure: null,
+      items: [
+        {
+          id: "review-response",
+          kind: "message",
+          role: "assistant",
+          text: "The packaged runtime is responding.",
+        },
+      ],
+      phase: "running",
+    },
+  });
+
+  render(<App visualReviewState="conversation" />);
+
+  expect(await screen.findByText("The packaged runtime is responding.")).toBeVisible();
+  expect(conversationRuntime.connect).toHaveBeenCalledWith("chat-review", expect.any(Function));
 });
 
 test("a host startup failure offers a retry in product language", async () => {

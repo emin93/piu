@@ -3,5 +3,13 @@
   "identifier": "default",
   "description": "Capabilities for the Più main window",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": [
+    "core:default",
+    "clipboard-manager:allow-write-text",
+    "dialog:allow-open",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://*" }]
+    }
+  ]
 }

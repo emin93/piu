@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "../../node_modules/.cache/tsconfig.performance.tsbuildinfo",
+    "types": ["node"]
+  },
+  "include": [
+    "../../src/vite-env.d.ts",
+    "issue-5/**/*.d.ts",
+    "issue-5/**/*.tsx",
+    "issue-5.vite.config.ts"
+  ]
+}

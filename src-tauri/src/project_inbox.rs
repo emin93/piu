@@ -108,6 +108,12 @@ pub struct ChatSummary {
     pub setup: ChatSetupSummary,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatSessionReference {
+    pub id: String,
+    pub path: PathBuf,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../src/generated/")]
@@ -144,6 +150,10 @@ pub enum ProjectInboxError {
     ProjectNotFound { project_id: i64 },
     #[error("chat {chat_id} does not exist")]
     ChatNotFound { chat_id: String },
+    #[error("chat {chat_id} is already bound to another Pi session")]
+    ChatSessionAlreadyBound { chat_id: String },
+    #[error("chat {chat_id} received an invalid Pi session reference")]
+    InvalidChatSessionReference { chat_id: String },
     #[error("project has {count} unmerged chats")]
     ProjectHasUnmergedChats { count: u32 },
     #[error("could not prepare application data: {0}")]
@@ -842,7 +852,107 @@ impl ProjectInbox {
         })
     }
 
-    #[cfg(test)]
+    pub fn chat_session(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<ChatSessionReference>, ProjectInboxError> {
+        self.with_database(|database| {
+            let stored = database
+                .connection()
+                .query_row(
+                    "SELECT pi_session_id, pi_session_path FROM chats WHERE id = ?1",
+                    [chat_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(DatabaseError::Query)?
+                .ok_or_else(|| ProjectInboxError::ChatNotFound {
+                    chat_id: chat_id.to_owned(),
+                })?;
+            match stored {
+                (None, None) => Ok(None),
+                (Some(id), Some(path)) => Ok(Some(ChatSessionReference {
+                    id,
+                    path: PathBuf::from(path),
+                })),
+                _ => Err(ProjectInboxError::Database(DatabaseError::Query(
+                    rusqlite::Error::InvalidQuery,
+                ))),
+            }
+        })
+    }
+
+    pub fn bind_chat_session(
+        &self,
+        chat_id: &str,
+        session_id: &str,
+        session_path: &Path,
+    ) -> Result<ChatSessionReference, ProjectInboxError> {
+        if session_id.is_empty() || !session_path.is_absolute() {
+            return Err(ProjectInboxError::InvalidChatSessionReference {
+                chat_id: chat_id.to_owned(),
+            });
+        }
+        let session_path = session_path.to_str().ok_or_else(|| {
+            ProjectInboxError::InvalidChatSessionReference {
+                chat_id: chat_id.to_owned(),
+            }
+        })?;
+        self.with_database(|database| {
+            let connection = database.connection_mut();
+            let transaction = connection.transaction().map_err(DatabaseError::Query)?;
+            let stored = transaction
+                .query_row(
+                    "SELECT pi_session_id, pi_session_path FROM chats WHERE id = ?1",
+                    [chat_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(DatabaseError::Query)?
+                .ok_or_else(|| ProjectInboxError::ChatNotFound {
+                    chat_id: chat_id.to_owned(),
+                })?;
+            match stored {
+                (Some(stored_id), Some(stored_path))
+                    if stored_id == session_id && stored_path == session_path => {}
+                (Some(_), Some(_)) => {
+                    return Err(ProjectInboxError::ChatSessionAlreadyBound {
+                        chat_id: chat_id.to_owned(),
+                    });
+                }
+                (None, None) => {
+                    transaction
+                        .execute(
+                            "UPDATE chats SET pi_session_id = ?2, pi_session_path = ?3
+                             WHERE id = ?1 AND pi_session_id IS NULL AND pi_session_path IS NULL",
+                            params![chat_id, session_id, session_path],
+                        )
+                        .map_err(DatabaseError::Query)?;
+                }
+                _ => {
+                    return Err(ProjectInboxError::Database(DatabaseError::Query(
+                        rusqlite::Error::InvalidQuery,
+                    )));
+                }
+            }
+            transaction.commit().map_err(DatabaseError::Query)?;
+            Ok(ChatSessionReference {
+                id: session_id.to_owned(),
+                path: PathBuf::from(session_path),
+            })
+        })
+    }
+
     pub(crate) fn first_user_message(&self, chat_id: &str) -> Result<String, ProjectInboxError> {
         self.with_database(|database| {
             database
@@ -887,6 +997,10 @@ impl ProjectInbox {
         chat_id: &str,
     ) -> Result<ChatSetupSummary, ProjectInboxError> {
         self.finish_setup(chat_id, ChatSetupPhase::NotRequired, None, None, None)
+    }
+
+    pub(crate) fn chat_setup(&self, chat_id: &str) -> Result<ChatSetupSummary, ProjectInboxError> {
+        self.with_database(|database| load_chat_setup(database.connection(), chat_id))
     }
 
     pub(crate) fn append_setup_log(

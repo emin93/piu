@@ -1,0 +1,269 @@
+.codex-auth {
+  display: grid;
+  width: min(100%, 440px);
+  gap: 18px;
+  color: var(--foreground);
+  container: codex-auth / inline-size;
+}
+
+.codex-auth__header {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.codex-auth__header h2,
+.codex-auth__header p,
+.codex-auth__notice p,
+.codex-auth__progress p,
+.codex-auth__terminal p,
+.codex-auth__prompt-label,
+.codex-auth__device p {
+  margin: 0;
+}
+
+.codex-auth__header h2 {
+  margin-top: 1px;
+  font-size: 15px;
+  font-weight: 620;
+  letter-spacing: -0.02em;
+}
+
+.codex-auth__header p {
+  max-width: 48ch;
+  margin-top: 3px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 1.48;
+}
+
+.codex-auth__mark {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in oklab, var(--card) 86%, var(--muted));
+  box-shadow: 0 1px 2px color-mix(in oklab, var(--foreground) 8%, transparent);
+}
+
+.codex-auth__mark svg {
+  width: 17px;
+  height: 17px;
+}
+
+.codex-auth__updates,
+.codex-auth__prompt,
+.codex-auth__prompt-form {
+  display: grid;
+  gap: 10px;
+}
+
+.codex-auth__notice,
+.codex-auth__device,
+.codex-auth__terminal {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in oklab, var(--card) 82%, var(--muted));
+}
+
+.codex-auth__notice {
+  display: flex;
+  min-height: 42px;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 8px 7px 11px;
+}
+
+.codex-auth__notice p {
+  min-width: 0;
+  color: var(--secondary-foreground);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.codex-auth__inline-actions,
+.codex-auth__device-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.codex-auth__device {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.codex-auth__device-code {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.codex-auth__device code {
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 610;
+  letter-spacing: 0.08em;
+}
+
+.codex-auth__device p {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.codex-auth__progress {
+  display: flex;
+  min-height: 30px;
+  gap: 8px;
+  align-items: center;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.codex-auth__spinner {
+  display: inline-grid;
+  flex: none;
+  width: 14px;
+  height: 14px;
+  place-items: center;
+  animation: codex-auth-spin 900ms linear infinite;
+}
+
+.codex-auth__spinner svg {
+  width: 100%;
+  height: 100%;
+}
+
+.codex-auth__prompt-label,
+.codex-auth__field label {
+  color: var(--secondary-foreground);
+  font-size: 12px;
+  font-weight: 560;
+  line-height: 1.4;
+}
+
+.codex-auth__choices,
+.codex-auth__field {
+  display: grid;
+  gap: 6px;
+}
+
+.codex-auth__choice {
+  width: 100%;
+  height: auto;
+  min-height: 46px;
+  justify-content: space-between;
+  padding: 7px 10px;
+  text-align: left;
+}
+
+.codex-auth__choice-copy {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.codex-auth__choice-copy strong,
+.codex-auth__choice-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.codex-auth__choice-copy strong {
+  font-size: 12px;
+  font-weight: 580;
+}
+
+.codex-auth__choice-copy small {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 430;
+}
+
+.codex-auth__choice-arrow {
+  color: var(--muted-foreground);
+}
+
+.codex-auth__prompt-form {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+}
+
+.codex-auth__terminal {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  padding: 11px;
+}
+
+.codex-auth__terminal > svg {
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  color: var(--muted-foreground);
+}
+
+.codex-auth__terminal[data-kind="complete"] > svg {
+  color: var(--success);
+}
+
+.codex-auth__terminal[data-kind="failed"] > svg {
+  color: var(--destructive);
+}
+
+.codex-auth__terminal strong {
+  display: block;
+  font-size: 12px;
+  font-weight: 590;
+}
+
+.codex-auth__terminal p {
+  margin-top: 2px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.codex-auth__error {
+  margin: -6px 0 0;
+  color: var(--destructive);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.codex-auth__footer {
+  display: flex;
+  min-height: 28px;
+  justify-content: flex-end;
+}
+
+@keyframes codex-auth-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@container codex-auth (max-width: 380px) {
+  .codex-auth__notice,
+  .codex-auth__device-code {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .codex-auth__prompt-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .codex-auth__prompt-form > button,
+  .codex-auth__device-actions > button {
+    width: 100%;
+  }
+}
