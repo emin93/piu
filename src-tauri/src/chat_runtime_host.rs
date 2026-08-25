@@ -153,6 +153,10 @@ pub enum ConversationEvent {
         before_item_id: Option<String>,
         item: ConversationItem,
     },
+    ItemRemoved {
+        #[serde(rename = "itemId")]
+        item_id: String,
+    },
     MessageQueueChanged {
         #[serde(rename = "itemId")]
         item_id: String,
@@ -628,16 +632,6 @@ impl ChatRuntimeHost {
                 projection.snapshot.phase == ConversationPhase::Running,
             )
         };
-        if let Err(error) = child.request(command, CancellationToken::new()).await {
-            let mut active = slot.active.lock().map_err(|_| ChatRuntimeHostError::Lock)?;
-            if let Some(active) = active.as_mut().filter(|active| {
-                Arc::ptr_eq(&active.child, &child)
-                    && active.command_generation == command_generation
-            }) {
-                active.command_generation = active.command_generation.wrapping_add(1);
-            }
-            return Err(error.into());
-        }
         let item_id = format!("message-{expected_index}");
         let (turn_started, item_added) = {
             let mut projection = slot
@@ -656,7 +650,7 @@ impl ChatRuntimeHost {
                 None
             } else {
                 let item = ConversationItem::Message {
-                    id: item_id,
+                    id: item_id.clone(),
                     queued: was_running,
                     role: ConversationRole::User,
                     text: text.to_owned(),
@@ -692,6 +686,73 @@ impl ChatRuntimeHost {
                     },
                 );
             }
+        }
+        if let Err(error) = child.request(command, CancellationToken::new()).await {
+            {
+                let mut active = slot.active.lock().map_err(|_| ChatRuntimeHostError::Lock)?;
+                if let Some(active) = active.as_mut().filter(|active| {
+                    Arc::ptr_eq(&active.child, &child)
+                        && active.command_generation == command_generation
+                }) {
+                    active.command_generation = active.command_generation.wrapping_add(1);
+                }
+            }
+            let (removed, failed) = {
+                let mut projection = slot
+                    .projection
+                    .lock()
+                    .map_err(|_| ChatRuntimeHostError::Lock)?;
+                let pending_index = projection
+                    .pending_user_items
+                    .iter()
+                    .position(|(pending_id, _)| pending_id == &item_id);
+                let removed = if let Some(pending_index) = pending_index {
+                    projection.pending_user_items.remove(pending_index);
+                    if let Some(item_index) = projection
+                        .snapshot
+                        .items
+                        .iter()
+                        .position(|item| item.id() == item_id)
+                    {
+                        projection.snapshot.items.remove(item_index);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let failed = if was_running {
+                    false
+                } else {
+                    projection.snapshot.failure = Some(
+                        "Pi couldn’t accept that message. The conversation is still available."
+                            .into(),
+                    );
+                    projection.snapshot.phase = ConversationPhase::Failed;
+                    true
+                };
+                (removed, failed)
+            };
+            if removed {
+                self.emit(
+                    chat_id,
+                    ConversationEvent::ItemRemoved {
+                        item_id: item_id.clone(),
+                    },
+                );
+            }
+            if failed {
+                self.emit(
+                    chat_id,
+                    ConversationEvent::TurnFailed {
+                        message:
+                            "Pi couldn’t accept that message. The conversation is still available."
+                                .into(),
+                    },
+                );
+            }
+            return Err(error.into());
         }
         Ok(())
     }

@@ -12,7 +12,7 @@ import type { InboxSnapshot } from "@/platform/project-inbox";
 import "@/styles.css";
 import "./harness.css";
 
-const RESULT_PREFIX = "PIU_ISSUE_5_PERFORMANCE:";
+const RESULT_PREFIX = "PIU_CHAT_PERFORMANCE:";
 const CHAT_SWITCH_SAMPLES = 30;
 const NAVIGATION_SAMPLES = 30;
 const INPUT_SAMPLES = 60;
@@ -63,14 +63,7 @@ const snapshot: InboxSnapshot = {
     setup: readySetup,
     title: `Performance conversation ${index}`,
   })),
-  drafts: [
-    {
-      attachments: performanceAttachments,
-      projectId: 1,
-      prompt: "",
-      updatedAtMs: 1_730_000_000_000,
-    },
-  ],
+  drafts: [],
   projects: [{ availability: "available", id: 1, name: "Atlas", unmergedChatCount: 24 }],
 };
 
@@ -222,6 +215,17 @@ function PerformanceReview() {
         "the warm chat switch",
       );
       await afterPaint();
+      click(".project-row-select");
+      await waitFor(
+        () => Boolean(document.querySelector('textarea[aria-label="Draft for Atlas"]')),
+        "the warm project navigation",
+      );
+      click('[data-chat-id="performance-chat-0"] button');
+      await waitFor(
+        () => visibleText("Conversation marker performance-chat-0"),
+        "the warm conversation restore",
+      );
+      await afterPaint();
 
       setStatus("Measuring locally available chat switching");
       const chatSwitchSamples: number[] = [];
@@ -231,9 +235,9 @@ function PerformanceReview() {
         const startedAt = performance.now();
         click(`[data-chat-id="${chatId}"] button`);
         await waitFor(() => visibleText(`Conversation marker ${chatId}`), `chat switch ${index}`);
-        await nextFrame();
         chatSwitchSamples.push(performance.now() - startedAt);
         currentScenario.current = undefined;
+        await nextFrame();
       }
 
       setStatus("Measuring project/composer navigation");
@@ -246,9 +250,9 @@ function PerformanceReview() {
           () => Boolean(document.querySelector('textarea[aria-label="Draft for Atlas"]')),
           `composer navigation ${index}`,
         );
-        await nextFrame();
         navigationSamples.push(performance.now() - startedAt);
         currentScenario.current = undefined;
+        await nextFrame();
         click('[data-chat-id="performance-chat-0"] button');
         await waitFor(
           () => visibleText("Conversation marker performance-chat-0"),
@@ -256,6 +260,7 @@ function PerformanceReview() {
         );
       }
 
+      drafts.changeAttachments(1, performanceAttachments);
       click(".project-row-select");
       await waitFor(
         () => Boolean(document.querySelector('textarea[aria-label="Draft for Atlas"]')),
@@ -342,11 +347,11 @@ function PerformanceReview() {
       await writeText(`${RESULT_PREFIX}${JSON.stringify({ error: message })}`);
       setStatus(`Performance review failed: ${message}`);
     }
-  }, []);
+  }, [drafts]);
 
   return (
     <TooltipProvider>
-      <Profiler id="issue-5-production-ui" onRender={profile}>
+      <Profiler id="chat-production-ui" onRender={profile}>
         <InboxWorkspace
           activities={activities}
           actionError={undefined}

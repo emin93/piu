@@ -107,6 +107,17 @@ export class ConversationStore {
       return;
     }
 
+    if (event.type === "item-removed") {
+      if (!this.#items.delete(event.itemId)) return;
+      this.#snapshot = {
+        ...this.#snapshot,
+        itemIds: this.#snapshot.itemIds.filter((itemId) => itemId !== event.itemId),
+      };
+      for (const listener of this.#itemListeners.get(event.itemId) ?? []) listener();
+      for (const listener of this.#listeners) listener();
+      return;
+    }
+
     if (
       event.type === "turn-completed" ||
       event.type === "turn-failed" ||

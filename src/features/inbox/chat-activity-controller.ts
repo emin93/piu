@@ -23,17 +23,13 @@ export interface ChatActivityStore {
 }
 
 const IDLE_ACTIVITY: ChatActivitySnapshot = Object.freeze({ phase: "idle", unread: false });
-const NO_CHAT_IDS: readonly string[] = Object.freeze([]);
 
 export class ChatActivityController {
   readonly #listeners = new Map<string, Set<Listener>>();
   readonly #snapshots = new Map<string, ChatActivitySnapshot>();
   readonly #stores = new Map<string, ChatActivityStore>();
-  #knownChatIds = NO_CHAT_IDS;
   #knownChats = new Set<string>();
   #selectedChatId: string | null = null;
-
-  getKnownChatIds = () => this.#knownChatIds;
 
   chat(chatId: string): ChatActivityStore {
     const existing = this.#stores.get(chatId);
@@ -48,29 +44,14 @@ export class ChatActivityController {
 
   reconcile(chatIds: readonly string[]) {
     const incoming = new Set(chatIds);
-    const nextChatIds = this.#knownChatIds.filter((chatId) => incoming.has(chatId));
-    const retained = new Set(nextChatIds);
-    for (const chatId of chatIds) {
-      if (retained.has(chatId)) continue;
-      retained.add(chatId);
-      nextChatIds.push(chatId);
-    }
-    if (
-      nextChatIds.length === this.#knownChatIds.length &&
-      nextChatIds.every((chatId, index) => chatId === this.#knownChatIds[index])
-    ) {
-      return;
-    }
-
-    for (const chatId of this.#knownChatIds) {
-      if (retained.has(chatId)) continue;
+    for (const chatId of this.#knownChats) {
+      if (incoming.has(chatId)) continue;
       const previous = this.#snapshot(chatId);
       this.#snapshots.delete(chatId);
       if (previous !== IDLE_ACTIVITY) this.#notify(chatId);
     }
-    this.#knownChats = retained;
-    this.#knownChatIds = Object.freeze(nextChatIds);
-    if (this.#selectedChatId && !retained.has(this.#selectedChatId)) {
+    this.#knownChats = incoming;
+    if (this.#selectedChatId && !incoming.has(this.#selectedChatId)) {
       this.#selectedChatId = null;
     }
   }

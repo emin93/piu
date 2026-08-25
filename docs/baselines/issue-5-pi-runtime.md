@@ -20,7 +20,7 @@ Seven consecutive samples were 298, 278, 265, 268, 272, 276, and 271 ms: 272 ms 
 
 ## Frontend responsiveness
 
-The checked-in `scripts/performance/issue-5` harness builds the actual production `InboxWorkspace`, `ChatConversationPanel`, `ConversationSurface`, composer, styles, and lazy conversation boundary into a temporary packaged Tauri application. It swaps only React DOM's standard production renderer for React's production profiling renderer. The harness does not ship in Più's normal bundle, does not add a dependency, and `scripts/measure-issue-5-performance.mjs` restores the normal package after a run.
+The checked-in `scripts/performance/chat` harness builds the actual production `InboxWorkspace`, `ChatConversationPanel`, `ConversationSurface`, composer, styles, and lazy conversation boundary into a temporary packaged Tauri application. It swaps only React DOM's standard production renderer for React's production profiling renderer. The harness does not ship in Più's normal bundle, does not add a dependency, and `scripts/measure-chat-performance.mjs` restores the normal package after a run.
 
 The foreground WKWebView ran at 1180 × 761 with one project, 24 locally available chats, and 181 representative messages per opened transcript. After one unrecorded warm chat switch, it measured 30 alternating chat switches, 30 chat-to-project composer navigations, 60 controlled composer input events, 120 scrolling animation frames, and 120 simulated Pi text deltas delivered one per animation frame. Interaction latency runs from DOM activation/input dispatch until the expected production UI is present and the next animation frame is available. Values are milliseconds.
 
@@ -47,7 +47,7 @@ The 119 measured scrolling intervals delivered 60.04 animation frames per second
 Run the deterministic packaged measurement with:
 
 ```sh
-node scripts/measure-issue-5-performance.mjs
+node scripts/measure-chat-performance.mjs
 ```
 
 The script writes its non-sensitive JSON result and an attempted local Animation Hitches trace under ignored `work/`, restores the previous clipboard contents, removes isolated application data, and rebuilds the normal production app in `finally`.

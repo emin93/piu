@@ -723,11 +723,31 @@ async fn native_steering_queue_keeps_current_turn_output_before_the_accepted_mes
     .await
     .expect("the active turn should begin streaming");
 
-    fixture
-        .host
-        .send(&fixture.chat_id, "Inspect the queued result")
-        .await
-        .unwrap();
+    let host = fixture.host.clone();
+    let chat_id = fixture.chat_id.clone();
+    let pending_send =
+        tokio::spawn(async move { host.send(&chat_id, "Inspect the queued result").await });
+    tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().event,
+                ConversationEvent::ItemAdded {
+                    item: ConversationItem::Message {
+                        ref text,
+                        queued: true,
+                        ..
+                    },
+                    ..
+                } if text == "Inspect the queued result"
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the accepted steering message should project before Pi responds");
+    assert!(!pending_send.is_finished());
+    pending_send.await.unwrap().unwrap();
 
     tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
         let mut saw_queue = false;
@@ -802,6 +822,66 @@ async fn native_steering_queue_keeps_current_turn_output_before_the_accepted_mes
         Some(session)
     );
     fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn rejected_steering_is_visible_while_pending_then_rolls_back_without_replay() {
+    let fixture = ChatFixture::with_options(true, true, "reject-steer");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    let mut events = fixture.host.subscribe();
+    let host = fixture.host.clone();
+    let chat_id = fixture.chat_id.clone();
+    let pending_send = tokio::spawn(async move { host.send(&chat_id, "Reject this steer").await });
+
+    let optimistic_item_id = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        loop {
+            if let ConversationEvent::ItemAdded {
+                item:
+                    ConversationItem::Message {
+                        id,
+                        ref text,
+                        queued: true,
+                        ..
+                    },
+                ..
+            } = events.recv().await.unwrap().event
+                && text == "Reject this steer"
+            {
+                break id;
+            }
+        }
+    })
+    .await
+    .expect("the pending steer should be visible before Pi responds");
+    assert!(!pending_send.is_finished());
+    assert!(pending_send.await.unwrap().is_err());
+
+    tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().event,
+                ConversationEvent::ItemRemoved { ref item_id } if item_id == &optimistic_item_id
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("a rejected steer should remove only its optimistic transcript item");
+    assert!(!fixture
+        .host
+        .snapshot(&fixture.chat_id)
+        .unwrap()
+        .items
+        .iter()
+        .any(|item| matches!(item, ConversationItem::Message { text, .. } if text == "Reject this steer")));
+    assert_eq!(
+        fixture
+            .record("commands")
+            .matches("\"type\":\"prompt\"")
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]

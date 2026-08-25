@@ -3,13 +3,13 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-const resultPrefix = "PIU_ISSUE_5_PERFORMANCE:";
-const resultPath = resolve("work/issue-5-performance-result.json");
-const tracePath = resolve("work/issue-5-animation-hitches.trace");
+const resultPrefix = "PIU_CHAT_PERFORMANCE:";
+const resultPath = resolve("work/chat-performance-result.json");
+const tracePath = resolve("work/chat-animation-hitches.trace");
 const executable = resolve(
   "src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Più.app/Contents/MacOS/piu",
 );
-const appData = await mkdtemp(join(tmpdir(), "piu-issue-5-performance-"));
+const appData = await mkdtemp(join(tmpdir(), "piu-chat-performance-"));
 const originalClipboard = spawnSync("pbpaste", { encoding: null }).stdout;
 let app;
 let trace;
@@ -61,7 +61,7 @@ try {
     "--bundles",
     "app",
     "--config",
-    "scripts/performance/issue-5.tauri.conf.json",
+    "scripts/performance/chat.tauri.conf.json",
   ]);
 
   app = spawn(executable, [], {

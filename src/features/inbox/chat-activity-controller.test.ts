@@ -2,19 +2,18 @@ import { expect, test, vi } from "vitest";
 
 import { ChatActivityController } from "./chat-activity-controller";
 
-test("known chats keep their original order and stable idle snapshots during reconciliation", () => {
+test("reconciliation preserves retained state and resets a removed chat", () => {
   const controller = new ChatActivityController();
   controller.reconcile(["chat-a", "chat-b"]);
-  const firstIds = controller.getKnownChatIds();
   const chatAIdle = controller.chat("chat-a").getSnapshot();
 
   controller.reconcile(["chat-b", "chat-a", "chat-c"]);
-
-  expect(controller.getKnownChatIds()).toEqual(["chat-a", "chat-b", "chat-c"]);
   expect(controller.chat("chat-a").getSnapshot()).toBe(chatAIdle);
-  controller.reconcile(["chat-a", "chat-b"]);
-  expect(controller.getKnownChatIds()).toEqual(firstIds);
-  expect(controller.getKnownChatIds()).toEqual(["chat-a", "chat-b"]);
+
+  controller.apply("chat-a", { type: "turn-started" });
+  expect(controller.chat("chat-a").getSnapshot()).toEqual({ phase: "running", unread: false });
+  controller.reconcile(["chat-b", "chat-c"]);
+  expect(controller.chat("chat-a").getSnapshot()).toEqual({ phase: "idle", unread: false });
 });
 
 test("background completion, failure, interruption, and input become unread until selected", () => {

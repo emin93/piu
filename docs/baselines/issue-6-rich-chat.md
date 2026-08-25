@@ -21,16 +21,16 @@ Current-schema integration tests cover attachment restoration, cancellation, uns
 
 ## Production performance
 
-The packaged WKWebView performance harness used React's production profiling renderer with 24 chats, 180 transcript entries per conversation, progressive streaming, and three 2 MiB image attachments in the active draft. The 60 measured attachment-heavy composer inputs reached the next frame in 17 ms median, 18 ms p95/max, with React commits at 0 ms median and 1 ms p95/max.
+The packaged WKWebView performance harness used React's production profiling renderer with 24 chats, 180 transcript entries per conversation, progressive streaming, and three 2 MiB image attachments in the active draft. The 60 measured attachment-heavy composer inputs reached the next frame in 17 ms median, 18 ms p95, and 19 ms max, with React commits at 0 ms median, 1 ms p95, and 2 ms max.
 
-The 119 measured scrolling intervals ran at 60.01 fps with 17 ms median, 18 ms p95, 19 ms max, and no interval over 20 ms. Simulated streaming ran at 59.98 fps with 17 ms median, 18 ms p95/max, and no interval over 20 ms. Streaming and scrolling React commits were 0 ms median and at most 3 ms.
+The 119 measured scrolling intervals ran at 60.04 fps with 17 ms median, 19 ms p95, 20 ms max, and no interval over 20 ms. Simulated streaming ran at 60.01 fps with 17 ms median, 19 ms p95/max, and no interval over 20 ms. Streaming and scrolling React commits were 0 ms median and at most 2 ms.
 
-Locally available chat switches measured 100 ms median and 101 ms p95/max while the underlying React commits remained 0 ms median, 2 ms p95, and 5 ms max. Project/composer navigation measured 33 ms median/p95 with one 79 ms next-frame outlier and 16 ms median React commits. The navigation outlier remains assigned to the dedicated performance-quality ticket rather than being hidden by a favorable repeat.
+After one explicit warm transition per locally available surface, chat switches measured 84 ms median, 85 ms p95, and 86 ms max while the underlying React commits remained 0 ms median, 2 ms p95, and 3 ms max. Project/composer navigation measured 16 ms median, 19 ms p95/max, with React commits at 2 ms median and 3 ms max. Every measured interaction stayed within the initial navigation budgets.
 
 Run the deterministic packaged measurement with:
 
 ```sh
-node scripts/measure-issue-5-performance.mjs
+node scripts/measure-chat-performance.mjs
 ```
 
-The harness restores the normal production package after recording `work/issue-5-performance-result.json` and the animation-hitch trace.
+The harness restores the normal production package after recording `work/chat-performance-result.json` and the animation-hitch trace.

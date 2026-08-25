@@ -85,6 +85,11 @@ export interface ConversationItemAdded {
   type: "item-added";
 }
 
+export interface ConversationItemRemoved {
+  itemId: string;
+  type: "item-removed";
+}
+
 export interface ConversationMessageQueueChanged {
   itemId: string;
   queued: boolean;
@@ -146,6 +151,7 @@ export interface ConversationUsageUpdate {
 
 export type ConversationEvent =
   | ConversationItemAdded
+  | ConversationItemRemoved
   | ConversationMessageQueueChanged
   | ConversationReasoningDelta
   | ConversationTextDelta
@@ -249,6 +255,8 @@ function mapNativeEvent(event: NativeConversationEvent): ConversationEvent {
         item: mapNativeItem(event.item),
         type: "item-added",
       };
+    case "item-removed":
+      return { itemId: event.itemId, type: "item-removed" };
     case "message-queue-changed":
       return {
         itemId: event.itemId,

@@ -138,6 +138,7 @@ test("runtime changes preserve every generated event field", async () => {
         status: "running",
       },
     },
+    { type: "item-removed", itemId: "message-optimistic" },
     { type: "text-delta", delta: "Fixed", itemId: "message-2" },
     { type: "reasoning-delta", delta: "Checking", itemId: "reasoning-3" },
     { type: "tool-update", detail: "Exit 1", itemId: "tool-1", status: "failed" },

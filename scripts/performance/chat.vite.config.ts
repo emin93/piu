@@ -8,7 +8,7 @@ const repositoryRoot = resolve(import.meta.dirname, "../..");
 export default defineConfig({
   build: {
     emptyOutDir: true,
-    outDir: resolve(repositoryRoot, "work/issue-5-performance-dist"),
+    outDir: resolve(repositoryRoot, "work/chat-performance-dist"),
     sourcemap: true,
     target: "safari18",
   },
@@ -22,5 +22,5 @@ export default defineConfig({
       ),
     },
   },
-  root: resolve(import.meta.dirname, "issue-5"),
+  root: resolve(import.meta.dirname, "chat"),
 });

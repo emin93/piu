@@ -233,3 +233,24 @@ test("typed input requests remain pending until resolved and terminal events cle
     phase: "interrupted",
   });
 });
+
+test("a rejected optimistic message is removed without disturbing prior turns", () => {
+  const store = new ConversationStore(snapshot);
+  store.apply({
+    beforeItemId: null,
+    item: {
+      id: "message-pending",
+      kind: "message",
+      queued: true,
+      role: "user",
+      text: "Steer the active turn",
+    },
+    type: "item-added",
+  });
+
+  store.apply({ itemId: "message-pending", type: "item-removed" });
+
+  expect(store.getSnapshot().itemIds).toEqual(["user-1", "assistant-1"]);
+  expect(store.getItem("message-pending")).toBeUndefined();
+  expect(store.getItem("user-1")).toMatchObject({ text: "Inspect the build." });
+});
