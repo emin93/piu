@@ -104,6 +104,7 @@ test("the controller does not replay events already folded into the opening snap
   });
 
   await controller.connect();
+  emit?.({ delta: "Done.", itemId: "assistant-1", type: "text-delta" }, 2);
   emit?.({ delta: " Ready.", itemId: "assistant-1", type: "text-delta" }, 3);
 
   expect(controller.store.getItem("assistant-1")).toMatchObject({

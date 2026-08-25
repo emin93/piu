@@ -1,6 +1,6 @@
 // Adapted from AI Elements message.tsx at commit 6a9d5b1822ffb10bba4bd97175f01edd7d8651cd.
 // Copyright 2023 Vercel, Inc. Licensed under Apache-2.0.
-import { memo, type HTMLAttributes } from "react";
+import type { HTMLAttributes } from "react";
 
 import { cn } from "@/lib/utils";
 
@@ -34,18 +34,3 @@ export function MessageContent({ children, className, ...props }: MessageContent
     </div>
   );
 }
-
-export type MessageResponseProps = HTMLAttributes<HTMLDivElement>;
-
-export const MessageResponse = memo(function MessageResponse({
-  className,
-  ...props
-}: MessageResponseProps) {
-  return (
-    <div
-      className={cn("ai-message-response", className)}
-      data-ai-element="message-response"
-      {...props}
-    />
-  );
-});

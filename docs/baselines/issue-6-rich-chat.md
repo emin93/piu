@@ -12,8 +12,12 @@ The checked-in references are native macOS PNG window captures of the final pack
 
 - `issue-6-rich-chat-light.png`
 - `issue-6-rich-chat-dark.png`
+- `issue-6-attachment-light.png`
+- `issue-6-failure-light.png`
 - `issue-6-unread-completion-light.png`
 - `issue-6-unread-completion-dark.png`
+
+The attachment reference records the centered welcome composer with a prepared, removable individual `README.md` text attachment, attachment-only send enabled, and the corresponding durable draft in the inbox; the native picker exposed files but no folder attachment action. The failure reference was driven through the production host with a deterministic Pi retry-attempt event. It records the accepted user turn, interrupted tool detail, inline terminal failure, failed inbox activity, resumable composer, and the explicit statement that Più stopped the retry without replaying a message.
 
 ## Packaged background completion and unread evidence
 

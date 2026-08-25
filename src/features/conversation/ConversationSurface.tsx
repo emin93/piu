@@ -165,6 +165,26 @@ function ToolDetail({ detail }: { detail: string }) {
 
 function ToolItem({ item }: { item: ConversationTool }) {
   const [open, setOpen] = useState(item.status !== "succeeded");
+  const rootRef = useRef<HTMLDivElement>(null);
+  const previousStatusRef = useRef(item.status);
+
+  useEffect(() => {
+    const previousStatus = previousStatusRef.current;
+    previousStatusRef.current = item.status;
+    if (previousStatus === "succeeded" || item.status !== "succeeded") return;
+
+    const root = rootRef.current;
+    const activeElement = document.activeElement;
+    const selection = window.getSelection();
+    const hasSelectionInside = Boolean(
+      root &&
+      selection &&
+      !selection.isCollapsed &&
+      ((selection.anchorNode && root.contains(selection.anchorNode)) ||
+        (selection.focusNode && root.contains(selection.focusNode))),
+    );
+    if (!root?.contains(activeElement) && !hasSelectionInside) setOpen(false);
+  }, [item.status]);
 
   return (
     <Tool
@@ -172,6 +192,7 @@ function ToolItem({ item }: { item: ConversationTool }) {
       data-status={item.status}
       onOpenChange={setOpen}
       open={open}
+      ref={rootRef}
     >
       <ToolHeader
         aria-label={`${open ? "Hide" : "Show"} ${item.name} details`}
@@ -259,7 +280,7 @@ function MessageItem({ item }: { item: Extract<ConversationItem, { kind: "messag
 
 function TranscriptItemView({ item }: { item: ConversationItem }) {
   if (item.kind === "reasoning") return <ReasoningItem text={item.text} />;
-  if (item.kind === "tool") return <ToolItem item={item} key={item.status} />;
+  if (item.kind === "tool") return <ToolItem item={item} />;
   if (item.kind === "usage") {
     return (
       <UsageItem

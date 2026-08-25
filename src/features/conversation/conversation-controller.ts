@@ -25,11 +25,20 @@ export class ConversationController {
   readonly #chatId: string;
   #disconnect: (() => void) | undefined;
   #generation = 0;
+  #revision = 0;
   readonly store = new ConversationStore(STOPPED_CONVERSATION);
 
   constructor(chatId: string, adapter: ConversationAdapter) {
     this.#adapter = adapter;
     this.#chatId = chatId;
+  }
+
+  #apply(event: ConversationEvent, revision?: number) {
+    if (revision !== undefined) {
+      if (revision <= this.#revision) return;
+      this.#revision = revision;
+    }
+    this.store.apply(event);
   }
 
   async connect() {
@@ -40,7 +49,7 @@ export class ConversationController {
     let connected = false;
     const connection = await this.#adapter.connect(this.#chatId, (event, revision) => {
       if (generation !== this.#generation) return;
-      if (connected) this.store.apply(event);
+      if (connected) this.#apply(event, revision);
       else pendingEvents.push({ event, revision });
     });
 
@@ -50,14 +59,10 @@ export class ConversationController {
     }
     this.#disconnect = connection.disconnect;
     this.store.replace(connection.snapshot);
+    this.#revision = connection.snapshot.revision ?? 0;
     connected = true;
     for (const pending of pendingEvents) {
-      if (
-        pending.revision === undefined ||
-        pending.revision > (connection.snapshot.revision ?? 0)
-      ) {
-        this.store.apply(pending.event);
-      }
+      this.#apply(pending.event, pending.revision);
     }
   }
 

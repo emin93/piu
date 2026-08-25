@@ -307,6 +307,39 @@ test("a running tool collapses when it succeeds", () => {
   expect(screen.getByRole("button", { name: "Show Run checks details" })).toBeVisible();
 });
 
+test("a focused running tool preserves focus and disclosure when it succeeds", () => {
+  const store = new ConversationStore({
+    failure: null,
+    inputRequest: null,
+    phase: "running",
+    items: [
+      {
+        id: "tool-1",
+        kind: "tool",
+        name: "Run checks",
+        status: "running",
+        detail: "Running TypeScript",
+      },
+    ],
+  });
+  render(<ConversationSurface store={store} />);
+  const trigger = screen.getByRole("button", { name: "Hide Run checks details" });
+  trigger.focus();
+
+  act(() => {
+    store.apply({
+      type: "tool-update",
+      itemId: "tool-1",
+      status: "succeeded",
+      detail: "All checks passed",
+    });
+  });
+
+  expect(screen.getByRole("button", { name: "Hide Run checks details" })).toBe(trigger);
+  expect(trigger).toHaveFocus();
+  expect(screen.getByText("All checks passed")).toBeVisible();
+});
+
 test("a stopped chat remains resumable from the same composer", () => {
   const store = new ConversationStore({
     failure: null,
