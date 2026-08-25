@@ -43,6 +43,26 @@ struct ChatFixture {
 }
 
 #[tokio::test]
+async fn model_controls_do_not_turn_a_completed_chat_into_a_stopped_chat() {
+    let fixture = ChatFixture::with_options(true, true, "streaming");
+    let opened = fixture.host.open(&fixture.chat_id).await.unwrap();
+    assert_eq!(opened.phase, ConversationPhase::Running);
+    fixture.wait_for_live_children(0).await;
+    assert_eq!(
+        fixture.host.snapshot(&fixture.chat_id).unwrap().phase,
+        ConversationPhase::Idle
+    );
+
+    fixture.host.model_controls(&fixture.chat_id).await.unwrap();
+
+    assert_eq!(
+        fixture.host.snapshot(&fixture.chat_id).unwrap().phase,
+        ConversationPhase::Idle
+    );
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn an_idle_affected_child_restarts_on_the_exact_session_and_worktree() {
     let fixture = ChatFixture::with_options(true, true, "streaming");
     fixture.host.open(&fixture.chat_id).await.unwrap();

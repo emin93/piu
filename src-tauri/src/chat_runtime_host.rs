@@ -427,6 +427,19 @@ impl ConversationProjection {
             })
             .collect()
     }
+
+    fn install_opened_session(
+        &mut self,
+        snapshot: ConversationSnapshot,
+        next_message_index: usize,
+        preserve_hydrated: bool,
+    ) -> bool {
+        if preserve_hydrated && self.hydrated {
+            return false;
+        }
+        *self = Self::new(snapshot, next_message_index, true);
+        true
+    }
 }
 
 struct HostInner {
@@ -1357,17 +1370,23 @@ impl ChatRuntimeHost {
             })
             .count()
             + usize::from(session_is_empty);
-        let mut projection =
-            ConversationProjection::new(snapshot.clone(), next_message_index, true);
-        if should_start {
-            projection
-                .pending_user_items
-                .push_back(("message-0".into(), initial_text.clone()));
-        }
-        *slot
-            .projection
-            .lock()
-            .map_err(|_| ChatRuntimeHostError::Lock)? = projection;
+        let snapshot = {
+            let mut projection = slot
+                .projection
+                .lock()
+                .map_err(|_| ChatRuntimeHostError::Lock)?;
+            let installed = projection.install_opened_session(
+                snapshot,
+                next_message_index,
+                keep_stopped_runtime,
+            );
+            if installed && should_start {
+                projection
+                    .pending_user_items
+                    .push_back(("message-0".into(), initial_text.clone()));
+            }
+            projection.snapshot.clone()
+        };
         if !should_start && !keep_stopped_runtime {
             child.shutdown().await?;
             return Ok(snapshot);
