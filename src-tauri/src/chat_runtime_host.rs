@@ -1937,8 +1937,7 @@ async fn persist_selected_route(
     effort: ReasoningEffort,
 ) -> Result<(), ChatRuntimeHostError> {
     tokio::task::spawn_blocking(move || {
-        preferences.remember_effort(&route, effort.as_pi())?;
-        preferences.select_route(&route)?;
+        preferences.select_route_with_effort(&route, effort.as_pi())?;
         Ok::<_, RuntimePreferencesError>(())
     })
     .await
