@@ -21,7 +21,7 @@
     "runtime:provision": "node scripts/provision-agent-runtime.mjs",
     "runtime:test": "node --test scripts/agent-runtime-bundle.test.mjs",
     "runtime:verify": "node scripts/verify-agent-runtime.mjs",
-    "runtime:contract": "node --test scripts/pi-auth-launcher-contract.test.mjs scripts/pi-credential-lock-contract.test.mjs scripts/pi-launcher-contract.test.mjs",
+    "runtime:contract": "node --test scripts/pi-auth-launcher-contract.test.mjs scripts/pi-credential-lock-contract.test.mjs scripts/pi-environment-contract.test.mjs scripts/pi-launcher-contract.test.mjs",
     "runtime:check": "npm run runtime:provision && npm run runtime:verify && npm run runtime:contract",
     "launcher:test": "node --test src-tauri/vendor/agent-runtime/launcher/*.test.mjs",
     "bundle:check": "node scripts/check-initial-bundle.mjs",
