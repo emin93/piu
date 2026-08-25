@@ -2,7 +2,7 @@
 .models-resources-inventory,
 .models-resources-loading {
   display: grid;
-  gap: 28px;
+  gap: 20px;
 }
 
 .models-resources-notice,
@@ -38,7 +38,7 @@
 
 .models-resources-inventory,
 .models-resources-loading {
-  gap: 24px;
+  gap: 16px;
 }
 
 .models-resources-group {
@@ -47,10 +47,14 @@
 
 .models-resources-group__header {
   display: flex;
-  min-height: 28px;
+  min-height: 32px;
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid var(--border);
+}
+
+.models-resources-group__header[data-empty="true"] {
+  gap: 16px;
 }
 
 .models-resources-group__header h2 {
@@ -106,10 +110,9 @@
 }
 
 .models-resources-empty-row {
-  min-height: 44px;
-  padding-block: 14px;
-  border-bottom: 1px solid var(--border);
+  min-width: 0;
   color: var(--muted-foreground);
+  text-align: right;
 }
 
 .models-resources-diagnostics {

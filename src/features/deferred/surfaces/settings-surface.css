@@ -21,10 +21,10 @@
 
 .settings-surface__content {
   display: grid;
-  gap: 32px;
+  gap: 24px;
   width: min(720px, calc(100% - 48px));
   margin-inline: auto;
-  padding: 48px 0 64px;
+  padding: 28px 0 48px;
 }
 
 .settings-surface__heading,
@@ -53,6 +53,6 @@
 @media (max-width: 960px) {
   .settings-surface__content {
     width: min(720px, calc(100% - 32px));
-    padding-top: 32px;
+    padding-top: 24px;
   }
 }

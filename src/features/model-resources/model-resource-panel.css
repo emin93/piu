@@ -45,11 +45,6 @@
   justify-content: space-between;
 }
 
-.model-resource-header[data-embedded="true"] {
-  justify-content: flex-end;
-  min-height: 20px;
-}
-
 .model-resource-header > div {
   display: grid;
   gap: 4px;
@@ -72,8 +67,16 @@
   color: color-mix(in oklab, var(--ring) 78%, var(--foreground));
 }
 
+.model-resource-identity-row {
+  display: flex;
+  gap: 16px;
+  align-items: start;
+  justify-content: space-between;
+}
+
 .model-resource-identity {
   display: grid;
+  min-width: 0;
   gap: 2px;
 }
 

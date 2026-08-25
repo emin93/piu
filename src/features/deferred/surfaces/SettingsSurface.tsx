@@ -58,9 +58,8 @@ export default function SettingsSurface({
       <div className="settings-surface__scroll">
         <div className="settings-surface__content">
           <div className="settings-surface__heading">
-            <p className="settings-eyebrow">Più on this Mac</p>
             <h1>Models &amp; Resources</h1>
-            <p>Choose what every Più chat can use.</p>
+            <p>Choose which models and resources Più can use.</p>
           </div>
           {modelResourceQaEnabled ? (
             <ModelResourceQaSurface />

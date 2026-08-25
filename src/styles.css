@@ -63,7 +63,7 @@
   --font-sans: "Geist Variable", -apple-system, BlinkMacSystemFont, sans-serif;
   --font-mono: "Geist Mono Variable", "SF Mono", ui-monospace, monospace;
   --radius: 0.625rem;
-  --workspace-topbar-height: 52px;
+  --workspace-topbar-height: 36px;
   --inbox-sidebar-width: 256px;
   --background: oklch(0.985 0.001 286);
   --foreground: oklch(0.205 0.006 286);
@@ -146,6 +146,23 @@
     font-family: var(--font-sans);
     font-size: 13px;
     -webkit-font-smoothing: antialiased;
+    -webkit-user-select: text;
+    user-select: text;
+  }
+
+  .titlebar,
+  .inbox-sidebar,
+  .sidebar-resize-handle,
+  .conversation-stage,
+  .settings-surface {
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  input,
+  textarea,
+  [contenteditable="true"],
+  .conversation-transcript {
     -webkit-user-select: text;
     user-select: text;
   }

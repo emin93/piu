@@ -135,10 +135,14 @@ function ResourceGroup({
   const headingId = useId();
   return (
     <section className="models-resources-group" aria-labelledby={headingId}>
-      <header className="models-resources-group__header">
+      <header
+        className="models-resources-group__header"
+        data-empty={emptyMessage ? true : undefined}
+      >
         <h2 id={headingId}>{heading}</h2>
+        {emptyMessage ? <p className="models-resources-empty-row">{emptyMessage}</p> : null}
       </header>
-      {emptyMessage ? <p className="models-resources-empty-row">{emptyMessage}</p> : children}
+      {emptyMessage ? null : children}
       <ExceptionalDiagnostics diagnostics={diagnostics} resource={diagnosticResource} />
     </section>
   );

@@ -207,6 +207,17 @@ export function ModelResourcePanel({
   const qaMode = statusOverride !== undefined;
   const progressValue = progress(currentStatus);
   const statusMessage = mismatch ? REVISION_MISMATCH_MESSAGE : currentStatus.message;
+  const statusBadge = (
+    <Badge
+      aria-atomic="true"
+      aria-live="polite"
+      className={`resource-status resource-status--${currentStatus.phase}`}
+      role="status"
+      variant={statusVariant(currentStatus.phase)}
+    >
+      {phaseLabels[currentStatus.phase]}
+    </Badge>
+  );
 
   return (
     <section
@@ -214,29 +225,24 @@ export function ModelResourcePanel({
       aria-labelledby={embedded ? undefined : headingId}
       className="model-resource-panel"
     >
-      <header className="model-resource-header" data-embedded={embedded || undefined}>
-        {embedded ? null : (
+      {embedded ? null : (
+        <header className="model-resource-header">
           <div>
             <p className="settings-eyebrow">
               {context === "onboarding" ? "Required resource" : "Models & resources"}
             </p>
             <h2 id={headingId}>Local model</h2>
           </div>
-        )}
-        <Badge
-          aria-atomic="true"
-          aria-live="polite"
-          className={`resource-status resource-status--${currentStatus.phase}`}
-          role="status"
-          variant={statusVariant(currentStatus.phase)}
-        >
-          {phaseLabels[currentStatus.phase]}
-        </Badge>
-      </header>
+          {statusBadge}
+        </header>
+      )}
 
-      <div className="model-resource-identity">
-        <strong>Qwen 3.8 27B · 4-bit</strong>
-        <span>MTP drafter</span>
+      <div className="model-resource-identity-row">
+        <div className="model-resource-identity">
+          <strong>Qwen 3.8 27B · 4-bit</strong>
+          <span>MTP drafter</span>
+        </div>
+        {embedded ? statusBadge : null}
       </div>
       <p className="model-resource-copy">
         Più installs and verifies this exact model in managed application storage. It loads only
