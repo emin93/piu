@@ -210,10 +210,14 @@ test("the real pinned Pi process exposes the rich event contract without externa
 export default function (pi) {
   const provider = fauxProvider({
     provider: "piu-contract",
-    models: [{ id: "event-matrix", name: "Più event matrix", reasoning: true }],
+    models: [
+      { id: "event-matrix", name: "Più event matrix", reasoning: true },
+      { id: "plain", name: "Più plain model", reasoning: false },
+    ],
     tokenSize: { min: 100, max: 100 },
     tokensPerSecond: 5000,
   });
+  provider.models[0].thinkingLevelMap = { xhigh: "xhigh", max: "max" };
   provider.setResponses([
     fauxAssistantMessage([
       fauxThinking("contract reasoning"),
@@ -269,6 +273,31 @@ export default function (pi) {
     const state = (await chat.request({ type: "get_state" })).data;
     assert.equal(state.model.provider, "piu-contract");
     assert.equal(state.model.id, "event-matrix");
+    assert.deepEqual(
+      (await chat.request({ type: "get_available_thinking_levels" })).data.levels,
+      ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    );
+    await chat.request({ type: "set_thinking_level", level: "max" });
+    assert.equal((await chat.request({ type: "get_state" })).data.thinkingLevel, "max");
+    const availableModels = (await chat.request({ type: "get_available_models" })).data.models;
+    assert.equal(
+      availableModels.some(
+        ({ provider, id }) => provider === "piu-contract" && id === "plain",
+      ),
+      true,
+    );
+    await chat.request({ type: "set_model", provider: "piu-contract", modelId: "plain" });
+    assert.deepEqual(
+      (await chat.request({ type: "get_available_thinking_levels" })).data.levels,
+      ["off"],
+    );
+    assert.equal((await chat.request({ type: "get_state" })).data.thinkingLevel, "off");
+    await chat.request({
+      type: "set_model",
+      provider: "piu-contract",
+      modelId: "event-matrix",
+    });
+    await chat.request({ type: "set_thinking_level", level: "high" });
     const commands = (await chat.request({ type: "get_commands" })).data.commands;
     assert.equal(
       commands.some((command) => command.name === "piu-contract-input"),
