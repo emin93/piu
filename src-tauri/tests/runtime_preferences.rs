@@ -33,6 +33,25 @@ fn selected_route_and_each_routes_effort_survive_relaunch() {
 }
 
 #[test]
+fn route_and_effective_effort_are_persisted_as_one_selection() {
+    let app_data = TempDir::new().expect("temporary application data");
+    let database_path = app_data.path().join("piu.sqlite3");
+    let route = ModelRoute::new("local", "qwen").unwrap();
+    let preferences = RuntimePreferences::open(&database_path).unwrap();
+
+    assert_eq!(
+        preferences
+            .select_route_with_effort(&route, "xhigh")
+            .unwrap(),
+        route.selection(Some("xhigh"))
+    );
+    assert_eq!(
+        preferences.current_selection().unwrap(),
+        Some(route.selection(Some("xhigh")))
+    );
+}
+
+#[test]
 fn resource_overrides_are_isolated_by_kind_source_and_scope() {
     let app_data = TempDir::new().expect("temporary application data");
     let database_path = app_data.path().join("piu.sqlite3");

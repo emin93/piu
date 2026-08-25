@@ -1,6 +1,6 @@
 import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const isolatedNpmRootLauncher = fileURLToPath(new URL("./isolated-npm-root.mjs", import.meta.url));
@@ -20,8 +20,15 @@ function validate(config) {
   }
 }
 
-function resourceItem(resource) {
+function pathDisplayName(path) {
+  if (basename(path) === "SKILL.md") return basename(dirname(path));
+  return basename(path, extname(path));
+}
+
+function resourceItem(resource, names = new Map()) {
   return {
+    id: resource.path,
+    name: names.get(resource.path) ?? pathDisplayName(resource.path),
     path: resource.path,
     enabled: resource.enabled,
     source: resource.metadata.source,
@@ -33,6 +40,8 @@ function resourceItem(resource) {
 
 function configuredPackageItem(configuredPackage) {
   return {
+    id: configuredPackage.source,
+    name: configuredPackage.source,
     source: configuredPackage.source,
     scope: configuredPackage.scope,
     filtered: configuredPackage.filtered,
@@ -169,9 +178,13 @@ export async function inspectPiuEnvironment(
       path,
     });
   }
-  for (const diagnostic of services.resourceLoader.getSkills().diagnostics) {
+  const loadedSkills = services.resourceLoader.getSkills();
+  for (const diagnostic of loadedSkills.diagnostics) {
     diagnostics.push({ resourceType: "skill", ...diagnostic });
   }
+  const skillNames = new Map(
+    (loadedSkills.skills ?? []).map((skill) => [skill.filePath, skill.name]),
+  );
 
   const availableModels = await services.modelRuntime.getAvailable();
   const modelError = services.modelRuntime.getError();
@@ -184,11 +197,12 @@ export async function inspectPiuEnvironment(
       provider: model.provider,
       id: model.id,
       name: model.name,
+      acceptsImages: model.input?.includes("image") ?? false,
       thinkingLevels: getSupportedThinkingLevels(model),
     })),
     resources: {
-      extensions: resolved.extensions.map(resourceItem),
-      skills: resolved.skills.map(resourceItem),
+      extensions: resolved.extensions.map((resource) => resourceItem(resource)),
+      skills: resolved.skills.map((resource) => resourceItem(resource, skillNames)),
       packages: packageManager.listConfiguredPackages().map(configuredPackageItem),
     },
     diagnostics,

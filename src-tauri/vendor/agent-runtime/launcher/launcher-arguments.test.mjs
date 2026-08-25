@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { parseAuthLauncherArguments, parseChatLauncherArguments } from "./launcher-arguments.mjs";
+import {
+  parseAuthLauncherArguments,
+  parseChatLauncherArguments,
+  parseEnvironmentLauncherArguments,
+} from "./launcher-arguments.mjs";
 
 test("parses the fixed internal chat launcher contract", () => {
   assert.deepEqual(
@@ -73,4 +77,41 @@ test("authentication arguments reject omitted duplicate and unrelated flags", ()
     /duplicate flag/,
   );
   assert.throws(() => parseAuthLauncherArguments(["--cwd", "/tmp"]), /unknown flag/);
+});
+
+test("parses the fixed one-shot environment launcher contract", () => {
+  assert.deepEqual(
+    parseEnvironmentLauncherArguments([
+      "--cwd",
+      "/private/tmp/project",
+      "--agent-dir",
+      "/private/tmp/app/agent",
+      "--credential-lock-dir",
+      "/private/tmp/app/credential-locks",
+    ]),
+    {
+      cwd: "/private/tmp/project",
+      agentDirectory: "/private/tmp/app/agent",
+      credentialLockDirectory: "/private/tmp/app/credential-locks",
+    },
+  );
+});
+
+test("environment arguments reject omitted duplicate and unrelated flags", () => {
+  assert.throws(() => parseEnvironmentLauncherArguments([]), /missing required flag/);
+  assert.throws(
+    () =>
+      parseEnvironmentLauncherArguments([
+        "--cwd",
+        "/one",
+        "--cwd",
+        "/two",
+        "--agent-dir",
+        "/agent",
+        "--credential-lock-dir",
+        "/locks",
+      ]),
+    /duplicate flag/,
+  );
+  assert.throws(() => parseEnvironmentLauncherArguments(["--session-dir", "/tmp"]), /unknown flag/);
 });

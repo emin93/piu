@@ -71,3 +71,28 @@ export function parseAuthLauncherArguments(arguments_) {
   }
   return { credentialLockDirectory };
 }
+
+export function parseEnvironmentLauncherArguments(arguments_) {
+  const flags = new Map([
+    ["--cwd", "cwd"],
+    ["--agent-dir", "agentDirectory"],
+    ["--credential-lock-dir", "credentialLockDirectory"],
+  ]);
+  const result = {};
+  const seen = new Set();
+
+  for (let index = 0; index < arguments_.length; index += 2) {
+    const flag = arguments_[index];
+    const value = takeValue(arguments_, index, flag);
+    const property = flags.get(flag);
+    if (!property) throw new Error(`unknown flag ${flag}`);
+    if (seen.has(flag)) throw new Error(`duplicate flag ${flag}`);
+    seen.add(flag);
+    result[property] = value;
+  }
+
+  for (const flag of flags.keys()) {
+    if (!seen.has(flag)) throw new Error(`missing required flag ${flag}`);
+  }
+  return result;
+}

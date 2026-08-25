@@ -183,6 +183,45 @@ impl RuntimePreferences {
         })
     }
 
+    pub fn select_route_with_effort(
+        &self,
+        route: &ModelRoute,
+        effort: &str,
+    ) -> Result<ModelSelection, RuntimePreferencesError> {
+        route.validate()?;
+        if effort.is_empty() {
+            return Err(RuntimePreferencesError::InvalidEffort);
+        }
+        let mut database = self
+            .database
+            .lock()
+            .map_err(|_| RuntimePreferencesError::LockPoisoned)?;
+        let transaction = database
+            .connection_mut()
+            .transaction()
+            .map_err(DatabaseError::Query)?;
+        transaction
+            .execute(
+                "INSERT INTO model_route_efforts (provider_id, model_id, effort)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(provider_id, model_id) DO UPDATE SET effort = excluded.effort",
+                params![route.provider_id(), route.model_id(), effort],
+            )
+            .map_err(DatabaseError::Query)?;
+        transaction
+            .execute(
+                "INSERT INTO runtime_model_selection (singleton, provider_id, model_id)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(singleton) DO UPDATE SET
+                    provider_id = excluded.provider_id,
+                    model_id = excluded.model_id",
+                params![route.provider_id(), route.model_id()],
+            )
+            .map_err(DatabaseError::Query)?;
+        transaction.commit().map_err(DatabaseError::Query)?;
+        Ok(route.selection(Some(effort)))
+    }
+
     pub fn remembered_effort(
         &self,
         route: &ModelRoute,

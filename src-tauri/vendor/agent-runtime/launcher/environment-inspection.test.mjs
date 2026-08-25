@@ -164,12 +164,14 @@ test("discovers effective routes and inventories isolated Più resources", async
       provider: "piu-contract",
       id: "reasoning",
       name: "Reasoning",
+      acceptsImages: false,
       thinkingLevels: ["off", "low", "max"],
     },
     {
       provider: "piu-contract",
       id: "plain",
       name: "Plain",
+      acceptsImages: false,
       thinkingLevels: ["off"],
     },
   ]);
@@ -182,6 +184,8 @@ test("discovers effective routes and inventories isolated Più resources", async
   assert.deepEqual(result.resources, {
     extensions: [
       {
+        id: `${paths.cwd}/.pi/extensions/route.mjs`,
+        name: "route",
         path: `${paths.cwd}/.pi/extensions/route.mjs`,
         enabled: true,
         source: "local",
@@ -191,6 +195,8 @@ test("discovers effective routes and inventories isolated Più resources", async
     ],
     skills: [
       {
+        id: `${paths.agentDirectory}/skills/review/SKILL.md`,
+        name: "review",
         path: `${paths.agentDirectory}/skills/review/SKILL.md`,
         enabled: true,
         source: "local",
@@ -198,6 +204,8 @@ test("discovers effective routes and inventories isolated Più resources", async
         origin: "top-level",
       },
       {
+        id: `${paths.cwd}/.pi/skills/disabled/SKILL.md`,
+        name: "disabled",
         path: `${paths.cwd}/.pi/skills/disabled/SKILL.md`,
         enabled: false,
         source: "local",
@@ -207,6 +215,8 @@ test("discovers effective routes and inventories isolated Più resources", async
     ],
     packages: [
       {
+        id: "npm:@piu/missing@1.0.0",
+        name: "npm:@piu/missing@1.0.0",
         source: "npm:@piu/missing@1.0.0",
         scope: "user",
         filtered: false,
