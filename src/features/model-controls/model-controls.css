@@ -1,0 +1,58 @@
+.composer-inference-controls {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+  min-width: 0;
+}
+
+.composer-inference-trigger {
+  min-width: 0;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.composer-inference-trigger:hover,
+.composer-inference-trigger[aria-expanded="true"] {
+  color: var(--foreground);
+}
+
+.composer-inference-trigger--model {
+  max-width: 190px;
+}
+
+.composer-inference-trigger--effort {
+  max-width: 104px;
+}
+
+.composer-inference-trigger__label,
+.composer-inference-menu__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-inference-menu {
+  width: min(256px, calc(100vw - 32px));
+}
+
+.composer-inference-menu--effort {
+  width: min(168px, calc(100vw - 32px));
+}
+
+.conversation-composer-error-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+@media (max-width: 960px) {
+  .composer-inference-trigger--model {
+    max-width: 156px;
+  }
+
+  .composer-inference-trigger--effort {
+    max-width: 88px;
+  }
+}
