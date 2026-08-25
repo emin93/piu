@@ -47,17 +47,17 @@ function selectedRouteName(controls: ModelControlsSnapshot) {
   );
 }
 
-export class ModelControlsController {
-  readonly #adapter: ModelControlsAdapter;
-  readonly #chatId: string;
+export class ModelControlsController<TargetId extends number | string = string> {
+  readonly #adapter: ModelControlsAdapter<TargetId>;
+  readonly #targetId: TargetId;
   #generation = 0;
   readonly #listeners = new Set<Listener>();
   #retry: (() => Promise<void>) | null = null;
   #snapshot = INITIAL_SNAPSHOT;
 
-  constructor(chatId: string, adapter: ModelControlsAdapter) {
+  constructor(targetId: TargetId, adapter: ModelControlsAdapter<TargetId>) {
     this.#adapter = adapter;
-    this.#chatId = chatId;
+    this.#targetId = targetId;
   }
 
   getSnapshot = () => this.#snapshot;
@@ -85,7 +85,7 @@ export class ModelControlsController {
       });
     }
     try {
-      const controls = await this.#adapter.get(this.#chatId);
+      const controls = await this.#adapter.get(this.#targetId);
       if (generation !== this.#generation) return;
       this.#publish({ controls, error: null, pending: null, phase: "ready" });
     } catch {
@@ -127,7 +127,7 @@ export class ModelControlsController {
       phase: "changing",
     });
     try {
-      const controls = await this.#adapter.selectRoute(this.#chatId, route);
+      const controls = await this.#adapter.selectRoute(this.#targetId, route);
       if (generation !== this.#generation) return;
       this.#publish({ controls, error: null, pending: null, phase: "ready" });
     } catch {
@@ -166,7 +166,7 @@ export class ModelControlsController {
       phase: "changing",
     });
     try {
-      const controls = await this.#adapter.selectEffort(this.#chatId, effort);
+      const controls = await this.#adapter.selectEffort(this.#targetId, effort);
       if (generation !== this.#generation) return;
       this.#publish({ controls, error: null, pending: null, phase: "ready" });
     } catch {

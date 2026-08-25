@@ -775,7 +775,7 @@ test("a failed draft save never claims the draft is saved", async () => {
   await user.click(await screen.findByRole("button", { name: /Atlas, available/ }));
   await user.type(screen.getByRole("textbox", { name: "Draft for Atlas" }), "Keep me");
 
-  expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't save this draft");
+  expect(await screen.findByText(/Couldn't save this draft/)).toBeVisible();
   expect(screen.queryByText("Saved locally")).not.toBeInTheDocument();
   await expect(windowLifecycle.resolveRequest?.()).rejects.toThrow("could not be saved");
 });

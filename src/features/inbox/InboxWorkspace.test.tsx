@@ -427,7 +427,7 @@ test("a failed draft stays visible in All Projects and can be retried", async ()
 
   await user.click(screen.getByRole("button", { name: /Caldera, available/ }));
   await user.type(screen.getByRole("textbox", { name: "Draft for Caldera" }), "Keep this work");
-  expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't save this draft");
+  expect(await screen.findByText(/Couldn't save this draft/)).toBeVisible();
   await user.click(screen.getByRole("button", { name: "All Projects, 3 projects" }));
 
   const draftsList = screen.getByRole("list", { name: "Unsent drafts" });

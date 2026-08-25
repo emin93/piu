@@ -1,5 +1,5 @@
 import { ArrowUpIcon, TriangleAlertIcon } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import { ProductComposer } from "@/components/ProductComposer";
 import { Button } from "@/components/ui/button";
@@ -7,6 +7,10 @@ import {
   PromptAttachmentButton,
   PromptAttachmentTray,
 } from "@/features/attachments/PromptAttachments";
+import { ComposerInferenceControls } from "@/features/model-controls/ComposerInferenceControls";
+import { ModelControlsController } from "@/features/model-controls/model-controls-controller";
+import { tauriProjectModelControlsAdapter } from "@/platform/agent-environment";
+import type { ModelControlsAdapter } from "@/platform/model-controls";
 import type { PromptAttachment } from "@/platform/prompt-attachments";
 import type { ProjectSummary } from "@/platform/project-inbox";
 
@@ -15,6 +19,7 @@ import { ProjectDraftController, type DraftPersistenceStatus } from "./draft-con
 interface ChatComposerProps {
   drafts: ProjectDraftController;
   layout?: "centered" | "docked";
+  modelControlsAdapter?: ModelControlsAdapter<number>;
   onSubmit?: (
     projectId: number,
     prompt: string,
@@ -33,6 +38,7 @@ function draftStatusCopy(status: DraftPersistenceStatus) {
 export function ChatComposer({
   drafts,
   layout = "centered",
+  modelControlsAdapter = tauriProjectModelControlsAdapter,
   onSubmit,
   project,
 }: ChatComposerProps) {
@@ -49,16 +55,38 @@ export function ChatComposer({
   const [submitting, setSubmitting] = useState(false);
   const [submissionError, setSubmissionError] = useState<string>();
   const [attachmentError, setAttachmentError] = useState<string>();
+  const modelControls = useMemo(
+    () => new ModelControlsController(project.id, modelControlsAdapter),
+    [modelControlsAdapter, project.id],
+  );
+  const modelControlsSnapshot = useSyncExternalStore(
+    modelControls.subscribe,
+    modelControls.getSnapshot,
+    modelControls.getSnapshot,
+  );
+
+  useEffect(() => {
+    if (!available) return;
+    void modelControls.load();
+    return () => modelControls.dispose();
+  }, [available, modelControls]);
 
   const submit = useCallback(async () => {
     const prompt = draft.prompt.trim();
-    if (!onSubmit || (!prompt && draft.attachments.length === 0) || submitting) return;
+    if (
+      !onSubmit ||
+      (!prompt && draft.attachments.length === 0) ||
+      submitting ||
+      modelControls.getSnapshot().phase === "changing"
+    ) {
+      return;
+    }
     setSubmitting(true);
     setSubmissionError(undefined);
     const error = await onSubmit(project.id, prompt, draft.attachments);
     setSubmitting(false);
     if (error) setSubmissionError(error);
-  }, [draft.attachments, draft.prompt, onSubmit, project.id, submitting]);
+  }, [draft.attachments, draft.prompt, modelControls, onSubmit, project.id, submitting]);
 
   const removeAttachment = useCallback(
     (attachmentId: string) => {
@@ -111,7 +139,10 @@ export function ChatComposer({
             <Button
               aria-label="Send message"
               disabled={
-                !onSubmit || (!draft.prompt.trim() && draft.attachments.length === 0) || submitting
+                !onSubmit ||
+                (!draft.prompt.trim() && draft.attachments.length === 0) ||
+                submitting ||
+                modelControlsSnapshot.phase === "changing"
               }
               size="icon"
               type="submit"
@@ -122,24 +153,44 @@ export function ChatComposer({
           ariaDescribedBy="draft-persistence-status"
           ariaLabel={`Draft for ${project.name}`}
           error={
-            draft.status.state === "failed" || submissionError || attachmentError
+            draft.status.state === "failed" ||
+            submissionError ||
+            attachmentError ||
+            modelControlsSnapshot.error
               ? {
                   action:
-                    draft.status.state === "failed" ? (
-                      <Button
-                        onClick={() => void drafts.retry(project.id)}
-                        size="sm"
-                        type="button"
-                        variant="outline"
-                      >
-                        Retry save
-                      </Button>
+                    draft.status.state === "failed" || modelControlsSnapshot.error ? (
+                      <div className="conversation-composer-error-actions">
+                        {draft.status.state === "failed" ? (
+                          <Button
+                            onClick={() => void drafts.retry(project.id)}
+                            size="sm"
+                            type="button"
+                            variant="outline"
+                          >
+                            Retry save
+                          </Button>
+                        ) : null}
+                        {modelControlsSnapshot.error ? (
+                          <Button
+                            onClick={() => void modelControls.retry()}
+                            size="sm"
+                            type="button"
+                            variant="outline"
+                          >
+                            Try again
+                          </Button>
+                        ) : null}
+                      </div>
                     ) : undefined,
                   message: (
                     <>
                       {draft.status.state === "failed" ? <span>{draft.status.message}</span> : null}
                       {submissionError ? <span>{submissionError}</span> : null}
                       {attachmentError ? <span>{attachmentError}</span> : null}
+                      {modelControlsSnapshot.error ? (
+                        <span>{modelControlsSnapshot.error}</span>
+                      ) : null}
                     </>
                   ),
                 }
@@ -149,12 +200,20 @@ export function ChatComposer({
           inputReadOnly={submitting}
           layout={layout}
           leadingActions={
-            <PromptAttachmentButton
-              attachments={draft.attachments}
-              disabled={submitting}
-              onChange={(attachments) => drafts.changeAttachments(project.id, attachments)}
-              onError={setAttachmentError}
-            />
+            <>
+              <PromptAttachmentButton
+                attachments={draft.attachments}
+                disabled={submitting}
+                onChange={(attachments) => drafts.changeAttachments(project.id, attachments)}
+                onError={setAttachmentError}
+              />
+              <ComposerInferenceControls
+                disabled={submitting}
+                onSelectEffort={modelControls.selectEffort}
+                onSelectRoute={modelControls.selectRoute}
+                snapshot={modelControlsSnapshot}
+              />
+            </>
           }
           onSubmit={() => void submit()}
           onValueChange={(value) => drafts.change(project.id, value)}

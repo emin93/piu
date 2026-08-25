@@ -51,6 +51,21 @@ test("loading publishes Pi's effective model controls as one stable snapshot", a
   expect(listener).toHaveBeenCalledOnce();
 });
 
+test("the same controller loads model controls for a project target", async () => {
+  const projectAdapter: ModelControlsAdapter<number> = {
+    get: vi.fn().mockResolvedValue(initialControls),
+    selectEffort: vi.fn().mockResolvedValue(initialControls),
+    selectRoute: vi.fn().mockResolvedValue(initialControls),
+  };
+  const controls = new ModelControlsController(7, projectAdapter);
+
+  await controls.load();
+  await controls.selectEffort("xhigh");
+
+  expect(projectAdapter.get).toHaveBeenCalledWith(7);
+  expect(projectAdapter.selectEffort).toHaveBeenCalledWith(7, "xhigh");
+});
+
 test("a route selection is visible while pending and adopts only Pi's returned efforts", async () => {
   const pending = deferred<ModelControlsSnapshot>();
   const modelAdapter = adapter({ selectRoute: vi.fn().mockReturnValue(pending.promise) });

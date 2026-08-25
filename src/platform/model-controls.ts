@@ -7,10 +7,10 @@ import type { ReasoningEffort } from "@/generated/ReasoningEffort";
 import type { SelectModelRouteRequest } from "@/generated/SelectModelRouteRequest";
 import type { SelectReasoningEffortRequest } from "@/generated/SelectReasoningEffortRequest";
 
-export interface ModelControlsAdapter {
-  get: (chatId: string) => Promise<ModelControlsSnapshot>;
-  selectEffort: (chatId: string, effort: ReasoningEffort) => Promise<ModelControlsSnapshot>;
-  selectRoute: (chatId: string, route: ModelRouteId) => Promise<ModelControlsSnapshot>;
+export interface ModelControlsAdapter<TargetId extends number | string = string> {
+  get: (targetId: TargetId) => Promise<ModelControlsSnapshot>;
+  selectEffort: (targetId: TargetId, effort: ReasoningEffort) => Promise<ModelControlsSnapshot>;
+  selectRoute: (targetId: TargetId, route: ModelRouteId) => Promise<ModelControlsSnapshot>;
 }
 
 export const tauriModelControlsAdapter: ModelControlsAdapter = {
