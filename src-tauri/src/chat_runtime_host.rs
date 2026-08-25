@@ -27,6 +27,8 @@ const MODEL_ID: &str = "gpt-5.6-sol";
 const THINKING_LEVEL: &str = "xhigh";
 const RESTORED_INTERRUPTED_TURN_MESSAGE: &str =
     "The agent turn was interrupted before Più reopened this chat.";
+const RUNTIME_INTERRUPTED_TURN_MESSAGE: &str =
+    "The agent runtime stopped before the turn finished. Send another message to continue.";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +49,8 @@ pub struct ConversationSnapshot {
     pub input_request: Option<ConversationInputRequest>,
     pub items: Vec<ConversationItem>,
     pub phase: ConversationPhase,
+    #[ts(type = "number")]
+    pub revision: u64,
 }
 
 impl ConversationSnapshot {
@@ -56,6 +60,7 @@ impl ConversationSnapshot {
             input_request: None,
             items: Vec::new(),
             phase: ConversationPhase::Stopped,
+            revision: 0,
         }
     }
 }
@@ -215,6 +220,8 @@ pub enum ConversationEvent {
 pub struct ChatRuntimeChangedEvent {
     pub chat_id: String,
     pub event: ConversationEvent,
+    #[ts(type = "number")]
+    pub revision: u64,
 }
 
 #[derive(Debug, Error)]
@@ -288,6 +295,7 @@ impl ChatSlot {
 struct ActiveChat {
     child: Arc<PiRpcChild>,
     command_generation: u64,
+    send_only: bool,
     stop_events: CancellationToken,
 }
 
@@ -312,6 +320,20 @@ impl ConversationProjection {
             native_steering_count: 0,
             pending_user_items: VecDeque::new(),
         }
+    }
+
+    fn stamp_events(&mut self, events: Vec<ConversationEvent>) -> Vec<(u64, ConversationEvent)> {
+        events
+            .into_iter()
+            .map(|event| {
+                self.snapshot.revision = self
+                    .snapshot
+                    .revision
+                    .checked_add(1)
+                    .expect("conversation event revision overflowed");
+                (self.snapshot.revision, event)
+            })
+            .collect()
     }
 }
 
@@ -557,10 +579,13 @@ impl ChatRuntimeHost {
             })?;
         let response = match (pending.kind, answer) {
             (_, ConversationInputAnswer::Cancelled) => PiRpcExtensionUiResponse::Cancelled,
+            (ConversationInputKind::Select, ConversationInputAnswer::Value { value })
+                if pending.options.contains(&value) =>
+            {
+                PiRpcExtensionUiResponse::Value(value)
+            }
             (
-                ConversationInputKind::Select
-                | ConversationInputKind::Input
-                | ConversationInputKind::Editor,
+                ConversationInputKind::Input | ConversationInputKind::Editor,
                 ConversationInputAnswer::Value { value },
             ) => PiRpcExtensionUiResponse::Value(value),
             (ConversationInputKind::Confirm, ConversationInputAnswer::Confirmed { confirmed }) => {
@@ -616,11 +641,30 @@ impl ChatRuntimeHost {
             active.command_generation = active.command_generation.wrapping_add(1);
             (Arc::clone(&active.child), active.command_generation)
         };
-        if attachments.iter().any(|attachment| {
+        let has_images = attachments.iter().any(|attachment| {
             attachment.kind == crate::prompt_attachments::PromptAttachmentKind::Image
-        }) && !child_accepts_images(&child).await?
+        });
+        if has_images {
+            match child_accepts_images(&child).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    retire_send_only_child(&slot, &child).await?;
+                    return Err(PromptAttachmentError::ModelMediaUnsupported.into());
+                }
+                Err(error) => {
+                    retire_send_only_child(&slot, &child).await?;
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(active) = slot
+            .active
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)?
+            .as_mut()
+            .filter(|active| Arc::ptr_eq(&active.child, &child))
         {
-            return Err(PromptAttachmentError::ModelMediaUnsupported.into());
+            active.send_only = false;
         }
         let (expected_index, was_running) = {
             let projection = slot
@@ -688,14 +732,35 @@ impl ChatRuntimeHost {
             }
         }
         if let Err(error) = child.request(command, CancellationToken::new()).await {
-            {
+            let retired = {
                 let mut active = slot.active.lock().map_err(|_| ChatRuntimeHostError::Lock)?;
-                if let Some(active) = active.as_mut().filter(|active| {
+                let owns_command = active.as_ref().is_some_and(|active| {
                     Arc::ptr_eq(&active.child, &child)
                         && active.command_generation == command_generation
-                }) {
-                    active.command_generation = active.command_generation.wrapping_add(1);
+                });
+                if !owns_command {
+                    None
+                } else if was_running {
+                    if let Some(active) = active.as_mut() {
+                        active.command_generation = active.command_generation.wrapping_add(1);
+                    }
+                    None
+                } else {
+                    let retired = active.take();
+                    if let Some(retired) = &retired {
+                        retired.stop_events.cancel();
+                    }
+                    retired
                 }
+            };
+            if let Some(retired) = retired
+                && let Err(shutdown_error) = retired.child.shutdown().await
+            {
+                tracing::warn!(
+                    %shutdown_error,
+                    %chat_id,
+                    "could not retire chat runtime after prompt rejection"
+                );
             }
             let (removed, failed) = {
                 let mut projection = slot
@@ -923,6 +988,7 @@ impl ChatRuntimeHost {
             } else {
                 ConversationPhase::Idle
             },
+            revision: 0,
         };
         let next_message_index = messages
             .iter()
@@ -955,6 +1021,7 @@ impl ChatRuntimeHost {
         *slot.active.lock().map_err(|_| ChatRuntimeHostError::Lock)? = Some(ActiveChat {
             child: Arc::clone(&child),
             command_generation: 0,
+            send_only: keep_stopped_runtime && !should_start,
             stop_events: stop_events.clone(),
         });
         self.forward_events(
@@ -1046,9 +1113,20 @@ impl ChatRuntimeHost {
     }
 
     fn emit(&self, chat_id: &str, event: ConversationEvent) {
+        let Ok(slot) = self.slot(chat_id) else {
+            return;
+        };
+        let Ok(mut projection) = slot.projection.lock() else {
+            return;
+        };
+        let Some((revision, event)) = projection.stamp_events(vec![event]).pop() else {
+            return;
+        };
+        drop(projection);
         let _ = self.inner.events.send(ChatRuntimeChangedEvent {
             chat_id: chat_id.to_owned(),
             event,
+            revision,
         });
     }
 
@@ -1105,6 +1183,7 @@ impl ChatRuntimeHost {
                                 return;
                             };
                             let projected = project_pi_event(&mut projection, &event.payload);
+                            let projected = projection.stamp_events(projected);
                             let active = active.take();
                             (projected, active)
                         };
@@ -1114,10 +1193,11 @@ impl ChatRuntimeHost {
                                 tracing::warn!(%error, %chat_id, "could not retire completed chat runtime");
                             }
                         }
-                        for event in projected.0 {
+                        for (revision, event) in projected.0 {
                             let _ = inner.events.send(ChatRuntimeChangedEvent {
                                 chat_id: chat_id.clone(),
                                 event,
+                                revision,
                             });
                         }
                         return;
@@ -1136,12 +1216,14 @@ impl ChatRuntimeHost {
                             let Ok(mut projection) = slot.projection.lock() else {
                                 return;
                             };
-                            project_pi_event(&mut projection, &event.payload)
+                            let projected = project_pi_event(&mut projection, &event.payload);
+                            projection.stamp_events(projected)
                         };
-                        for event in projected {
+                        for (revision, event) in projected {
                             let _ = inner.events.send(ChatRuntimeChangedEvent {
                                 chat_id: chat_id.clone(),
                                 event,
+                                revision,
                             });
                         }
                     }
@@ -1165,15 +1247,19 @@ impl ChatRuntimeHost {
                             }
                             *active = None;
                         }
-                        let message =
-                            format!("The Pi runtime stopped before the turn finished. {}", error);
-                        let mut projected = Vec::new();
-                        if let Ok(mut projection) = slot.projection.lock() {
+                        tracing::warn!(%error, %chat_id, "Pi runtime stopped during an active turn");
+                        let message = RUNTIME_INTERRUPTED_TURN_MESSAGE.to_owned();
+                        let projected = if let Ok(mut projection) = slot.projection.lock() {
+                            let mut projected = Vec::new();
                             interrupt_running_tools(&mut projection, &mut projected);
                             projection.snapshot.failure = Some(message.clone());
                             clear_pending_input(&mut projection, &mut projected);
                             projection.snapshot.phase = ConversationPhase::Interrupted;
-                        }
+                            projected.push(ConversationEvent::TurnInterrupted { message });
+                            projection.stamp_events(projected)
+                        } else {
+                            return;
+                        };
                         if let Err(shutdown_error) = child.shutdown().await {
                             tracing::debug!(
                                 %shutdown_error,
@@ -1181,11 +1267,11 @@ impl ChatRuntimeHost {
                                 "failed Pi runtime was already unavailable during retirement"
                             );
                         }
-                        projected.push(ConversationEvent::TurnInterrupted { message });
-                        for event in projected {
+                        for (revision, event) in projected {
                             let _ = inner.events.send(ChatRuntimeChangedEvent {
                                 chat_id: chat_id.clone(),
                                 event,
+                                revision,
                             });
                         }
                         return;
@@ -1367,6 +1453,30 @@ fn prompt_command(message: &str, attachments: &[PromptAttachment], steer: bool) 
         command["images"] = Value::Array(images);
     }
     command
+}
+
+async fn retire_send_only_child(
+    slot: &ChatSlot,
+    child: &Arc<PiRpcChild>,
+) -> Result<(), ChatRuntimeHostError> {
+    let active = {
+        let mut active = slot.active.lock().map_err(|_| ChatRuntimeHostError::Lock)?;
+        if active
+            .as_ref()
+            .is_some_and(|active| active.send_only && Arc::ptr_eq(&active.child, child))
+        {
+            active.take()
+        } else {
+            None
+        }
+    };
+    if let Some(active) = active {
+        active.stop_events.cancel();
+        if let Err(error) = active.child.shutdown().await {
+            tracing::warn!(%error, "could not retire send-only chat runtime after preflight failure");
+        }
+    }
+    Ok(())
 }
 
 async fn child_accepts_images(child: &PiRpcChild) -> Result<bool, ChatRuntimeHostError> {

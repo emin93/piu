@@ -71,11 +71,12 @@ test("a chat observes its first runtime event and ignores events for other chats
       },
     ],
     phase: "running",
+    revision: 7,
   };
   boundary.invoke.mockImplementationOnce((command: string) => {
     boundary.order.push(`invoke:${command}`);
     boundary.handler?.({
-      payload: { chatId: "chat-other", event: { type: "turn-stopped" } },
+      payload: { chatId: "chat-other", event: { type: "turn-stopped" }, revision: 1 },
     } as Event<ChatRuntimeChangedEvent>);
     boundary.handler?.({
       payload: {
@@ -91,6 +92,7 @@ test("a chat observes its first runtime event and ignores events for other chats
             text: "Done.",
           },
         },
+        revision: 8,
       },
     } as Event<ChatRuntimeChangedEvent>);
     return Promise.resolve(snapshot);
@@ -104,17 +106,20 @@ test("a chat observes its first runtime event and ignores events for other chats
   });
   expect(connection.snapshot).toEqual(snapshot);
   expect(receive).toHaveBeenCalledOnce();
-  expect(receive).toHaveBeenCalledWith({
-    beforeItemId: null,
-    type: "item-added",
-    item: {
-      kind: "message",
-      id: "message-4",
-      queued: false,
-      role: "assistant",
-      text: "Done.",
+  expect(receive).toHaveBeenCalledWith(
+    {
+      beforeItemId: null,
+      type: "item-added",
+      item: {
+        kind: "message",
+        id: "message-4",
+        queued: false,
+        role: "assistant",
+        text: "Done.",
+      },
     },
-  });
+    8,
+  );
 });
 
 test("runtime changes preserve every generated event field", async () => {

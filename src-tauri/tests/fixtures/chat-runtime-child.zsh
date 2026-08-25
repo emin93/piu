@@ -178,7 +178,7 @@ while IFS= read -r line; do
         printf '%s\n' \
           '{"type":"agent_start"}' \
           '{"type":"extension_ui_request","id":"extension-choice-1","method":"select","title":"Choose a strategy","options":["Keep both","Replace"]}'
-      elif [[ "$mode" == "reject-steer" && $prompt_count -gt 1 ]]; then
+      elif [[ "$mode" == "reject-prompt" || ("$mode" == "reject-steer" && $prompt_count -gt 1) ]]; then
         sleep 1
         printf '{"id":"%s","type":"response","command":"prompt","success":false,"error":"fixture rejection"}\n' "$id"
       else

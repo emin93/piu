@@ -68,7 +68,7 @@ export function ProductComposer({
         placeholder={placeholder}
         readOnly={readOnly || inputReadOnly}
         ref={inputRef}
-        rows={layout === "centered" ? 4 : 3}
+        rows={layout === "centered" ? 4 : 2}
         value={value}
       />
       <div className="product-composer-footer">

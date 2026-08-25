@@ -71,6 +71,7 @@ export interface ConversationSnapshot {
   inputRequest: ConversationInputRequest | null;
   items: readonly ConversationItem[];
   phase: ConversationPhase;
+  revision?: number;
 }
 
 export interface ConversationTextDelta {
@@ -180,7 +181,7 @@ export interface ConversationPromptRequest {
 export interface ConversationAdapter {
   connect: (
     chatId: string,
-    onEvent: (event: ConversationEvent) => void,
+    onEvent: (event: ConversationEvent, revision?: number) => void,
   ) => Promise<ConversationConnection>;
   prompt: (request: ConversationPromptRequest) => Promise<void>;
   answerInput: (
@@ -305,6 +306,7 @@ function mapNativeSnapshot(snapshot: NativeConversationSnapshot): ConversationSn
     inputRequest: snapshot.inputRequest,
     items: snapshot.items.map(mapNativeItem),
     phase: snapshot.phase,
+    revision: snapshot.revision,
   };
 }
 
@@ -322,7 +324,9 @@ export const tauriConversationAdapter: ConversationAdapter = {
     const unlisten = await listen<ChatRuntimeChangedEvent>(
       CHAT_RUNTIME_CHANGED_EVENT,
       ({ payload }) => {
-        if (payload.chatId === chatId) onEvent(mapNativeEvent(payload.event));
+        if (payload.chatId === chatId) {
+          onEvent(mapNativeEvent(payload.event), payload.revision);
+        }
       },
     );
     let snapshot: NativeConversationSnapshot;

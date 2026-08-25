@@ -5,7 +5,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import { mockVirtuosoAutoscrollToBottom } from "@/test/mock-virtuoso-state";
 
-import { ConversationSurface } from "./ConversationSurface";
+import { ConversationSurface, type TranscriptViewState } from "./ConversationSurface";
 import { ConversationStore } from "./conversation-store";
 
 let nextAnimationFrame = 1;
@@ -49,7 +49,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-test("the transcript keeps prose plain and exposes tool detail by status", async () => {
+test("the AI Elements transcript presents chat messages and exposes activity detail by status", async () => {
   const user = userEvent.setup();
   const store = new ConversationStore({
     failure: null,
@@ -116,18 +116,23 @@ test("the transcript keeps prose plain and exposes tool detail by status", async
   expect(screen.queryByText("Read package.json")).not.toBeInTheDocument();
   expect(screen.getByText("Compiling the Tauri bundle")).toBeVisible();
   expect(screen.getByText("The release check exited with code 1")).toBeVisible();
-  expect(screen.getByText("1,200 in · 84 out · 800 cached")).toBeVisible();
+  expect(screen.queryByText("1,200 in · 84 out · 800 cached")).not.toBeInTheDocument();
+
+  expect(screen.getByLabelText("You")).toHaveAttribute("data-ai-element", "message");
+  expect(screen.getByLabelText("Più")).toHaveAttribute("data-ai-element", "message");
+  expect(screen.getByLabelText("You")).toHaveAttribute("data-role", "user");
+  expect(screen.getByLabelText("Più")).toHaveAttribute("data-role", "assistant");
 
   const reasoningTrigger = screen.getByRole("button", { name: "Show reasoning" });
-  expect(reasoningTrigger.closest(".conversation-reasoning-row")).toHaveTextContent(
-    "PiùShow reasoning",
-  );
+  expect(reasoningTrigger.closest("[data-ai-element='reasoning']")).toHaveTextContent("Thought");
 
   await user.click(reasoningTrigger);
   await user.click(screen.getByRole("button", { name: "Show Read package manifest details" }));
+  await user.click(screen.getByRole("button", { name: "Show turn context" }));
 
   expect(screen.getByText("I should inspect the manifest.")).toBeVisible();
   expect(screen.getByText("Read package.json")).toBeVisible();
+  expect(screen.getByText("1,200 in · 84 out · 800 cached")).toBeVisible();
   expect(screen.getByRole("button", { name: "Hide Read package manifest details" })).toBeVisible();
   expect(screen.getByRole("textbox", { name: "Message Più" })).toBeEnabled();
   expect(screen.getByRole("button", { name: "Stop turn" })).toBeVisible();
@@ -553,6 +558,7 @@ test("appended turns preserve a manual scroll position", () => {
     scrollHeight: { configurable: true, value: 10_080 },
   });
   scroller.scrollTop = 0;
+  fireEvent.wheel(scroller);
   fireEvent.scroll(scroller);
   act(flushAnimationFrames);
   mockVirtuosoAutoscrollToBottom.mockClear();
@@ -565,8 +571,8 @@ test("appended turns preserve a manual scroll position", () => {
   expect(mockVirtuosoAutoscrollToBottom).not.toHaveBeenCalled();
 });
 
-test("saves and restores the virtualized transcript state across navigation", () => {
-  const saveTranscriptState = vi.fn();
+test("a transient restore scroll signal does not replace follow intent", () => {
+  const saveTranscriptState = vi.fn<(state: TranscriptViewState) => void>();
   const rendered = render(
     <ConversationSurface
       onTranscriptStateChange={saveTranscriptState}
@@ -574,21 +580,173 @@ test("saves and restores the virtualized transcript state across navigation", ()
     />,
   );
   const transcript = screen.getByRole("region", { name: "Conversation transcript" });
-  transcript.scrollTop = 144;
+  Object.defineProperties(transcript, {
+    clientHeight: { configurable: true, value: 420 },
+    scrollHeight: { configurable: true, value: 10_080 },
+  });
+  transcript.scrollTop = 0;
+  fireEvent.scroll(transcript);
 
   rendered.unmount();
 
-  expect(saveTranscriptState).toHaveBeenCalledWith({ ranges: [], scrollTop: 144 });
+  expect(saveTranscriptState.mock.calls[0]?.[0].followOutput).toBe(true);
+});
 
+test("saves and restores the virtualized transcript state across navigation", () => {
+  const saveTranscriptState = vi.fn<(state: TranscriptViewState) => void>();
+  const initialStore = interactionTranscriptStore();
+  const rendered = render(
+    <ConversationSurface onTranscriptStateChange={saveTranscriptState} store={initialStore} />,
+  );
+  const transcript = screen.getByRole("region", { name: "Conversation transcript" });
+  Object.defineProperties(transcript, {
+    clientHeight: { configurable: true, value: 420 },
+    getBoundingClientRect: {
+      configurable: true,
+      value: () => ({ bottom: 460, height: 420, left: 0, right: 800, top: 40, width: 800 }),
+    },
+    scrollHeight: { configurable: true, value: 10_080 },
+  });
+  const anchorItem = screen.getByText("Older transcript row 112").closest("[data-item-index]");
+  expect(anchorItem).not.toBeNull();
+  Object.defineProperty(anchorItem, "getBoundingClientRect", {
+    configurable: true,
+    value: () => ({ bottom: 152, height: 84, left: 0, right: 640, top: 68, width: 640 }),
+  });
+  transcript.scrollTop = 144;
+  fireEvent.wheel(transcript);
+  fireEvent.scroll(transcript);
+  act(flushAnimationFrames);
+
+  rendered.unmount();
+
+  const savedState = saveTranscriptState.mock.calls[0]?.[0];
+  expect(savedState?.followOutput).toBe(false);
+  expect(savedState?.anchor?.itemId).toBe("history-112");
+  expect(savedState?.anchor?.offset).toBe(0);
+  expect(savedState?.layoutSignature).toContain("selected-message:message:assistant:0:");
+  expect(savedState?.virtualization).toEqual({ ranges: [], scrollTop: 144 });
+
+  mockVirtuosoAutoscrollToBottom.mockClear();
+  saveTranscriptState.mockClear();
+  const restored = render(
+    <ConversationSurface
+      initialTranscriptState={savedState}
+      onTranscriptStateChange={saveTranscriptState}
+      store={interactionTranscriptStore()}
+    />,
+  );
+  const restoredTranscript = screen.getByRole("region", { name: "Conversation transcript" });
+  expect(restoredTranscript).toHaveAttribute("data-start-index", "112");
+  expect(restoredTranscript).toHaveAttribute("data-start-offset", "0");
+  expect(restoredTranscript).not.toHaveAttribute("data-restored-scroll-top");
+  expect(mockVirtuosoAutoscrollToBottom).not.toHaveBeenCalled();
+
+  Object.defineProperties(restoredTranscript, {
+    clientHeight: { configurable: true, value: 420 },
+    getBoundingClientRect: {
+      configurable: true,
+      value: () => ({ bottom: 500, height: 420, left: 0, right: 800, top: 80, width: 800 }),
+    },
+    scrollHeight: { configurable: true, value: 10_080 },
+  });
+  const restoredAnchorItem = screen
+    .getByText("Older transcript row 112")
+    .closest("[data-item-index]");
+  expect(restoredAnchorItem).not.toBeNull();
+  Object.defineProperty(restoredAnchorItem, "getBoundingClientRect", {
+    configurable: true,
+    value: () => ({ bottom: 192, height: 84, left: 0, right: 640, top: 108, width: 640 }),
+  });
+  restoredTranscript.scrollTop = 144;
+  fireEvent.wheel(restoredTranscript);
+  fireEvent.scroll(restoredTranscript);
+  act(flushAnimationFrames);
+  restored.unmount();
+
+  const repeatedlySavedState = saveTranscriptState.mock.calls[0]?.[0];
+  expect(repeatedlySavedState?.anchor).toEqual({ itemId: "history-112", offset: 0 });
   render(
     <ConversationSurface
-      initialTranscriptState={{ ranges: [], scrollTop: 144 }}
+      initialTranscriptState={repeatedlySavedState}
       store={interactionTranscriptStore()}
     />,
   );
   expect(screen.getByRole("region", { name: "Conversation transcript" })).toHaveAttribute(
+    "data-start-offset",
+    "0",
+  );
+});
+
+test("does not restore stale virtualized measurements after a hidden chat streams", () => {
+  const initialStore = interactionTranscriptStore();
+  const saveTranscriptState = vi.fn<(state: TranscriptViewState) => void>();
+  const rendered = render(
+    <ConversationSurface onTranscriptStateChange={saveTranscriptState} store={initialStore} />,
+  );
+  const transcript = screen.getByRole("region", { name: "Conversation transcript" });
+  Object.defineProperties(transcript, {
+    clientHeight: { configurable: true, value: 420 },
+    scrollHeight: { configurable: true, value: 10_080 },
+  });
+  transcript.scrollTop = 144;
+  fireEvent.wheel(transcript);
+  fireEvent.scroll(transcript);
+  rendered.unmount();
+
+  const backgroundStore = interactionTranscriptStore();
+  backgroundStore.apply({ type: "text-delta", itemId: "streaming-message", delta: " safely." });
+  render(
+    <ConversationSurface
+      initialTranscriptState={saveTranscriptState.mock.calls[0]?.[0]}
+      store={backgroundStore}
+    />,
+  );
+
+  const restoredTranscript = screen.getByRole("region", { name: "Conversation transcript" });
+  expect(restoredTranscript).toHaveAttribute("data-start-index", "112");
+  expect(restoredTranscript).not.toHaveAttribute("data-restored-scroll-top");
+});
+
+test("does not restore measurements after an equal-length hidden tool update", () => {
+  const withRunningTool = () => {
+    const store = interactionTranscriptStore();
+    store.apply({
+      beforeItemId: null,
+      item: {
+        detail: "Read alpha",
+        id: "layout-tool",
+        kind: "tool",
+        name: "Inspect files",
+        status: "running",
+      },
+      type: "item-added",
+    });
+    return store;
+  };
+  const initialStore = withRunningTool();
+  const saveTranscriptState = vi.fn<(state: TranscriptViewState) => void>();
+  const rendered = render(
+    <ConversationSurface onTranscriptStateChange={saveTranscriptState} store={initialStore} />,
+  );
+  rendered.unmount();
+
+  const backgroundStore = withRunningTool();
+  backgroundStore.apply({
+    detail: "Read bravo",
+    itemId: "layout-tool",
+    status: "running",
+    type: "tool-update",
+  });
+  render(
+    <ConversationSurface
+      initialTranscriptState={saveTranscriptState.mock.calls[0]?.[0]}
+      store={backgroundStore}
+    />,
+  );
+
+  expect(screen.getByRole("region", { name: "Conversation transcript" })).not.toHaveAttribute(
     "data-restored-scroll-top",
-    "144",
   );
 });
 

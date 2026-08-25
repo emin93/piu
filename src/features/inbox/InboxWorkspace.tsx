@@ -18,7 +18,6 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import type { StateSnapshot } from "react-virtuoso";
 
 import {
   AlertDialog,
@@ -63,6 +62,7 @@ import type { ConversationAdapter } from "@/platform/conversations";
 import type { PromptAttachment } from "@/platform/prompt-attachments";
 
 import { ChatComposer } from "./ChatComposer";
+import type { TranscriptViewState } from "../conversation/ConversationSurface";
 import { ChatActivityController } from "./chat-activity-controller";
 import { EmptyInbox } from "./EmptyInbox";
 import { type DraftPersistenceStatus, ProjectDraftController } from "./draft-controller";
@@ -187,13 +187,13 @@ const ChatConversationPanel = lazy(() => import("../conversation/ChatConversatio
 const MAX_CACHED_TRANSCRIPT_STATES = 32;
 
 class TranscriptStateCache {
-  readonly #states = new Map<string, StateSnapshot>();
+  readonly #states = new Map<string, TranscriptViewState>();
 
   get(chatId: string) {
     return this.#states.get(chatId);
   }
 
-  remember(chatId: string, state: StateSnapshot) {
+  remember(chatId: string, state: TranscriptViewState) {
     this.#states.delete(chatId);
     this.#states.set(chatId, state);
     if (this.#states.size <= MAX_CACHED_TRANSCRIPT_STATES) return;
@@ -217,12 +217,12 @@ function SelectedChatStage({
   chat: ChatSummary;
   conversationAdapter: ConversationAdapter;
   conversationRevision: number;
-  initialTranscriptState?: StateSnapshot;
+  initialTranscriptState?: TranscriptViewState;
   onCancelSetup: (chatId: string) => Promise<string | undefined>;
   onOpenTerminal: (chatId: string) => Promise<string | undefined>;
   onRequestCodexSignIn: () => void;
   onRetrySetup: (chatId: string) => Promise<string | undefined>;
-  rememberTranscriptState: (chatId: string, state: StateSnapshot) => void;
+  rememberTranscriptState: (chatId: string, state: TranscriptViewState) => void;
   setups: ChatSetupController;
 }) {
   const subscribe = useCallback(
@@ -233,7 +233,7 @@ function SelectedChatStage({
   const setup = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   const ready = setup.phase === "notRequired" || setup.phase === "succeeded";
   const saveTranscriptState = useCallback(
-    (state: StateSnapshot) => rememberTranscriptState(chat.id, state),
+    (state: TranscriptViewState) => rememberTranscriptState(chat.id, state),
     [chat.id, rememberTranscriptState],
   );
 
@@ -398,14 +398,22 @@ function DraftList({
   const visibleDrafts = projects.flatMap((project) => {
     if (selectedProjectId !== null && project.id !== selectedProjectId) return [];
     const draft = drafts.get(project.id);
-    if (!draft.prompt) return [];
+    if (!draft.prompt && draft.attachments.length === 0) return [];
+    const attachmentNames = draft.attachments.map(({ name }) => name).join(" ");
     if (
       normalizedQuery &&
-      !`${project.name} ${draft.prompt}`.toLocaleLowerCase().includes(normalizedQuery)
+      !`${project.name} ${draft.prompt} ${attachmentNames}`
+        .toLocaleLowerCase()
+        .includes(normalizedQuery)
     ) {
       return [];
     }
-    return [{ draft, project }];
+    const summary =
+      draft.prompt ||
+      (draft.attachments.length === 1
+        ? `Attached ${draft.attachments[0].name}`
+        : `${draft.attachments.length} attached files`);
+    return [{ draft, project, summary }];
   });
 
   if (visibleDrafts.length === 0) return null;
@@ -417,7 +425,7 @@ function DraftList({
         <span className="font-mono">{visibleDrafts.length}</span>
       </div>
       <ul aria-label="Unsent drafts" className="draft-list">
-        {visibleDrafts.map(({ draft, project }) => (
+        {visibleDrafts.map(({ draft, project, summary }) => (
           <li key={project.id}>
             <Button
               className="draft-row"
@@ -426,7 +434,7 @@ function DraftList({
               variant="ghost"
             >
               <span className="draft-row-project">{project.name}</span>
-              <span className="draft-row-prompt">{draft.prompt}</span>
+              <span className="draft-row-prompt">{summary}</span>
               {draft.status.state === "failed" ? (
                 <span className="draft-row-failure">Not saved</span>
               ) : null}
@@ -509,7 +517,7 @@ export function InboxWorkspace({
   const selectedChat = snapshot.chats.find(({ id }) => id === selectedChatId);
   const visibleChatCount = selection.unmergedChats.length;
   const rememberTranscriptState = useCallback(
-    (chatId: string, state: StateSnapshot) => {
+    (chatId: string, state: TranscriptViewState) => {
       transcriptStates.remember(chatId, state);
     },
     [transcriptStates],
@@ -546,7 +554,10 @@ export function InboxWorkspace({
   }, [chatPendingRename, closeRenameDialog, onRenameChat, renameTitle]);
 
   const pendingRemovalHasDraft = projectPendingRemoval
-    ? Boolean(drafts.get(projectPendingRemoval.id).prompt)
+    ? Boolean(
+        drafts.get(projectPendingRemoval.id).prompt ||
+        drafts.get(projectPendingRemoval.id).attachments.length,
+      )
     : false;
   const totalSearchResults = selection.unmergedChats.length + selection.mergedChats.length;
 

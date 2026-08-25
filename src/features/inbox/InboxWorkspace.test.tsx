@@ -381,6 +381,42 @@ test("removal discloses draft deletion and keeps the modal open on failure", asy
   expect(dialog).toBeVisible();
 });
 
+test("attachment-only drafts stay visible and are disclosed before project removal", async () => {
+  const user = userEvent.setup();
+  const attachmentOnlySnapshot: InboxSnapshot = {
+    ...populatedSnapshot,
+    drafts: [
+      ...populatedSnapshot.drafts,
+      {
+        attachments: [
+          {
+            content: "Release notes",
+            id: "notes-attachment",
+            kind: "text",
+            mimeType: "text/plain",
+            name: "notes.txt",
+            sizeBytes: 13,
+          },
+        ],
+        projectId: 3,
+        prompt: "",
+        updatedAtMs: 700,
+      },
+    ],
+  };
+  render(<WorkspaceHarness initialSnapshot={attachmentOnlySnapshot} />);
+
+  const draftsList = screen.getByRole("list", { name: "Unsent drafts" });
+  expect(within(draftsList).getByText("Attached notes.txt")).toBeVisible();
+
+  await user.click(screen.getByRole("button", { name: "Project actions for Caldera" }));
+  await user.click(await screen.findByRole("menuitem", { name: "Remove project" }));
+
+  expect(screen.getByRole("alertdialog", { name: "Remove Caldera?" })).toHaveTextContent(
+    "unsent draft will be deleted",
+  );
+});
+
 test("a failed draft stays visible in All Projects and can be retried", async () => {
   const save = vi
     .fn<(projectId: number, prompt: string) => Promise<void>>()

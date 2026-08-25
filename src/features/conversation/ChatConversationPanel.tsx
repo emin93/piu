@@ -1,6 +1,5 @@
 import { LoaderCircleIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { StateSnapshot } from "react-virtuoso";
 
 import {
   type ConversationAdapter,
@@ -9,15 +8,15 @@ import {
 } from "@/platform/conversations";
 import type { PromptAttachment } from "@/platform/prompt-attachments";
 
-import { ConversationSurface } from "./ConversationSurface";
+import { ConversationSurface, type TranscriptViewState } from "./ConversationSurface";
 import { ConversationController } from "./conversation-controller";
 
 interface ChatConversationPanelProps {
   adapter: ConversationAdapter;
   chatId: string;
-  initialTranscriptState?: StateSnapshot;
+  initialTranscriptState?: TranscriptViewState;
   onRequestCodexSignIn: () => void;
-  onTranscriptStateChange?: (state: StateSnapshot) => void;
+  onTranscriptStateChange?: (state: TranscriptViewState) => void;
   revision?: number;
 }
 

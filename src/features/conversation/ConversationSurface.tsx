@@ -14,6 +14,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useEffectEvent,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -26,12 +27,16 @@ import {
   type ContextProp,
   type FollowOutput,
   type ItemProps,
+  type ListRange,
   type ListProps,
   type StateSnapshot,
   type VirtuosoHandle,
 } from "react-virtuoso";
 
 import { ProductComposer } from "@/components/ProductComposer";
+import { Message, MessageContent } from "@/components/ai-elements/message";
+import { Reasoning, ReasoningContent, ReasoningTrigger } from "@/components/ai-elements/reasoning";
+import { Tool, ToolContent, ToolHeader } from "@/components/ai-elements/tool";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
@@ -52,17 +57,27 @@ import { ConversationStore } from "./conversation-store";
 import { ConversationInputDialog } from "./ConversationInputDialog";
 import "./conversation.css";
 
+export interface TranscriptViewState {
+  anchor: {
+    itemId: string;
+    offset: number;
+  } | null;
+  followOutput: boolean;
+  layoutSignature: string;
+  virtualization: StateSnapshot;
+}
+
 interface ConversationSurfaceProps {
   attachments?: readonly PromptAttachment[];
   draft?: string;
-  initialTranscriptState?: StateSnapshot;
+  initialTranscriptState?: TranscriptViewState;
   onAnswerInput?: (requestId: string, answer: ConversationInputAnswer) => Promise<void>;
   onAttachmentsChange?: (attachments: PromptAttachment[]) => void;
   onDraftChange?: (value: string) => void;
   onRequestCodexSignIn?: () => void;
   onSend?: (text: string, attachments: readonly PromptAttachment[]) => Promise<void>;
   onStop?: () => Promise<void>;
-  onTranscriptStateChange?: (state: StateSnapshot) => void;
+  onTranscriptStateChange?: (state: TranscriptViewState) => void;
   recovery?: {
     message: string;
     onRequestCodexSignIn?: () => void;
@@ -77,6 +92,61 @@ const EMPTY_CONVERSATION = new ConversationStore({
   items: [],
   phase: "stopped",
 });
+const TRANSCRIPT_ITEM_LAYOUT_SIGNATURES = new WeakMap<ConversationItem, string>();
+
+function hashLayoutText(value: string) {
+  let primary = 2_166_136_261;
+  let secondary = 2_654_435_769;
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    primary = Math.imul(primary ^ codeUnit, 16_777_619);
+    secondary = Math.imul(secondary ^ codeUnit, 2_246_822_519);
+  }
+  return `${value.length}:${(primary >>> 0).toString(36)}:${(secondary >>> 0).toString(36)}`;
+}
+
+function transcriptItemLayoutSignature(item: ConversationItem) {
+  const cached = TRANSCRIPT_ITEM_LAYOUT_SIGNATURES.get(item);
+  if (cached) return cached;
+  let signature: string;
+  switch (item.kind) {
+    case "message":
+      signature = `message:${item.role}:${item.queued ? 1 : 0}:${hashLayoutText(item.text)}`;
+      break;
+    case "reasoning":
+      signature = `reasoning:${hashLayoutText(item.text)}`;
+      break;
+    case "tool":
+      signature = `tool:${hashLayoutText(item.name)}:${item.status}:${hashLayoutText(item.detail)}`;
+      break;
+    case "usage":
+      signature = `usage:${item.inputTokens}:${item.outputTokens}:${item.cacheReadTokens}`;
+      break;
+  }
+  TRANSCRIPT_ITEM_LAYOUT_SIGNATURES.set(item, signature);
+  return signature;
+}
+
+function transcriptLayoutSignature(itemIds: readonly string[], store: ConversationStore) {
+  return itemIds
+    .map((itemId) => {
+      const item = store.getItem(itemId);
+      if (!item) return `${itemId}:missing`;
+      return `${itemId}:${transcriptItemLayoutSignature(item)}`;
+    })
+    .join("\u001f");
+}
+
+function transcriptAnchor(
+  itemIds: readonly string[],
+  visibleRange: ListRange | null,
+): TranscriptViewState["anchor"] {
+  const index = visibleRange?.startIndex;
+  if (index === undefined) return null;
+  const itemId = itemIds[index];
+  if (!itemId) return null;
+  return { itemId, offset: 0 };
+}
 
 const tokenFormatter = new Intl.NumberFormat("en-US");
 
@@ -94,105 +164,112 @@ function ToolDetail({ detail }: { detail: string }) {
 }
 
 function ToolItem({ item }: { item: ConversationTool }) {
-  const [open, setOpen] = useState(false);
-  if (item.status === "succeeded") {
-    return (
-      <Collapsible
-        className="conversation-tool"
-        data-status={item.status}
-        onOpenChange={setOpen}
-        open={open}
-      >
-        <CollapsibleTrigger
-          aria-label={`${open ? "Hide" : "Show"} ${item.name} details`}
-          render={<Button className="conversation-tool-trigger" type="button" variant="ghost" />}
-        >
-          <ToolStatusIcon status={item.status} />
-          <span>{item.name}</span>
-          <span className="conversation-tool-state">Completed</span>
-          <ChevronDownIcon aria-hidden="true" className="conversation-disclosure" />
-        </CollapsibleTrigger>
-        <CollapsibleContent>
-          <ToolDetail detail={item.detail} />
-        </CollapsibleContent>
-      </Collapsible>
-    );
-  }
+  const [open, setOpen] = useState(item.status !== "succeeded");
 
   return (
-    <section
-      aria-label={`${item.name}, ${item.status}`}
+    <Tool
       className="conversation-tool"
       data-status={item.status}
+      onOpenChange={setOpen}
+      open={open}
     >
-      <div className="conversation-tool-heading">
+      <ToolHeader
+        aria-label={`${open ? "Hide" : "Show"} ${item.name} details`}
+        className="conversation-tool-trigger"
+      >
         <ToolStatusIcon status={item.status} />
-        <span>{item.name}</span>
+        <span className="conversation-tool-name">{item.name}</span>
         <span className="conversation-tool-state">
           {item.status === "running"
             ? "Running"
-            : item.status === "interrupted"
-              ? "Interrupted"
-              : "Failed"}
+            : item.status === "succeeded"
+              ? "Completed"
+              : item.status === "interrupted"
+                ? "Interrupted"
+                : "Failed"}
         </span>
-      </div>
-      <ToolDetail detail={item.detail} />
-    </section>
+        <ChevronDownIcon aria-hidden="true" className="conversation-disclosure" />
+      </ToolHeader>
+      <ToolContent>
+        <ToolDetail detail={item.detail} />
+      </ToolContent>
+    </Tool>
   );
 }
 
 function ReasoningItem({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="conversation-reasoning-row">
-      <p className="conversation-message-role">Più</p>
-      <Collapsible className="conversation-reasoning" onOpenChange={setOpen} open={open}>
-        <CollapsibleTrigger
-          render={
-            <Button className="conversation-reasoning-trigger" type="button" variant="ghost" />
-          }
-        >
-          <ChevronDownIcon aria-hidden="true" className="conversation-disclosure" />
-          {open ? "Hide reasoning" : "Show reasoning"}
-        </CollapsibleTrigger>
-        <CollapsibleContent>
-          <p>{text || "Reasoning is streaming"}</p>
-        </CollapsibleContent>
-      </Collapsible>
-    </div>
+    <Reasoning className="conversation-reasoning" onOpenChange={setOpen} open={open}>
+      <ReasoningTrigger
+        aria-label={open ? "Hide reasoning" : "Show reasoning"}
+        className="conversation-reasoning-trigger"
+      >
+        <span>{text ? "Thought" : "Thinking"}</span>
+        <ChevronDownIcon aria-hidden="true" className="conversation-disclosure" />
+      </ReasoningTrigger>
+      <ReasoningContent className="conversation-reasoning-content">
+        <p>{text || "Reasoning is streaming"}</p>
+      </ReasoningContent>
+    </Reasoning>
+  );
+}
+
+function UsageItem({
+  cacheReadTokens,
+  inputTokens,
+  outputTokens,
+}: {
+  cacheReadTokens: number | null;
+  inputTokens: number;
+  outputTokens: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const cached = cacheReadTokens ? ` · ${tokenFormatter.format(cacheReadTokens)} cached` : "";
+  return (
+    <Collapsible className="conversation-usage" onOpenChange={setOpen} open={open}>
+      <CollapsibleTrigger
+        aria-label={open ? "Hide turn context" : "Show turn context"}
+        render={<Button className="conversation-usage-trigger" type="button" variant="ghost" />}
+      >
+        <span>Turn context</span>
+        <ChevronDownIcon aria-hidden="true" className="conversation-disclosure" />
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <p className="conversation-usage-detail">
+          {tokenFormatter.format(inputTokens)} in · {tokenFormatter.format(outputTokens)} out
+          {cached}
+        </p>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+function MessageItem({ item }: { item: Extract<ConversationItem, { kind: "message" }> }) {
+  const label = item.role === "user" ? "You" : "Più";
+  return (
+    <Message aria-label={label} className="conversation-message" from={item.role}>
+      <MessageContent className="conversation-message-content">
+        <p className="conversation-message-copy">{item.text}</p>
+      </MessageContent>
+      {item.queued ? <p className="conversation-message-queue">Queued · next safe point</p> : null}
+    </Message>
   );
 }
 
 function TranscriptItemView({ item }: { item: ConversationItem }) {
   if (item.kind === "reasoning") return <ReasoningItem text={item.text} />;
-  if (item.kind === "tool") return <ToolItem item={item} />;
+  if (item.kind === "tool") return <ToolItem item={item} key={item.status} />;
   if (item.kind === "usage") {
-    const cached = item.cacheReadTokens
-      ? ` · ${tokenFormatter.format(item.cacheReadTokens)} cached`
-      : "";
     return (
-      <p className="conversation-usage">
-        {tokenFormatter.format(item.inputTokens)} in · {tokenFormatter.format(item.outputTokens)}{" "}
-        out
-        {cached}
-      </p>
+      <UsageItem
+        cacheReadTokens={item.cacheReadTokens}
+        inputTokens={item.inputTokens}
+        outputTokens={item.outputTokens}
+      />
     );
   }
-  return (
-    <article
-      className="conversation-message"
-      data-queued={item.queued || undefined}
-      data-role={item.role}
-    >
-      <p className="conversation-message-role">{item.role === "user" ? "You" : "Più"}</p>
-      <div className="conversation-message-body">
-        <p className="conversation-message-copy">{item.text}</p>
-        {item.queued ? (
-          <p className="conversation-message-queue">Queued · next safe point</p>
-        ) : null}
-      </div>
-    </article>
-  );
+  return <MessageItem item={item} />;
 }
 
 const TranscriptItem = memo(function TranscriptItem({
@@ -514,9 +591,11 @@ function ConversationComposer({
       onValueChange={onDraftChange}
       placeholder={active ? "Steer the active turn" : "Continue the conversation"}
       status={
-        <span>
-          {active ? "Sends at the next safe point" : onSend ? "⌘↵ to send" : "Reconnect to send"}
-        </span>
+        active ? (
+          <span>Steers at the next safe point</span>
+        ) : !onSend ? (
+          <span>Reconnect to send</span>
+        ) : undefined
       }
       submitOnMetaEnter
       value={draft}
@@ -545,10 +624,6 @@ export function ConversationSurface({
   const updateDraft = onDraftChange ?? setLocalDraft;
   const updateAttachments = onAttachmentsChange ?? setLocalAttachments;
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
-  const followTranscriptRef = useRef(true);
-  const scrollFrameRef = useRef<number | undefined>(undefined);
-  const transcriptRef = useRef<VirtuosoHandle>(null);
-  const transcriptScrollerRef = useRef<HTMLElement | null>(null);
   const transcriptContext = useMemo<TranscriptListContext>(
     () => ({ failure: snapshot.failure, phase: snapshot.phase, store }),
     [snapshot.failure, snapshot.phase, store],
@@ -557,6 +632,36 @@ export function ConversationSurface({
     () => ({ align: "end" as const, index: snapshot.itemIds.length - 1 }),
     [snapshot.itemIds.length],
   );
+  const currentTranscriptLayout = useMemo(
+    () => transcriptLayoutSignature(snapshot.itemIds, store),
+    [snapshot.itemIds, store],
+  );
+  const manualTranscriptPosition = useMemo(() => {
+    if (initialTranscriptState?.followOutput !== false || !initialTranscriptState.anchor) {
+      return undefined;
+    }
+    const index = snapshot.itemIds.indexOf(initialTranscriptState.anchor.itemId);
+    if (index < 0) return undefined;
+    return {
+      align: "start" as const,
+      index,
+      offset: -initialTranscriptState.anchor.offset,
+    };
+  }, [initialTranscriptState, snapshot.itemIds]);
+  const restoredTranscriptState =
+    !manualTranscriptPosition && initialTranscriptState?.layoutSignature === currentTranscriptLayout
+      ? initialTranscriptState.virtualization
+      : undefined;
+  const followTranscriptRef = useRef(
+    manualTranscriptPosition || restoredTranscriptState
+      ? (initialTranscriptState?.followOutput ?? true)
+      : true,
+  );
+  const manualScrollIntentRef = useRef(false);
+  const scrollFrameRef = useRef<number | undefined>(undefined);
+  const transcriptRef = useRef<VirtuosoHandle>(null);
+  const transcriptScrollerRef = useRef<HTMLElement | null>(null);
+  const visibleRangeRef = useRef<ListRange | null>(null);
   const followLatestContent = useCallback(() => {
     if (
       !followTranscriptRef.current ||
@@ -571,10 +676,47 @@ export function ConversationSurface({
     });
   }, []);
   const trackScrollPosition = useCallback((atBottom: boolean) => {
-    followTranscriptRef.current = atBottom;
+    if (atBottom) {
+      followTranscriptRef.current = true;
+      manualScrollIntentRef.current = false;
+    } else if (manualScrollIntentRef.current) {
+      followTranscriptRef.current = false;
+    }
   }, []);
-  const trackTranscriptScroller = useCallback((scroller: HTMLElement | Window | null) => {
-    transcriptScrollerRef.current = scroller instanceof HTMLElement ? scroller : null;
+  const markManualScrollIntent = useCallback(() => {
+    manualScrollIntentRef.current = true;
+  }, []);
+  const markScrollbarIntent = useCallback((event: PointerEvent) => {
+    if (event.target === event.currentTarget) manualScrollIntentRef.current = true;
+  }, []);
+  const markKeyboardScrollIntent = useCallback((event: KeyboardEvent) => {
+    if (["ArrowDown", "ArrowUp", "End", "Home", "PageDown", "PageUp", " "].includes(event.key)) {
+      manualScrollIntentRef.current = true;
+    }
+  }, []);
+  const trackTranscriptScroller = useCallback(
+    (scroller: HTMLElement | Window | null) => {
+      const previous = transcriptScrollerRef.current;
+      previous?.removeEventListener("keydown", markKeyboardScrollIntent);
+      previous?.removeEventListener("pointerdown", markScrollbarIntent);
+      previous?.removeEventListener("touchstart", markManualScrollIntent);
+      previous?.removeEventListener("wheel", markManualScrollIntent);
+      transcriptScrollerRef.current = scroller instanceof HTMLElement ? scroller : null;
+      transcriptScrollerRef.current?.addEventListener("keydown", markKeyboardScrollIntent);
+      transcriptScrollerRef.current?.addEventListener("pointerdown", markScrollbarIntent, {
+        passive: true,
+      });
+      transcriptScrollerRef.current?.addEventListener("touchstart", markManualScrollIntent, {
+        passive: true,
+      });
+      transcriptScrollerRef.current?.addEventListener("wheel", markManualScrollIntent, {
+        passive: true,
+      });
+    },
+    [markKeyboardScrollIntent, markManualScrollIntent, markScrollbarIntent],
+  );
+  const trackVisibleRange = useCallback((range: ListRange) => {
+    visibleRangeRef.current = range;
   }, []);
   const followAppendedTranscript: FollowOutput = useCallback(
     (atBottom: boolean) =>
@@ -591,15 +733,30 @@ export function ConversationSurface({
   useEffect(
     () => () => {
       if (scrollFrameRef.current !== undefined) cancelAnimationFrame(scrollFrameRef.current);
+      const scroller = transcriptScrollerRef.current;
+      scroller?.removeEventListener("keydown", markKeyboardScrollIntent);
+      scroller?.removeEventListener("pointerdown", markScrollbarIntent);
+      scroller?.removeEventListener("touchstart", markManualScrollIntent);
+      scroller?.removeEventListener("wheel", markManualScrollIntent);
     },
-    [],
+    [markKeyboardScrollIntent, markManualScrollIntent, markScrollbarIntent],
   );
+  const saveTranscriptState = useEffectEvent((transcript: VirtuosoHandle) => {
+    if (!onTranscriptStateChange) return;
+    const itemIds = store.getSnapshot().itemIds;
+    const anchor = transcriptAnchor(itemIds, visibleRangeRef.current);
+    const followOutput = followTranscriptRef.current;
+    const layoutSignature = transcriptLayoutSignature(itemIds, store);
+    transcript.getState((virtualization) => {
+      onTranscriptStateChange({ anchor, followOutput, layoutSignature, virtualization });
+    });
+  });
   useLayoutEffect(() => {
     const transcript = transcriptRef.current;
     return () => {
-      if (transcript && onTranscriptStateChange) transcript.getState(onTranscriptStateChange);
+      if (transcript) saveTranscriptState(transcript);
     };
-  }, [onTranscriptStateChange]);
+  }, []);
 
   const inputRequest = snapshot.inputRequest;
 
@@ -672,10 +829,14 @@ export function ConversationSurface({
           defaultItemHeight={84}
           followOutput={followAppendedTranscript}
           increaseViewportBy={TRANSCRIPT_VIEWPORT_BUFFER}
-          initialTopMostItemIndex={initialTranscriptState ? undefined : initialTranscriptPosition}
+          initialTopMostItemIndex={
+            manualTranscriptPosition ??
+            (restoredTranscriptState ? undefined : initialTranscriptPosition)
+          }
           itemContent={renderTranscriptItem}
+          rangeChanged={trackVisibleRange}
           ref={transcriptRef}
-          restoreStateFrom={initialTranscriptState}
+          restoreStateFrom={restoredTranscriptState}
           role="region"
           scrollerRef={trackTranscriptScroller}
         />

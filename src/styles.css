@@ -752,7 +752,7 @@ html[data-inbox-sidebar-resizing] {
   width: 100%;
   overflow: hidden;
   border: 1px solid var(--input);
-  border-radius: 12px;
+  border-radius: 16px;
   background: var(--card);
   box-shadow:
     0 1px 0 color-mix(in oklab, var(--foreground) 4%, transparent),
@@ -855,7 +855,7 @@ html[data-inbox-sidebar-resizing] {
 }
 
 .product-composer[data-composer-layout="docked"] .product-composer-input {
-  min-height: 72px;
+  min-height: 56px;
   font-size: 13px;
   line-height: 1.5;
 }

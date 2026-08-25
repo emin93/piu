@@ -4,9 +4,9 @@ Recorded on 2026-08-25 on a MacBook Pro with Apple M5 Pro, 64 GB memory, and mac
 
 ## Packaged interaction and visual review
 
-The final Apple Silicon `Più.app` was exercised against isolated application data through the production Tauri commands. The review covered a restored text attachment, native image selection, selection cancellation, preview and removal of text and image files, attachment-only send readiness, project/chat navigation, full process relaunch restoration, an unavailable repository, and a controlled fresh-main failure. Folder selection remained unavailable in the native file picker.
+The final Apple Silicon `Più.app` was exercised against isolated application data through the production Tauri commands. The review covered first send, exact-session follow-up send, streaming reasoning and text, tool completion, collapsed usage, project/chat navigation, the native chat menu, sidebar resize, title-bar window drag, and full process relaunch restoration. The startup race was also exercised with the event subscriber active before the opening snapshot; the completed assistant text rendered once.
 
-During the controlled slow send, the textarea was read-only and the attach, remove, and send controls were disabled. After the forced failure, every control recovered and the exact draft and both attachments remained available with the typed inline error. Light and dark appearances used the same grid, hierarchy, focus treatment, and semantic colors. macOS was restored to Light after review.
+The transcript uses locally adapted AI Elements message, reasoning, and tool primitives pinned to upstream commit `6a9d5b1822ffb10bba4bd97175f01edd7d8651cd`, with its Apache-2.0 notice checked in. Its visual grammar follows the T3 Code reference at commit `5d7665396083d285132d67038813862a93337ca5`: centered 48 rem content, right-aligned user bubbles, flat assistant output, subordinate activity rows, and a floating composer. The controller and native Pi transport remain Più-owned. Light and dark appearances used the same grid, hierarchy, focus treatment, and semantic colors. macOS was restored to Light after review.
 
 The checked-in references are native macOS PNG window captures of the final packaged application:
 
@@ -31,11 +31,11 @@ Current-schema integration tests cover attachment restoration, cancellation, uns
 
 ## Production performance
 
-The packaged WKWebView performance harness used React's production profiling renderer with 24 chats, 180 transcript entries per conversation, progressive streaming, and three 2 MiB image attachments in the active draft. The 60 measured attachment-heavy composer inputs reached the next frame in 17 ms median and 19 ms p95/max, with React commits at 0 ms median, 1 ms p95, and 2 ms max.
+The packaged WKWebView performance harness used React's production profiling renderer with 24 chats, 180 transcript entries per conversation, progressive streaming, and three 2 MiB image attachments in the active draft. The 60 measured attachment-heavy composer inputs reached the next frame in 17 ms median and 19 ms p95/max, with React commits at 0 ms median and 1 ms p95/max.
 
-The 119 measured scrolling intervals ran at 59.98 fps with 17 ms median and 19 ms p95/max, with no interval over 20 ms. Simulated streaming ran at 60.01 fps with 17 ms median and 19 ms p95/max, also with no interval over 20 ms. Streaming and scrolling React commits were 0 ms median and at most 2 ms.
+The 119 measured scrolling intervals ran at 60.01 fps with 17 ms median and 19 ms p95/max, with no interval over 20 ms. Simulated streaming ran at 60.04 fps with 17 ms median and 19 ms p95/max, also with no interval over 20 ms. Streaming and scrolling React commits were 0 ms median and at most 3 ms.
 
-After one explicit warm transition per locally available surface, chat switches measured 83 ms median, 85 ms p95, and 86 ms max while the underlying React commits remained 0 ms median, 2 ms p95, and 4 ms max. Project/composer navigation measured 32 ms median and 35 ms p95/max, with React commits at 2 ms median, 3 ms p95/max. Every measured interaction stayed within the initial navigation budgets.
+After one explicit warm transition per locally available surface, chat switches measured 83 ms median, 85 ms p95, and 86 ms max while the underlying React commits remained 0 ms median, 2 ms p95, and 3 ms max. Project/composer navigation measured 33 ms median, 35 ms p95, and 36 ms max, with React commits at 2 ms median and 3 ms p95/max. Every measured interaction stayed within the initial navigation budgets.
 
 Each navigation sample includes the first animation frame after the expected production UI is present. The corrected uncached transcript measurement initially reached 102 ms despite a 4 ms maximum React commit, identifying Virtuoso's repeated item measurement as the delay. Più now saves and restores Virtuoso's measured list state and manual scroll position for the 32 most recently visited chats. The runner persists its JSON report, then fails if a visible chat switch exceeds 100 ms, navigation or composer input exceeds 50 ms, or scrolling or streaming records a frame over 20 ms.
 

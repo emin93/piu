@@ -3,4 +3,4 @@ import type { ConversationInputRequest } from "./ConversationInputRequest";
 import type { ConversationItem } from "./ConversationItem";
 import type { ConversationPhase } from "./ConversationPhase";
 
-export type ConversationSnapshot = { failure: string | null, inputRequest: ConversationInputRequest | null, items: Array<ConversationItem>, phase: ConversationPhase, };
+export type ConversationSnapshot = { failure: string | null, inputRequest: ConversationInputRequest | null, items: Array<ConversationItem>, phase: ConversationPhase, revision: number, };

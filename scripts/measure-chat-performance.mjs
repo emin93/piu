@@ -26,13 +26,29 @@ function requireNoSlowFrames(summary, label) {
   }
 }
 
+function waitForChildExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolveExit) => {
+    const onExit = () => {
+      clearTimeout(timeout);
+      resolveExit(true);
+    };
+    const timeout = setTimeout(() => {
+      child.off("exit", onExit);
+      resolveExit(false);
+    }, timeoutMs);
+    child.once("exit", onExit);
+  });
+}
+
 async function stopChild(child, signal) {
-  if (!child || child.exitCode !== null) return;
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
   child.kill(signal);
-  await Promise.race([
-    new Promise((resolveExit) => child.once("exit", resolveExit)),
-    new Promise((resolveTimeout) => setTimeout(resolveTimeout, 2_000)),
-  ]);
+  if (await waitForChildExit(child, 2_000)) return;
+  child.kill("SIGKILL");
+  if (!(await waitForChildExit(child, 2_000))) {
+    throw new Error(`Child process ${String(child.pid)} did not exit after SIGKILL`);
+  }
 }
 
 function run(command, arguments_) {
@@ -111,9 +127,18 @@ try {
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   process.stdout.write(`RESULT_PATH=${resultPath}\nTRACE_PATH=${tracePath}\n`);
 } finally {
-  await stopChild(trace, "SIGINT");
-  await stopChild(app, "SIGTERM");
+  const stopResults = await Promise.allSettled([
+    stopChild(trace, "SIGINT"),
+    stopChild(app, "SIGTERM"),
+  ]);
   spawnSync("pbcopy", { input: originalClipboard });
   await rm(appData, { force: true, recursive: true });
   run("npm", ["run", "build"]);
+  const stopFailure = stopResults.find((result) => result.status === "rejected");
+  if (stopFailure?.status === "rejected") {
+    const message =
+      stopFailure.reason instanceof Error ? stopFailure.reason.message : String(stopFailure.reason);
+    process.stderr.write(`Packaged performance cleanup failed: ${message}\n`);
+    process.exitCode = 1;
+  }
 }

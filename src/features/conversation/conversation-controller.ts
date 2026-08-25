@@ -12,7 +12,13 @@ const STOPPED_CONVERSATION = {
   inputRequest: null,
   items: [],
   phase: "stopped",
+  revision: 0,
 } as const;
+
+interface PendingConversationEvent {
+  event: ConversationEvent;
+  revision?: number;
+}
 
 export class ConversationController {
   readonly #adapter: ConversationAdapter;
@@ -30,12 +36,12 @@ export class ConversationController {
     const generation = ++this.#generation;
     this.#disconnect?.();
     this.#disconnect = undefined;
-    const pendingEvents: ConversationEvent[] = [];
+    const pendingEvents: PendingConversationEvent[] = [];
     let connected = false;
-    const connection = await this.#adapter.connect(this.#chatId, (event) => {
+    const connection = await this.#adapter.connect(this.#chatId, (event, revision) => {
       if (generation !== this.#generation) return;
       if (connected) this.store.apply(event);
-      else pendingEvents.push(event);
+      else pendingEvents.push({ event, revision });
     });
 
     if (generation !== this.#generation) {
@@ -45,7 +51,14 @@ export class ConversationController {
     this.#disconnect = connection.disconnect;
     this.store.replace(connection.snapshot);
     connected = true;
-    for (const event of pendingEvents) this.store.apply(event);
+    for (const pending of pendingEvents) {
+      if (
+        pending.revision === undefined ||
+        pending.revision > (connection.snapshot.revision ?? 0)
+      ) {
+        this.store.apply(pending.event);
+      }
+    }
   }
 
   send(text: string, attachments: readonly PromptAttachment[] = []) {

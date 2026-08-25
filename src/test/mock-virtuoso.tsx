@@ -1,6 +1,7 @@
 import {
   forwardRef,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
   useState,
   type ComponentType,
@@ -33,7 +34,10 @@ interface MockVirtuosoProps {
   context: unknown;
   data: readonly string[];
   followOutput?: boolean | string | ((atBottom: boolean) => boolean | string);
+  initialTopMostItemIndex?:
+    number | { align?: "center" | "end" | "start"; index: number; offset?: number };
   itemContent: (index: number, item: string, context: unknown) => ReactNode;
+  rangeChanged?: (range: { endIndex: number; startIndex: number }) => void;
   restoreStateFrom?: { scrollTop: number };
   role?: string;
   scrollerRef?: (ref: HTMLElement | Window | null) => void;
@@ -55,7 +59,9 @@ export const MockVirtuoso = forwardRef<
     context,
     data,
     followOutput,
+    initialTopMostItemIndex,
     itemContent,
+    rangeChanged,
     restoreStateFrom,
     role,
     scrollerRef,
@@ -63,7 +69,13 @@ export const MockVirtuoso = forwardRef<
   ref,
 ) {
   const tailStart = Math.max(0, data.length - VISIBLE_ITEM_COUNT);
-  const initialWindowStartRef = useRef(tailStart);
+  const requestedInitialIndex =
+    typeof initialTopMostItemIndex === "number"
+      ? initialTopMostItemIndex
+      : initialTopMostItemIndex?.align === "start"
+        ? initialTopMostItemIndex.index
+        : undefined;
+  const initialWindowStartRef = useRef(requestedInitialIndex ?? tailStart);
   const scrollerElementRef = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
   const followsBottom =
@@ -85,6 +97,13 @@ export const MockVirtuoso = forwardRef<
     }),
     [],
   );
+  useLayoutEffect(() => () => scrollerRef?.(null), [scrollerRef]);
+  useLayoutEffect(() => {
+    rangeChanged?.({
+      endIndex: Math.min(data.length - 1, windowStart + VISIBLE_ITEM_COUNT - 1),
+      startIndex: windowStart,
+    });
+  }, [data.length, rangeChanged, windowStart]);
 
   const Header = components?.Header;
   const Footer = components?.Footer;
@@ -97,7 +116,14 @@ export const MockVirtuoso = forwardRef<
       const key = computeItemKey?.(index, item, context) ?? item;
       const content = itemContent(index, item, context);
       return Item ? (
-        <Item context={context} item={item} key={key}>
+        <Item
+          context={context}
+          data-index={index}
+          data-item-index={index}
+          data-known-size={84}
+          item={item}
+          key={key}
+        >
           {content}
         </Item>
       ) : (
@@ -109,6 +135,10 @@ export const MockVirtuoso = forwardRef<
     <div
       aria-label={ariaLabel}
       className={className}
+      data-start-offset={
+        typeof initialTopMostItemIndex === "object" ? initialTopMostItemIndex.offset : undefined
+      }
+      data-start-index={requestedInitialIndex}
       data-restored-scroll-top={restoreStateFrom?.scrollTop}
       onScroll={(event) => {
         const scroller = event.currentTarget;
