@@ -405,7 +405,7 @@
   position: relative;
   min-width: 0;
   content-visibility: auto;
-  contain-intrinsic-block-size: 46px;
+  contain-intrinsic-block-size: 62px;
 }
 
 .chat-row-select {

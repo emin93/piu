@@ -93,6 +93,10 @@ test("long chat branches stay inside their inbox metadata column", () => {
 });
 
 test("project-scoped idle chats collapse to a compact two-line row", () => {
+  expect(stylesheet).toMatch(/\.chat-row\s*\{[^}]*contain-intrinsic-block-size: 62px;/);
+  expect(stylesheet).toMatch(
+    /\.chat-row\[data-compact="true"\]\s*\{[^}]*contain-intrinsic-block-size: 46px;/,
+  );
   expect(stylesheet).toMatch(
     /\.chat-row\[data-compact="true"\] \.chat-row-select\s*\{[^}]*min-height: 46px;/,
   );
