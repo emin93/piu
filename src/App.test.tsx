@@ -800,15 +800,14 @@ test("the shell verifies the typed host boundary without exposing internals", as
   expect(screen.queryByText(/core ready|schema 1/i)).not.toBeInTheDocument();
 });
 
-test("every visible titlebar surface remains a native window drag region", async () => {
+test("the complete visible titlebar delegates deep dragging to Tauri", async () => {
   installMatchMedia("light");
 
   render(<App />);
 
   await screen.findByRole("main", { name: "Più inbox" });
   const titlebar = document.querySelector<HTMLElement>(".titlebar");
-  expect(titlebar).toHaveAttribute("data-tauri-drag-region");
-  expect(titlebar?.querySelectorAll("*:not([data-tauri-drag-region])")).toHaveLength(0);
+  expect(titlebar).toHaveAttribute("data-tauri-drag-region", "deep");
 });
 
 test("startup presents a stable non-interactive loading state", () => {

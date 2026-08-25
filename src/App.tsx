@@ -486,16 +486,14 @@ export function App({
   return (
     <TooltipProvider>
       <div className="app-shell" data-appearance={appearance}>
-        <header className="titlebar" data-tauri-drag-region>
-          <div aria-label="Più" className="wordmark" data-tauri-drag-region>
-            <span aria-hidden="true" className="wordmark-symbol" data-tauri-drag-region>
+        <header className="titlebar" data-tauri-drag-region="deep">
+          <div aria-label="Più" className="wordmark">
+            <span aria-hidden="true" className="wordmark-symbol">
               π
             </span>
-            <span data-tauri-drag-region>Più</span>
+            <span>Più</span>
           </div>
-          <div className="titlebar-context" data-tauri-drag-region>
-            {titlebarContext}
-          </div>
+          <div className="titlebar-context">{titlebarContext}</div>
         </header>
         {hostStatus === "checking" ? (
           <main className="startup-workspace">
