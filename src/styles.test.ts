@@ -72,6 +72,16 @@ test("native controls and inherited sidebar copy keep explicit system-theme cont
   expect(stylesheet).toMatch(/\.draft-row-prompt\s*\{[^}]*color: var\(--sidebar-foreground\);/);
 });
 
+test("application chrome is nonselectable while editing and transcript content remain selectable", () => {
+  expect(stylesheet).toMatch(
+    /html,\s*body,\s*#root\s*\{[^}]*-webkit-user-select: none;[^}]*user-select: none;/,
+  );
+  expect(stylesheet).toMatch(
+    /input,\s*textarea,\s*\[contenteditable="true"\],\s*\.conversation-transcript\s*\{[^}]*-webkit-user-select: text;[^}]*user-select: text;/,
+  );
+  expect(stylesheet).not.toMatch(/body\s*\{[^}]*user-select: text;/);
+});
+
 test("long chat branches stay inside their inbox metadata column", () => {
   expect(stylesheet).toMatch(/\.chat-row-copy\s*\{[\s\S]*?display: grid;[\s\S]*?min-width: 0;/);
   expect(stylesheet).toMatch(
@@ -79,6 +89,15 @@ test("long chat branches stay inside their inbox metadata column", () => {
   );
   expect(stylesheet).toMatch(
     /\.chat-row-branch\s*\{[\s\S]*?min-width: 0;[\s\S]*?overflow: hidden;[\s\S]*?text-overflow: ellipsis;/,
+  );
+});
+
+test("project-scoped idle chats collapse to a compact two-line row", () => {
+  expect(stylesheet).toMatch(
+    /\.chat-row\[data-compact="true"\] \.chat-row-select\s*\{[^}]*min-height: 46px;/,
+  );
+  expect(stylesheet).toMatch(
+    /\.chat-row\[data-compact="true"\] \.chat-actions-trigger\s*\{[^}]*top: 11px;/,
   );
 });
 

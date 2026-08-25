@@ -14,7 +14,7 @@ use piu_lib::{
         ConversationInputAnswer, ConversationInputKind, ConversationItem, ConversationPhase,
         ConversationSnapshot, ConversationToolStatus, ModelRouteId, ReasoningEffort,
     },
-    chat_workspaces::ChatWorkspaces,
+    chat_workspaces::{ChatWorkspaceError, ChatWorkspaces},
     git_process::GitProcess,
     project_inbox::{ChatSetupPhase, ProjectInbox},
     prompt_attachments::{PromptAttachment, PromptAttachmentError, PromptAttachmentKind},
@@ -93,6 +93,52 @@ async fn confirmed_deletion_retires_the_active_pi_child_before_local_cleanup() {
             .next()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn deletion_tombstones_an_open_that_prepared_before_the_slot_lock() {
+    let fixture = ChatFixture::with_environment_mode(true, true, "quiet", "chat-runtime-delayed");
+    let opening_host = fixture.host.clone();
+    let opening_chat_id = fixture.chat_id.clone();
+    let opening = tokio::spawn(async move { opening_host.open(&opening_chat_id).await });
+    let inspection_record = fixture
+        ._app_data
+        .path()
+        .join("environment-fixture/inspections");
+    tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+        while !inspection_record.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the launch should pause after preparing its chat context");
+
+    let deletion = fixture
+        .workspaces
+        .prepare_chat_deletion(&fixture.chat_id)
+        .unwrap();
+    fixture
+        .host
+        .retire_for_deletion(&fixture.chat_id)
+        .await
+        .unwrap();
+    fs::write(
+        fixture._app_data.path().join("environment-fixture/release"),
+        "continue\n",
+    )
+    .unwrap();
+
+    let error = opening
+        .await
+        .unwrap()
+        .expect_err("an orphaned prepared slot must never launch");
+    assert!(matches!(
+        error,
+        ChatRuntimeHostError::Workspace(ChatWorkspaceError::UnsafeDeletion)
+    ));
+    assert_eq!(fixture.live_children(), 0);
+    assert!(deletion.execute().unwrap().chats.is_empty());
+    assert_eq!(fixture.live_children(), 0);
 }
 
 struct ChatFixture {
@@ -1197,6 +1243,15 @@ impl ChatFixture {
     }
 
     fn with_options(run_setup: bool, install_skills: bool, mode: &str) -> Self {
+        Self::with_environment_mode(run_setup, install_skills, mode, "chat-runtime")
+    }
+
+    fn with_environment_mode(
+        run_setup: bool,
+        install_skills: bool,
+        mode: &str,
+        environment_mode: &str,
+    ) -> Self {
         let app_data = TemporaryAppData::new();
         let remote = TemporaryGitRemote::new();
         fs::write(remote.working_path().join("README.md"), "fixture\n").unwrap();
@@ -1279,7 +1334,7 @@ impl ChatFixture {
         );
         environment_variables.insert(
             std::ffi::OsString::from("PIU_ENVIRONMENT_FIXTURE_MODE"),
-            std::ffi::OsString::from("chat-runtime"),
+            std::ffi::OsString::from(environment_mode),
         );
         environment_variables.insert(
             std::ffi::OsString::from("PIU_ENVIRONMENT_FIXTURE_RECORD_DIR"),

@@ -564,7 +564,7 @@ fn map_deletion_error(error: ChatWorkspaceError) -> ProjectCommandError {
         ChatWorkspaceError::UnsafeDeletion | ChatWorkspaceError::InvalidOwnership => {
             ProjectCommandError {
                 code: ProjectCommandErrorCode::UnsafeChatDeletion,
-                message: "Più couldn’t verify that the local worktree is safe to remove. The chat and local files were left in place.".into(),
+                message: "Più stopped because it could no longer verify a local deletion target. The chat record was kept so the deletion can be inspected and retried.".into(),
             }
         }
         ChatWorkspaceError::Inbox(ProjectInboxError::AppData(_))

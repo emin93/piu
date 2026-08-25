@@ -10,6 +10,7 @@ import {
   Trash2Icon,
 } from "lucide-react";
 import {
+  Fragment,
   lazy,
   memo,
   Suspense,
@@ -35,12 +36,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
-  ContextMenu,
-  ContextMenuContent,
-  ContextMenuItem,
-  ContextMenuTrigger,
-} from "@/components/ui/context-menu";
-import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -54,6 +49,7 @@ import {
   DropdownMenuItem,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
@@ -65,6 +61,7 @@ import type { PromptAttachment } from "@/platform/prompt-attachments";
 import type { ModelControlsAdapter } from "@/platform/model-controls";
 import type { ModelRouteId } from "@/generated/ModelRouteId";
 import type { ReasoningEffort } from "@/generated/ReasoningEffort";
+import { recordInboxRender } from "#inbox-performance-review";
 
 import { ChatComposer } from "./ChatComposer";
 import type { TranscriptViewState } from "../conversation/ConversationSurface";
@@ -206,11 +203,28 @@ function SelectedChatStage({
 }
 
 const CHAT_ACTIONS = [
-  { destructive: false, Icon: PencilIcon, id: "rename", label: "Rename chat" },
-  { destructive: true, Icon: Trash2Icon, id: "delete", label: "Delete chat" },
+  {
+    destructive: false,
+    Icon: PencilIcon,
+    id: "rename",
+    label: "Rename chat",
+    separatorBefore: false,
+  },
+  {
+    destructive: true,
+    Icon: Trash2Icon,
+    id: "delete",
+    label: "Delete chat",
+    separatorBefore: true,
+  },
 ] as const;
 
 type ChatActionId = (typeof CHAT_ACTIONS)[number]["id"];
+const MERGED_CHAT_ACTIONS = CHAT_ACTIONS.slice(0, 1);
+
+function availableChatActions(chat: ChatSummary) {
+  return chat.mergeState === "merged" ? MERGED_CHAT_ACTIONS : CHAT_ACTIONS;
+}
 
 const CHAT_PHASE_LABELS = {
   cancelled: "Cancelled",
@@ -242,6 +256,7 @@ const ChatRow = memo(function ChatRow({
   showProjectIdentity: boolean;
   setups: ChatSetupController;
 }) {
+  recordInboxRender?.({ id: chat.id, kind: "chat-row" });
   const selectTriggerRef = useRef<HTMLButtonElement>(null);
   const subscribe = useCallback(
     (listener: () => void) => setups.subscribe(chat.id, listener),
@@ -258,68 +273,89 @@ const ChatRow = memo(function ChatRow({
   const rowPhase =
     setup.phase === "succeeded" || setup.phase === "notRequired" ? activity.phase : setup.phase;
   const transientStatus = rowPhase === "idle" ? null : CHAT_PHASE_LABELS[rowPhase];
+  const actions = availableChatActions(chat);
+  const compact = !showProjectIdentity && !transientStatus;
+  const openNativeMenu = useCallback(
+    async (position?: { x: number; y: number }) => {
+      const trigger = selectTriggerRef.current;
+      if (!trigger) return;
+      trigger.focus({ preventScroll: true });
+      const { popupNativeContextMenu } = await import("@/platform/native-context-menu");
+      await popupNativeContextMenu({
+        actions: availableChatActions(chat),
+        onAction: (action) => onAction(action, chat, trigger),
+        position,
+      });
+    },
+    [chat, onAction],
+  );
+  const requestNativeMenu = useCallback(
+    (position?: { x: number; y: number }) => {
+      void openNativeMenu(position).catch(() => undefined);
+    },
+    [openNativeMenu],
+  );
+
   return (
     <li
       className="chat-row"
       data-activity={rowPhase}
       data-chat-id={chat.id}
+      data-compact={compact || undefined}
       data-unread={activity.unread || undefined}
     >
-      <ContextMenu>
-        <ContextMenuTrigger className="chat-row-context-trigger">
-          <Button
-            aria-label={`${chat.title}, ${rowPhase}${activity.unread ? ", unread" : ""}`}
-            aria-pressed={selected}
-            className="chat-row-select"
-            onClick={() => onSelect(chat.id)}
-            ref={selectTriggerRef}
-            type="button"
-            variant="ghost"
-          >
-            <span className="chat-row-copy">
-              {showProjectIdentity || transientStatus ? (
-                <span className="chat-row-eyebrow">
-                  {showProjectIdentity ? (
-                    <span className="chat-row-project">{chat.projectName}</span>
-                  ) : null}
-                  {transientStatus ? (
-                    <span className="chat-row-status" data-phase={rowPhase}>
-                      {transientStatus}
-                    </span>
-                  ) : null}
+      <Button
+        aria-label={`${chat.title}, ${rowPhase}${activity.unread ? ", unread" : ""}`}
+        aria-pressed={selected}
+        className="chat-row-select"
+        onClick={() => onSelect(chat.id)}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          requestNativeMenu();
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+          event.preventDefault();
+          event.stopPropagation();
+          const bounds = event.currentTarget.getBoundingClientRect();
+          requestNativeMenu({
+            x: Math.round(bounds.left + Math.min(16, bounds.width / 2)),
+            y: Math.round(bounds.top + Math.min(28, bounds.height)),
+          });
+        }}
+        ref={selectTriggerRef}
+        type="button"
+        variant="ghost"
+      >
+        <span className="chat-row-copy">
+          {showProjectIdentity || transientStatus ? (
+            <span className="chat-row-eyebrow">
+              {showProjectIdentity ? (
+                <span className="chat-row-project">{chat.projectName}</span>
+              ) : null}
+              {transientStatus ? (
+                <span className="chat-row-status" data-phase={rowPhase}>
+                  {transientStatus}
                 </span>
               ) : null}
-              <span className="chat-row-title" id={`chat-${chat.id}-title`} title={chat.title}>
-                {chat.title}
-              </span>
-              <span className="chat-row-metadata">
-                <span className="chat-row-branch font-mono" title={chat.branchName}>
-                  {chat.branchName}
-                </span>
-                {chat.pullRequestNumber !== null ? (
-                  <Badge className="font-mono" variant="outline">
-                    #{chat.pullRequestNumber}
-                  </Badge>
-                ) : null}
-              </span>
             </span>
-          </Button>
-        </ContextMenuTrigger>
-        <ContextMenuContent className="w-40">
-          {CHAT_ACTIONS.map((action) => (
-            <ContextMenuItem
-              key={action.id}
-              onClick={() => {
-                if (selectTriggerRef.current) onAction(action.id, chat, selectTriggerRef.current);
-              }}
-              variant={action.destructive ? "destructive" : "default"}
-            >
-              <action.Icon aria-hidden="true" />
-              {action.label}
-            </ContextMenuItem>
-          ))}
-        </ContextMenuContent>
-      </ContextMenu>
+          ) : null}
+          <span className="chat-row-title" id={`chat-${chat.id}-title`} title={chat.title}>
+            {chat.title}
+          </span>
+          <span className="chat-row-metadata">
+            <span className="chat-row-branch font-mono" title={chat.branchName}>
+              {chat.branchName}
+            </span>
+            {chat.pullRequestNumber !== null ? (
+              <Badge className="font-mono" variant="outline">
+                #{chat.pullRequestNumber}
+              </Badge>
+            ) : null}
+          </span>
+        </span>
+      </Button>
 
       <DropdownMenu>
         <DropdownMenuTrigger
@@ -337,21 +373,96 @@ const ChatRow = memo(function ChatRow({
           <MoreHorizontalIcon aria-hidden="true" />
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="w-40">
-          {CHAT_ACTIONS.map((action) => (
-            <DropdownMenuItem
-              key={action.id}
-              onClick={() => {
-                if (selectTriggerRef.current) onAction(action.id, chat, selectTriggerRef.current);
-              }}
-              variant={action.destructive ? "destructive" : "default"}
-            >
-              <action.Icon aria-hidden="true" />
-              {action.label}
-            </DropdownMenuItem>
+          {actions.map((action) => (
+            <Fragment key={action.id}>
+              {action.separatorBefore ? <DropdownMenuSeparator /> : null}
+              <DropdownMenuItem
+                onClick={() => {
+                  if (selectTriggerRef.current) onAction(action.id, chat, selectTriggerRef.current);
+                }}
+                variant={action.destructive ? "destructive" : "default"}
+              >
+                <action.Icon aria-hidden="true" />
+                {action.label}
+              </DropdownMenuItem>
+            </Fragment>
           ))}
         </DropdownMenuContent>
       </DropdownMenu>
     </li>
+  );
+});
+
+const ProjectScopeControl = memo(function ProjectScopeControl({
+  onOpenRepository,
+  onProjectScopeChange,
+  projects,
+  scopeProject,
+  selectedProjectId,
+}: {
+  onOpenRepository: () => void;
+  onProjectScopeChange: (projectId: number | null) => void;
+  projects: readonly ProjectSummary[];
+  scopeProject: ProjectSummary | undefined;
+  selectedProjectId: number | null;
+}) {
+  recordInboxRender?.({ kind: "scope-control" });
+
+  return (
+    <div className="sidebar-scope-row">
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button
+              aria-label={`Project scope: ${scopeProject?.name ?? "All Projects"}`}
+              className="project-scope-trigger"
+              type="button"
+              variant="ghost"
+            />
+          }
+        >
+          <FolderIcon aria-hidden="true" />
+          <span>{scopeProject?.name ?? "All Projects"}</span>
+          <ChevronDownIcon aria-hidden="true" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="project-scope-menu">
+          <DropdownMenuRadioGroup
+            onValueChange={(value) =>
+              onProjectScopeChange(value === ALL_PROJECTS_SCOPE ? null : Number(value))
+            }
+            value={selectedProjectId === null ? ALL_PROJECTS_SCOPE : String(selectedProjectId)}
+          >
+            <DropdownMenuRadioItem closeOnClick value={ALL_PROJECTS_SCOPE}>
+              <FolderIcon aria-hidden="true" />
+              <span>All Projects</span>
+            </DropdownMenuRadioItem>
+            {projects.map((project) => (
+              <DropdownMenuRadioItem closeOnClick key={project.id} value={String(project.id)}>
+                <FolderIcon aria-hidden="true" />
+                <span>{project.name}</span>
+              </DropdownMenuRadioItem>
+            ))}
+          </DropdownMenuRadioGroup>
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <Button
+              aria-label="Open Repository"
+              onClick={onOpenRepository}
+              size="icon-lg"
+              type="button"
+              variant="ghost"
+            />
+          }
+        >
+          <FolderPlusIcon aria-hidden="true" />
+        </TooltipTrigger>
+        <TooltipContent side="right">Open Repository</TooltipContent>
+      </Tooltip>
+    </div>
   );
 });
 
@@ -447,12 +558,6 @@ export function InboxWorkspace({
   const targetProject = composerProject(snapshot, selectedProjectId);
   const selectedChat = snapshot.chats.find(({ id }) => id === selectedChatId);
 
-  const selectProjectScope = useCallback(
-    (projectId: number | null) => {
-      onProjectScopeChange(projectId);
-    },
-    [onProjectScopeChange],
-  );
   const rememberTranscriptState = useCallback(
     (chatId: string, state: TranscriptViewState) => {
       transcriptStates.remember(chatId, state);
@@ -568,66 +673,13 @@ export function InboxWorkspace({
           </div>
 
           {snapshot.projects.length > 0 ? (
-            <div className="sidebar-scope-row">
-              <DropdownMenu>
-                <DropdownMenuTrigger
-                  render={
-                    <Button
-                      aria-label={`Project scope: ${scopeProject?.name ?? "All Projects"}`}
-                      className="project-scope-trigger"
-                      type="button"
-                      variant="ghost"
-                    />
-                  }
-                >
-                  <FolderIcon aria-hidden="true" />
-                  <span>{scopeProject?.name ?? "All Projects"}</span>
-                  <ChevronDownIcon aria-hidden="true" />
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="start" className="project-scope-menu">
-                  <DropdownMenuRadioGroup
-                    onValueChange={(value) =>
-                      selectProjectScope(value === ALL_PROJECTS_SCOPE ? null : Number(value))
-                    }
-                    value={
-                      selectedProjectId === null ? ALL_PROJECTS_SCOPE : String(selectedProjectId)
-                    }
-                  >
-                    <DropdownMenuRadioItem closeOnClick value={ALL_PROJECTS_SCOPE}>
-                      <FolderIcon aria-hidden="true" />
-                      <span>All Projects</span>
-                    </DropdownMenuRadioItem>
-                    {snapshot.projects.map((project) => (
-                      <DropdownMenuRadioItem
-                        closeOnClick
-                        key={project.id}
-                        value={String(project.id)}
-                      >
-                        <FolderIcon aria-hidden="true" />
-                        <span>{project.name}</span>
-                      </DropdownMenuRadioItem>
-                    ))}
-                  </DropdownMenuRadioGroup>
-                </DropdownMenuContent>
-              </DropdownMenu>
-
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <Button
-                      aria-label="Open Repository"
-                      onClick={onOpenRepository}
-                      size="icon-lg"
-                      type="button"
-                      variant="ghost"
-                    />
-                  }
-                >
-                  <FolderPlusIcon aria-hidden="true" />
-                </TooltipTrigger>
-                <TooltipContent side="right">Open Repository</TooltipContent>
-              </Tooltip>
-            </div>
+            <ProjectScopeControl
+              onOpenRepository={onOpenRepository}
+              onProjectScopeChange={onProjectScopeChange}
+              projects={snapshot.projects}
+              scopeProject={scopeProject}
+              selectedProjectId={selectedProjectId}
+            />
           ) : null}
 
           {actionError && snapshot.projects.length > 0 ? (
@@ -759,9 +811,7 @@ export function InboxWorkspace({
               <AlertDialogDescription>
                 This permanently deletes the local conversation, managed worktree, and local branch.
                 It won&apos;t close a pull request or delete a remote branch.
-                <span className="mt-2 block">
-                  Any active agent or terminal will be stopped first.
-                </span>
+                <span className="mt-2 block">Any active agent will be stopped first.</span>
               </AlertDialogDescription>
             </AlertDialogHeader>
             {deletionError ? (

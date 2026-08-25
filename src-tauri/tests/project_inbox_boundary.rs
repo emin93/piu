@@ -647,6 +647,8 @@ fn deletion_crosses_the_production_boundary_stops_pi_and_emits_one_local_only_ch
         rejected.code,
         ProjectCommandErrorCode::UnsafeChatDeletion
     ));
+    assert!(rejected.message.contains("chat record was kept"));
+    assert!(!rejected.message.contains("local files were left"));
     assert!(event_receiver.try_recv().is_err());
     assert_eq!(fs::read_to_string(&dirty_file).unwrap(), "uncommitted\n");
     let dirty_rows: u32 = connection

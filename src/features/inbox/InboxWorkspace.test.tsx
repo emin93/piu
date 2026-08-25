@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, expect, test, vi } from "vitest";
 
@@ -15,6 +15,18 @@ import { ProjectDraftController } from "./draft-controller";
 import { readRememberedProjectScope, rememberProjectScope } from "./inbox-scope";
 import { InboxWorkspace } from "./InboxWorkspace";
 import { ChatSetupController } from "./setup-controller";
+
+interface NativeMenuRequest {
+  actions: ReadonlyArray<{ id: "delete" | "rename"; separatorBefore: boolean }>;
+  onAction: (action: "delete" | "rename") => void;
+  position?: { x: number; y: number };
+}
+
+const popupNativeContextMenu = vi.hoisted(() =>
+  vi.fn<(request: NativeMenuRequest) => Promise<void>>().mockResolvedValue(undefined),
+);
+
+vi.mock("@/platform/native-context-menu", () => ({ popupNativeContextMenu }));
 
 const readySetup = {
   attempt: 1,
@@ -195,6 +207,12 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
+function latestNativeMenuRequest() {
+  const request = popupNativeContextMenu.mock.calls.at(-1)?.[0];
+  if (!request) throw new Error("The native context menu was not requested");
+  return request;
+}
+
 test("renders a compact header and a headerless flat newest-created-first inbox", () => {
   render(<WorkspaceHarness />);
 
@@ -227,6 +245,9 @@ test("changes scope without closing the current chat and exposes one inline proj
   expect(
     within(screen.getByRole("list", { name: "Chat inbox" })).queryByText("Beacon"),
   ).not.toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Document the importer, idle" }).closest("li"),
+  ).toHaveAttribute("data-compact", "true");
   expect(screen.getByRole("region", { name: "Chat workspace" })).toHaveAttribute(
     "data-selected-chat-id",
     "newer",
@@ -291,13 +312,14 @@ test("secondary click and overflow expose the same ordered Rename and Delete act
   const row = screen.getByRole("button", { name: "Document the importer, idle" });
 
   fireEvent.contextMenu(row, { clientX: 120, clientY: 160 });
-  const contextMenu = await screen.findByRole("menu");
+  await vi.waitFor(() => expect(popupNativeContextMenu).toHaveBeenCalledOnce());
   expect(
-    within(contextMenu)
-      .getAllByRole("menuitem")
-      .map((item) => item.textContent),
-  ).toEqual(["Rename chat", "Delete chat"]);
-  await user.keyboard("{Escape}");
+    latestNativeMenuRequest().actions.map((action) => [action.id, action.separatorBefore]),
+  ).toEqual([
+    ["rename", false],
+    ["delete", true],
+  ]);
+  expect(latestNativeMenuRequest().position).toBeUndefined();
 
   await user.click(
     within(row.closest("li") as HTMLLIElement).getByRole("button", {
@@ -310,6 +332,55 @@ test("secondary click and overflow expose the same ordered Rename and Delete act
       .getAllByRole("menuitem")
       .map((item) => item.textContent),
   ).toEqual(["Rename chat", "Delete chat"]);
+  expect(within(overflowMenu).getByRole("separator")).toBeVisible();
+});
+
+test("keyboard context-menu keys open the native menu beside the focused row", async () => {
+  render(<WorkspaceHarness />);
+  const row = screen.getByRole("button", { name: "Document the importer, idle" });
+  vi.spyOn(row, "getBoundingClientRect").mockReturnValue({
+    bottom: 142,
+    height: 62,
+    left: 40,
+    right: 220,
+    toJSON: () => ({}),
+    top: 80,
+    width: 180,
+    x: 40,
+    y: 80,
+  });
+
+  fireEvent.keyDown(row, { key: "F10", shiftKey: true });
+
+  await vi.waitFor(() => expect(popupNativeContextMenu).toHaveBeenCalledOnce());
+  expect(latestNativeMenuRequest().position).toEqual({ x: 56, y: 108 });
+  expect(row).toHaveFocus();
+
+  popupNativeContextMenu.mockClear();
+  fireEvent.keyDown(row, { key: "ContextMenu" });
+  await vi.waitFor(() => expect(popupNativeContextMenu).toHaveBeenCalledOnce());
+  expect(latestNativeMenuRequest().position).toEqual({ x: 56, y: 108 });
+});
+
+test("merged chats retain Rename but omit Delete until merged records can be removed", async () => {
+  const user = userEvent.setup();
+  render(<WorkspaceHarness />);
+  await user.click(screen.getByRole("button", { name: /Merged/ }));
+  const row = screen.getByRole("button", { name: "Historical result, idle" });
+
+  fireEvent.contextMenu(row);
+  await vi.waitFor(() => expect(popupNativeContextMenu).toHaveBeenCalledOnce());
+  expect(latestNativeMenuRequest().actions.map((action) => action.id)).toEqual(["rename"]);
+
+  await user.click(
+    within(row.closest("li") as HTMLLIElement).getByRole("button", {
+      name: "More chat actions",
+    }),
+  );
+  const overflowMenu = await screen.findByRole("menu");
+  expect(within(overflowMenu).getAllByRole("menuitem")).toHaveLength(1);
+  expect(within(overflowMenu).getByRole("menuitem", { name: "Rename chat" })).toBeVisible();
+  expect(within(overflowMenu).queryByRole("menuitem", { name: "Delete chat" })).toBeNull();
 });
 
 test("rename remains presentation-only and restores focus to the row", async () => {
@@ -319,7 +390,10 @@ test("rename remains presentation-only and restores focus to the row", async () 
   const row = screen.getByRole("button", { name: "Document the importer, idle" });
 
   fireEvent.contextMenu(row, { clientX: 120, clientY: 160 });
-  await user.click(await screen.findByRole("menuitem", { name: "Rename chat" }));
+  await vi.waitFor(() => expect(popupNativeContextMenu).toHaveBeenCalledOnce());
+  act(() => {
+    latestNativeMenuRequest().onAction("rename");
+  });
   const title = screen.getByRole("textbox", { name: "Title" });
   await user.clear(title);
   await user.type(title, "Importer documentation");
@@ -339,11 +413,14 @@ test("delete confirms local-only effects, recovers neighbor focus, and reports f
 
   const older = screen.getByRole("button", { name: "Document the importer, idle" });
   fireEvent.contextMenu(older, { clientX: 120, clientY: 160 });
-  await user.click(await screen.findByRole("menuitem", { name: "Delete chat" }));
+  await vi.waitFor(() => expect(popupNativeContextMenu).toHaveBeenCalledOnce());
+  act(() => {
+    latestNativeMenuRequest().onAction("delete");
+  });
   const confirmation = screen.getByRole("alertdialog", { name: /Delete.*Document the importer/ });
   expect(confirmation).toHaveTextContent("local conversation, managed worktree, and local branch");
   expect(confirmation).toHaveTextContent("won't close a pull request or delete a remote branch");
-  expect(confirmation).toHaveTextContent("Any active agent or terminal will be stopped first");
+  expect(confirmation).toHaveTextContent("Any active agent will be stopped first");
   await vi.waitFor(() =>
     expect(within(confirmation).getByRole("button", { name: "Cancel" })).toHaveFocus(),
   );
@@ -358,8 +435,12 @@ test("delete confirms local-only effects, recovers neighbor focus, and reports f
   );
 
   const newer = screen.getByRole("button", { name: "Repair repository indexing, idle" });
+  popupNativeContextMenu.mockClear();
   fireEvent.contextMenu(newer, { clientX: 120, clientY: 160 });
-  await user.click(await screen.findByRole("menuitem", { name: "Delete chat" }));
+  await vi.waitFor(() => expect(popupNativeContextMenu).toHaveBeenCalledOnce());
+  act(() => {
+    latestNativeMenuRequest().onAction("delete");
+  });
   await user.click(
     within(screen.getByRole("alertdialog")).getByRole("button", { name: "Delete chat" }),
   );

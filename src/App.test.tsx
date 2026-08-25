@@ -431,7 +431,7 @@ test("background activity becomes unread without reordering chats and clears on 
   act(() => {
     conversationRuntime.onEvent?.("chat-older", { type: "turn-completed" });
   });
-  expect(rows.querySelector('[data-chat-id="chat-older"]')).toHaveAttribute("data-unread", "true");
+  expect(rows.querySelector('[data-chat-id="chat-older"]')).not.toHaveAttribute("data-unread");
   await user.clear(search);
   expect(rows.querySelector('[data-chat-id="chat-older"]')).not.toHaveAttribute("data-unread");
 

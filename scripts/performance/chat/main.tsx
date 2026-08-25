@@ -1,6 +1,7 @@
 import { Profiler, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/profiling";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { inboxRenderCount, resetInboxRenderCounts } from "#inbox-performance-review";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ProjectDraftController } from "@/features/inbox/draft-controller";
@@ -275,7 +276,7 @@ function PerformanceReview() {
         "the warm chat switch",
       );
       await afterPaint();
-      click(".project-row-select");
+      click('[aria-label="New Chat"]');
       await waitFor(
         () => Boolean(document.querySelector('textarea[aria-label="Draft for Atlas"]')),
         "the warm project navigation",
@@ -310,7 +311,7 @@ function PerformanceReview() {
       for (let index = 0; index < NAVIGATION_SAMPLES; index += 1) {
         currentScenario.current = "navigation";
         const startedAt = performance.now();
-        click(".project-row-select");
+        click('[aria-label="New Chat"]');
         await waitFor(
           () => Boolean(document.querySelector('textarea[aria-label="Draft for Atlas"]')),
           `composer navigation ${index}`,
@@ -326,7 +327,7 @@ function PerformanceReview() {
       }
 
       drafts.changeAttachments(1, performanceAttachments);
-      click(".project-row-select");
+      click('[aria-label="New Chat"]');
       await waitFor(
         () => Boolean(document.querySelector('textarea[aria-label="Draft for Atlas"]')),
         "the composer",
@@ -379,8 +380,14 @@ function PerformanceReview() {
       setStatus("Measuring simulated Pi streaming");
       const receive = eventReceivers.current.get("performance-chat-0");
       if (!receive) throw new Error("Conversation event receiver is unavailable");
+      resetInboxRenderCounts();
       const streamFrames: number[] = [];
       const inferenceControlRendersBeforeStreaming = inferenceControlRenders.count;
+      const scopeControlRendersBeforeStreaming = inboxRenderCount({ kind: "scope-control" });
+      const unrelatedChatRowRendersBeforeStreaming = inboxRenderCount({
+        id: "performance-chat-1",
+        kind: "chat-row",
+      });
       currentScenario.current = "streaming";
       for (let index = 0; index < FRAME_SAMPLES; index += 1) {
         const timestamp = await nextFrame();
@@ -391,11 +398,38 @@ function PerformanceReview() {
       await afterPaint();
       const inferenceControlRendersDuringStreaming =
         inferenceControlRenders.count - inferenceControlRendersBeforeStreaming;
+      const scopeControlRendersDuringStreaming =
+        inboxRenderCount({ kind: "scope-control" }) - scopeControlRendersBeforeStreaming;
+      const unrelatedChatRowRendersDuringStreaming =
+        inboxRenderCount({ id: "performance-chat-1", kind: "chat-row" }) -
+        unrelatedChatRowRendersBeforeStreaming;
       if (inferenceControlRendersDuringStreaming !== 0) {
         throw new Error(
           `Inference controls rendered ${String(inferenceControlRendersDuringStreaming)} times during transcript streaming`,
         );
       }
+
+      const scopeControlRendersBeforeActivityUpdate = inboxRenderCount({
+        kind: "scope-control",
+      });
+      const targetChatRowRendersBeforeActivityUpdate = inboxRenderCount({
+        id: "performance-chat-0",
+        kind: "chat-row",
+      });
+      const unrelatedChatRowRendersBeforeActivityUpdate = inboxRenderCount({
+        id: "performance-chat-1",
+        kind: "chat-row",
+      });
+      activities.apply("performance-chat-0", { type: "turn-started" });
+      await afterPaint();
+      const scopeControlRendersDuringActivityUpdate =
+        inboxRenderCount({ kind: "scope-control" }) - scopeControlRendersBeforeActivityUpdate;
+      const targetChatRowRendersDuringActivityUpdate =
+        inboxRenderCount({ id: "performance-chat-0", kind: "chat-row" }) -
+        targetChatRowRendersBeforeActivityUpdate;
+      const unrelatedChatRowRendersDuringActivityUpdate =
+        inboxRenderCount({ id: "performance-chat-1", kind: "chat-row" }) -
+        unrelatedChatRowRendersBeforeActivityUpdate;
 
       const report = {
         browser: navigator.userAgent,
@@ -411,7 +445,12 @@ function PerformanceReview() {
           ]),
         ),
         scrollingFrames: summarizeFrames(scrollFrames),
+        scopeControlRendersDuringActivityUpdate,
+        scopeControlRendersDuringStreaming,
         streamingFrames: summarizeFrames(streamFrames),
+        targetChatRowRendersDuringActivityUpdate,
+        unrelatedChatRowRendersDuringActivityUpdate,
+        unrelatedChatRowRendersDuringStreaming,
         viewport: { height: window.innerHeight, width: window.innerWidth },
       };
       await writeText(`${RESULT_PREFIX}${JSON.stringify(report)}`);
@@ -421,7 +460,7 @@ function PerformanceReview() {
       await writeText(`${RESULT_PREFIX}${JSON.stringify({ error: message })}`);
       setStatus(`Performance review failed: ${message}`);
     }
-  }, [drafts, inferenceControlRenders]);
+  }, [activities, drafts, inferenceControlRenders]);
 
   return (
     <TooltipProvider>

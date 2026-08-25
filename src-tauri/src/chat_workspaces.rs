@@ -401,13 +401,15 @@ impl ChatWorkspaces {
         &self,
         deletion: &ChatDeletionReservation,
     ) -> Result<InboxSnapshot, ChatWorkspaceError> {
-        let project = self.inbox.project_location(deletion.ownership.project_id)?;
+        self.validate_deletion_session(deletion)?;
+        let ownership = &deletion.ownership;
+        let project = self.inbox.project_location(ownership.project_id)?;
         if !deletion.worktree_removed {
-            match fs::symlink_metadata(&deletion.ownership.worktree_path) {
+            match fs::symlink_metadata(&ownership.worktree_path) {
                 Ok(metadata) if !metadata.file_type().is_symlink() => {
                     self.validate_deletion_worktree(deletion, &project)?;
                     self.git
-                        .remove_worktree(&project.canonical_path, &deletion.ownership.worktree_path)
+                        .remove_worktree(&project.canonical_path, &ownership.worktree_path)
                         .map_err(|error| ChatWorkspaceError::Deletion(error.to_string()))?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -420,7 +422,7 @@ impl ChatWorkspaces {
             self.git
                 .delete_branch_if_at(
                     &project.canonical_path,
-                    &deletion.ownership.branch_name,
+                    &ownership.branch_name,
                     &deletion.branch_head,
                 )
                 .map_err(|error| ChatWorkspaceError::Deletion(error.to_string()))?;
@@ -432,22 +434,9 @@ impl ChatWorkspaces {
                 .session_file
                 .as_ref()
                 .ok_or(ChatWorkspaceError::UnsafeDeletion)?;
-            match fs::symlink_metadata(&session.path) {
-                Ok(metadata) => {
-                    if metadata.file_type().is_symlink()
-                        || !metadata.is_file()
-                        || filesystem_identity(&session.path)
-                            .map_err(|_| ChatWorkspaceError::UnsafeDeletion)?
-                            != *session
-                    {
-                        return Err(ChatWorkspaceError::UnsafeDeletion);
-                    }
-                    self.validate_session_path(&session.path)?;
-                    fs::remove_file(&session.path)
-                        .map_err(|error| ChatWorkspaceError::Deletion(error.to_string()))?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(ChatWorkspaceError::UnsafeDeletion),
+            if self.validate_deletion_session(deletion)? {
+                fs::remove_file(&session.path)
+                    .map_err(|error| ChatWorkspaceError::Deletion(error.to_string()))?;
             }
             self.inbox
                 .mark_chat_deletion_session_removed(&deletion.chat_id)?;
@@ -498,6 +487,32 @@ impl ChatWorkspaces {
             return Err(ChatWorkspaceError::UnsafeDeletion);
         }
         Ok(())
+    }
+
+    fn validate_deletion_session(
+        &self,
+        deletion: &ChatDeletionReservation,
+    ) -> Result<bool, ChatWorkspaceError> {
+        if deletion.session_removed {
+            return Ok(false);
+        }
+        let session = deletion
+            .session_file
+            .as_ref()
+            .ok_or(ChatWorkspaceError::UnsafeDeletion)?;
+        match fs::symlink_metadata(&session.path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && filesystem_identity(&session.path)
+                        .is_ok_and(|identity| identity == *session) =>
+            {
+                self.validate_session_path(&session.path)?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            _ => Err(ChatWorkspaceError::UnsafeDeletion),
+        }
     }
 
     fn stop_setup_for_deletion(&self, chat_id: &str) -> Result<(), ChatWorkspaceError> {
@@ -1653,6 +1668,61 @@ mod tests {
             "do not remove\n"
         );
         assert_eq!(replaced.inbox.snapshot().unwrap().chats.len(), 1);
+    }
+
+    #[test]
+    fn session_replacement_is_rejected_before_any_git_cleanup() {
+        let fixture = WorkspaceFixture::new(RemoteFixture::new());
+        let created = fixture.create("Protect a replacement session");
+        let worktree = fixture.worktrees.join(&created.chat.id);
+        let session_path = fixture
+            ._app_data
+            .path()
+            .join("sessions")
+            .join(format!("{}.jsonl", created.chat.id));
+        let original_session = session_path.with_extension("original.jsonl");
+        fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+        fs::write(&session_path, "owned conversation\n").unwrap();
+        fixture
+            .inbox
+            .bind_chat_session(&created.chat.id, "pi-replaced", &session_path)
+            .unwrap();
+        let deletion = fixture
+            .manager
+            .prepare_chat_deletion(&created.chat.id)
+            .unwrap();
+
+        fs::rename(&session_path, &original_session).unwrap();
+        fs::write(&session_path, "unrelated replacement\n").unwrap();
+        let error = deletion
+            .execute()
+            .expect_err("a replaced session must stop deletion before cleanup");
+
+        assert!(matches!(error, ChatWorkspaceError::UnsafeDeletion));
+        assert!(worktree.exists());
+        assert!(
+            fixture
+                .manager
+                .git
+                .branch_exists(&fixture.remote.working, &created.chat.branch_name)
+                .unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(&session_path).unwrap(),
+            "unrelated replacement\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&original_session).unwrap(),
+            "owned conversation\n"
+        );
+        assert_eq!(fixture.inbox.snapshot().unwrap().chats.len(), 1);
+        assert!(
+            fixture
+                .inbox
+                .chat_deletion(&created.chat.id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

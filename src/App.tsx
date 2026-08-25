@@ -447,9 +447,9 @@ export function App({
   }, [activities, snapshot.chats]);
 
   useEffect(() => {
-    const visibleChatId = activeSurface === "inbox" && !query.trim() ? selectedChatId : null;
+    const visibleChatId = activeSurface === "inbox" ? selectedChatId : null;
     activities.select(visibleChatId);
-  }, [activeSurface, activities, query, selectedChatId]);
+  }, [activeSurface, activities, selectedChatId]);
 
   useEffect(() => {
     let disposed = false;
