@@ -1,4 +1,5 @@
 pub mod application;
+pub mod attachment_commands;
 pub mod chat_runtime_commands;
 pub mod chat_runtime_host;
 pub mod chat_workspaces;
@@ -13,6 +14,7 @@ mod owned_process;
 pub mod pi_rpc;
 pub mod project_commands;
 pub mod project_inbox;
+pub mod prompt_attachments;
 pub mod runtime_lifecycle;
 pub mod system_appearance;
 
@@ -35,10 +37,12 @@ pub fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
             model_asset_boundary::authorize_hugging_face,
             model_asset_boundary::remove_model_assets,
             model_asset_boundary::retry_model_asset_recovery,
+            attachment_commands::prepare_prompt_attachments,
             project_commands::load_project_inbox,
             project_commands::open_repository,
             project_commands::save_project_draft,
             project_commands::remove_project,
+            project_commands::rename_chat,
             project_commands::create_chat,
             project_commands::retry_chat_setup,
             project_commands::cancel_chat_setup,
@@ -47,6 +51,7 @@ pub fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
             chat_runtime_commands::send_chat_message,
             chat_runtime_commands::steer_chat,
             chat_runtime_commands::abort_chat_turn,
+            chat_runtime_commands::answer_conversation_input,
             chat_runtime_commands::stop_chat_runtime,
             runtime_lifecycle::has_active_agent_turn,
             runtime_lifecycle::shutdown_runtime_processes,

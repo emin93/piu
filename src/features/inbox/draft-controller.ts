@@ -1,21 +1,31 @@
 import type { InboxSnapshot } from "@/platform/project-inbox";
+import type { PromptAttachment } from "@/platform/prompt-attachments";
 
 export type DraftPersistenceStatus =
   { state: "idle" | "saving" | "saved" } | { state: "failed"; message: string };
 
 export interface ProjectDraftState {
+  attachments: readonly PromptAttachment[];
   prompt: string;
   status: DraftPersistenceStatus;
 }
 
-type PersistDraft = (projectId: number, prompt: string) => Promise<unknown>;
+type PersistDraft = (
+  projectId: number,
+  prompt: string,
+  attachments: readonly PromptAttachment[],
+) => Promise<unknown>;
 type DraftListener = () => void;
 
 interface DraftEntry extends ProjectDraftState {
   local: boolean;
 }
 
-const EMPTY_DRAFT: ProjectDraftState = { prompt: "", status: { state: "idle" } };
+const EMPTY_DRAFT: ProjectDraftState = {
+  attachments: [],
+  prompt: "",
+  status: { state: "idle" },
+};
 const SAVE_DELAY_MS = 250;
 
 export class ProjectDraftController {
@@ -66,23 +76,32 @@ export class ProjectDraftController {
 
   reconcile(snapshot: InboxSnapshot) {
     const incomingByProject = new Map(
-      snapshot.drafts.map((draft) => [draft.projectId, draft.prompt] as const),
+      snapshot.drafts.map((draft) => [draft.projectId, draft] as const),
     );
 
     for (const project of snapshot.projects) {
-      const prompt = incomingByProject.get(project.id) ?? "";
+      const incoming = incomingByProject.get(project.id);
+      const prompt = incoming?.prompt ?? "";
+      const attachments = incoming?.attachments ?? [];
       const current = this.#entries.get(project.id);
-      if (current?.local && current.prompt !== prompt) continue;
-      const status: DraftPersistenceStatus = prompt ? { state: "saved" } : { state: "idle" };
+      if (
+        current?.local &&
+        (current.prompt !== prompt || !sameAttachmentIds(current.attachments, attachments))
+      ) {
+        continue;
+      }
+      const status: DraftPersistenceStatus =
+        prompt || attachments.length ? { state: "saved" } : { state: "idle" };
       if (
         current &&
         current.prompt === prompt &&
+        sameAttachmentIds(current.attachments, attachments) &&
         current.status.state === status.state &&
         !current.local
       ) {
         continue;
       }
-      this.#entries.set(project.id, { prompt, status, local: false });
+      this.#entries.set(project.id, { attachments, prompt, status, local: false });
       this.#notify(project.id);
     }
   }
@@ -92,17 +111,37 @@ export class ProjectDraftController {
     const drafts = snapshot.drafts.filter((draft) => !this.#entries.has(draft.projectId));
 
     for (const [projectId, entry] of this.#entries) {
-      if (!projectIds.has(projectId) || !entry.prompt) continue;
-      drafts.push({ projectId, prompt: entry.prompt, updatedAtMs: Date.now() });
+      if (!projectIds.has(projectId) || (!entry.prompt && entry.attachments.length === 0)) continue;
+      drafts.push({
+        attachments: [...entry.attachments],
+        projectId,
+        prompt: entry.prompt,
+        updatedAtMs: Date.now(),
+      });
     }
 
     return { ...snapshot, drafts };
   }
 
   change(projectId: number, prompt: string) {
+    const attachments = this.#entries.get(projectId)?.attachments ?? [];
+    this.#change(projectId, prompt, attachments);
+  }
+
+  changeAttachments(projectId: number, attachments: readonly PromptAttachment[]) {
+    const prompt = this.#entries.get(projectId)?.prompt ?? "";
+    this.#change(projectId, prompt, [...attachments]);
+  }
+
+  #change(projectId: number, prompt: string, attachments: readonly PromptAttachment[]) {
     const generation = (this.#generations.get(projectId) ?? 0) + 1;
     this.#generations.set(projectId, generation);
-    this.#entries.set(projectId, { prompt, status: { state: "saving" }, local: true });
+    this.#entries.set(projectId, {
+      attachments,
+      prompt,
+      status: { state: "saving" },
+      local: true,
+    });
     this.#notify(projectId);
 
     const previousTimer = this.#timers.get(projectId);
@@ -116,7 +155,7 @@ export class ProjectDraftController {
   async retry(projectId: number) {
     const entry = this.#entries.get(projectId);
     if (!entry || entry.status.state !== "failed") return;
-    this.change(projectId, entry.prompt);
+    this.#change(projectId, entry.prompt, entry.attachments);
     await this.flush(projectId);
   }
 
@@ -133,15 +172,22 @@ export class ProjectDraftController {
 
     const generation = this.#generations.get(projectId) ?? 0;
     const prompt = entry.prompt;
+    const attachments = entry.attachments;
     const previous = this.#queues.get(projectId) ?? Promise.resolve();
     const queued = previous.then(async () => {
       try {
-        await this.#persist(projectId, prompt);
+        await this.#persist(projectId, prompt, attachments);
         if (this.#generations.get(projectId) !== generation) return;
-        this.#entries.set(projectId, { prompt, status: { state: "saved" }, local: true });
+        this.#entries.set(projectId, {
+          attachments,
+          prompt,
+          status: { state: "saved" },
+          local: true,
+        });
       } catch (error: unknown) {
         if (this.#generations.get(projectId) !== generation) return;
         this.#entries.set(projectId, {
+          attachments,
           prompt,
           status: { state: "failed", message: this.#toFailureMessage(error) },
           local: true,
@@ -182,4 +228,11 @@ export class ProjectDraftController {
     for (const listener of this.#listeners.get(projectId) ?? []) listener();
     for (const listener of this.#allListeners) listener();
   }
+}
+
+function sameAttachmentIds(left: readonly PromptAttachment[], right: readonly PromptAttachment[]) {
+  return (
+    left.length === right.length &&
+    left.every((attachment, index) => attachment.id === right[index]?.id)
+  );
 }

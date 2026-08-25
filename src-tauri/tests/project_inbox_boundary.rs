@@ -16,7 +16,8 @@ use piu_lib::{
     project_commands::{
         CHAT_SETUP_CHANGED_EVENT, CHAT_TERMINAL_REQUESTED_EVENT, ChatIdRequest, CreateChatRequest,
         CreateChatResponse, OpenRepositoryRequest, OpenRepositoryResponse,
-        PROJECT_INBOX_CHANGED_EVENT, ProjectInboxChangedEvent, SaveProjectDraftRequest,
+        PROJECT_INBOX_CHANGED_EVENT, ProjectInboxChangedEvent, RenameChatRequest,
+        SaveProjectDraftRequest,
     },
     project_inbox::{
         DraftSummary, ProjectInbox, RepositoryIdentity, RepositoryInspectionError,
@@ -104,6 +105,7 @@ fn opening_a_repository_crosses_the_typed_boundary_and_emits_one_coarse_change()
                 "request": SaveProjectDraftRequest {
                     project_id: response.focused_project_id,
                     prompt: "Retained prompt".into(),
+                    attachments: vec![],
                 }
             })),
             headers: Default::default(),
@@ -272,6 +274,15 @@ fn first_send_crosses_the_typed_boundary_and_publishes_setup_and_terminal_action
     app.listen(CHAT_TERMINAL_REQUESTED_EVENT, move |event| {
         terminal_sender.send(event.payload().to_owned()).unwrap();
     });
+    let (inbox_sender, inbox_receiver) = mpsc::channel();
+    app.listen(PROJECT_INBOX_CHANGED_EVENT, move |event| {
+        inbox_sender
+            .send(
+                serde_json::from_str::<ProjectInboxChangedEvent>(event.payload())
+                    .expect("inbox event should be typed"),
+            )
+            .unwrap();
+    });
 
     let response = test::get_ipc_response(
         &webview,
@@ -284,6 +295,7 @@ fn first_send_crosses_the_typed_boundary_and_publishes_setup_and_terminal_action
                 "request": CreateChatRequest {
                     project_id,
                     prompt: "Build the parser boundary".into(),
+                    attachments: vec![],
                 }
             })),
             headers: Default::default(),
@@ -302,6 +314,39 @@ fn first_send_crosses_the_typed_boundary_and_publishes_setup_and_terminal_action
             .branch_name
             .ends_with("-build-the-parser-boundary")
     );
+    inbox_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("chat creation should publish its inbox change");
+
+    let renamed = test::get_ipc_response(
+        &webview,
+        InvokeRequest {
+            cmd: "rename_chat".into(),
+            callback: CallbackFn(24),
+            error: CallbackFn(25),
+            url: "tauri://localhost".parse().unwrap(),
+            body: InvokeBody::Json(serde_json::json!({
+                "request": RenameChatRequest {
+                    chat_id: response.chat.id.clone(),
+                    title: "  Parser   boundary  ".into(),
+                }
+            })),
+            headers: Default::default(),
+            invoke_key: test::INVOKE_KEY.into(),
+        },
+    )
+    .unwrap()
+    .deserialize::<piu_lib::project_inbox::InboxSnapshot>()
+    .unwrap();
+    assert_eq!(renamed.chats[0].title, "Parser boundary");
+    assert_eq!(renamed.chats[0].branch_name, response.chat.branch_name);
+    let renamed_event = inbox_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("rename should publish one inbox change");
+    assert_eq!(renamed_event.snapshot, renamed);
+    assert_eq!(renamed_event.focused_project_id, None);
+    assert!(inbox_receiver.try_recv().is_err());
+
     let setup = setup_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(
         setup.setup.phase,

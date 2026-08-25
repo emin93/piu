@@ -62,6 +62,7 @@ fn main() {
         .save_draft(
             atlas.id,
             "Trace the importer boundary and explain why the fallback order changes.",
+            &[],
         )
         .expect("review draft should save");
 
@@ -117,10 +118,10 @@ fn main() {
                     worktree_path, worktree_root_path, worktree_root_device,
                     worktree_root_inode, worktree_git_dir_path, worktree_git_dir_device,
                     worktree_git_dir_inode, base_commit, pull_request_number, created_at_ms,
-                    merge_state, setup_phase, setup_attempt, setup_log
+                    merge_state, setup_phase, setup_attempt, setup_log, initial_attachments_json
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 'review-device', ?7,
                            ?8, 'review-git-device', ?9, 'review-base', ?10, ?11, ?12,
-                           'succeeded', 1, '')",
+                           'succeeded', 1, '', '[]')",
                 params![
                     fixture.id,
                     fixture.project_id,

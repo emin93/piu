@@ -6,6 +6,7 @@ import { expect, test, vi } from "vitest";
 import type { InboxSnapshot } from "../../platform/project-inbox";
 import type { ConversationAdapter } from "../../platform/conversations";
 import { ProjectDraftController } from "./draft-controller";
+import { ChatActivityController } from "./chat-activity-controller";
 import { InboxWorkspace } from "./InboxWorkspace";
 import { ChatSetupController } from "./setup-controller";
 
@@ -19,9 +20,10 @@ const readySetup = {
 };
 
 const conversationAdapter: ConversationAdapter = {
+  answerInput: vi.fn().mockResolvedValue(undefined),
   connect: vi.fn().mockResolvedValue({
     disconnect: vi.fn(),
-    snapshot: { failure: null, items: [], phase: "idle" },
+    snapshot: { failure: null, inputRequest: null, items: [], phase: "idle" },
   }),
   prompt: vi.fn().mockResolvedValue(undefined),
   stop: vi.fn().mockResolvedValue(undefined),
@@ -33,7 +35,7 @@ const populatedSnapshot: InboxSnapshot = {
     { id: 2, name: "Beacon", availability: "missing", unmergedChatCount: 1 },
     { id: 3, name: "Caldera", availability: "available", unmergedChatCount: 0 },
   ],
-  drafts: [{ projectId: 1, prompt: "Explain the parser", updatedAtMs: 500 }],
+  drafts: [{ attachments: [], projectId: 1, prompt: "Explain the parser", updatedAtMs: 500 }],
   chats: [
     {
       id: "older",
@@ -85,10 +87,12 @@ const populatedSnapshot: InboxSnapshot = {
 function WorkspaceHarness({
   initialSnapshot = populatedSnapshot,
   onRemove = vi.fn().mockResolvedValue(undefined),
+  onRename = vi.fn().mockResolvedValue(undefined),
   onSave,
 }: {
   initialSnapshot?: InboxSnapshot;
   onRemove?: (projectId: number) => Promise<string | undefined>;
+  onRename?: (chatId: string, title: string) => Promise<string | undefined>;
   onSave?: (projectId: number, prompt: string) => Promise<void>;
 }) {
   const [snapshot, setSnapshot] = useState(initialSnapshot);
@@ -102,7 +106,7 @@ function WorkspaceHarness({
         ...current,
         drafts: [
           ...current.drafts.filter((draft) => draft.projectId !== projectId),
-          ...(prompt ? [{ projectId, prompt, updatedAtMs: 700 }] : []),
+          ...(prompt ? [{ attachments: [], projectId, prompt, updatedAtMs: 700 }] : []),
         ],
       }));
     });
@@ -114,12 +118,14 @@ function WorkspaceHarness({
     controller.reconcile(initialSnapshot);
     return controller;
   });
+  const [activities] = useState(() => new ChatActivityController());
   useEffect(() => drafts.reconcile(snapshot), [drafts, snapshot]);
   useEffect(() => setups.reconcile(snapshot), [setups, snapshot]);
 
   return (
     <InboxWorkspace
       actionError={undefined}
+      activities={activities}
       conversationAdapter={conversationAdapter}
       conversationRevision={0}
       drafts={drafts}
@@ -131,6 +137,7 @@ function WorkspaceHarness({
       onRequestCodexSignIn={vi.fn()}
       onQueryChange={setQuery}
       onRemoveProject={onRemove}
+      onRenameChat={onRename}
       onRetrySetup={vi.fn().mockResolvedValue(undefined)}
       onSelectChat={setSelectedChatId}
       onSelectProject={(projectId) => {
@@ -152,6 +159,7 @@ test("exposes Settings as a quiet sidebar footer action", async () => {
   render(
     <InboxWorkspace
       actionError={undefined}
+      activities={new ChatActivityController()}
       conversationAdapter={conversationAdapter}
       conversationRevision={0}
       drafts={new ProjectDraftController(() => Promise.resolve())}
@@ -163,6 +171,7 @@ test("exposes Settings as a quiet sidebar footer action", async () => {
       onRequestCodexSignIn={vi.fn()}
       onQueryChange={vi.fn()}
       onRemoveProject={vi.fn().mockResolvedValue(undefined)}
+      onRenameChat={vi.fn().mockResolvedValue(undefined)}
       onRetrySetup={vi.fn().mockResolvedValue(undefined)}
       onSelectChat={vi.fn()}
       onSelectProject={vi.fn()}
@@ -201,6 +210,31 @@ test("renders stable global rows and composes project filtering with search", as
   expect(screen.queryByRole("textbox", { name: "Draft for Atlas" })).not.toBeInTheDocument();
   expect(screen.getByText(/deliberately long chat title/)).toBeVisible();
   expect(screen.queryByText("Document the importer")).not.toBeInTheDocument();
+});
+
+test("offers chat actions through right click and a visible menu, then renames presentation only", async () => {
+  const renameChat = vi.fn().mockResolvedValue(undefined);
+  const user = userEvent.setup();
+  render(<WorkspaceHarness onRename={renameChat} />);
+
+  const row = screen.getByRole("button", { name: "Document the importer, idle" });
+  expect(
+    within(row.closest("li") as HTMLLIElement).getByRole("button", {
+      name: "More chat actions",
+    }),
+  ).toBeInTheDocument();
+
+  fireEvent.contextMenu(row, { clientX: 120, clientY: 160 });
+  await user.click(await screen.findByRole("menuitem", { name: "Rename chat" }));
+
+  const title = screen.getByRole("textbox", { name: "Title" });
+  expect(title).toHaveValue("Document the importer");
+  await user.clear(title);
+  await user.type(title, "Importer documentation");
+  await user.click(screen.getByRole("button", { name: "Save" }));
+
+  expect(renameChat).toHaveBeenCalledWith("older", "Importer documentation");
+  expect(screen.queryByRole("dialog", { name: "Rename chat" })).not.toBeInTheDocument();
 });
 
 test("keeps one controlled draft per project across navigation", async () => {
@@ -309,7 +343,12 @@ test("an unavailable project presents its retained draft read-only without send 
     ...populatedSnapshot,
     drafts: [
       ...populatedSnapshot.drafts,
-      { projectId: 2, prompt: "Keep the unavailable repository context", updatedAtMs: 600 },
+      {
+        attachments: [],
+        projectId: 2,
+        prompt: "Keep the unavailable repository context",
+        updatedAtMs: 600,
+      },
     ],
   };
   const user = userEvent.setup();
@@ -340,6 +379,42 @@ test("removal discloses draft deletion and keeps the modal open on failure", asy
 
   expect(await within(dialog).findByRole("alert")).toHaveTextContent("Couldn't remove");
   expect(dialog).toBeVisible();
+});
+
+test("attachment-only drafts stay visible and are disclosed before project removal", async () => {
+  const user = userEvent.setup();
+  const attachmentOnlySnapshot: InboxSnapshot = {
+    ...populatedSnapshot,
+    drafts: [
+      ...populatedSnapshot.drafts,
+      {
+        attachments: [
+          {
+            content: "Release notes",
+            id: "notes-attachment",
+            kind: "text",
+            mimeType: "text/plain",
+            name: "notes.txt",
+            sizeBytes: 13,
+          },
+        ],
+        projectId: 3,
+        prompt: "",
+        updatedAtMs: 700,
+      },
+    ],
+  };
+  render(<WorkspaceHarness initialSnapshot={attachmentOnlySnapshot} />);
+
+  const draftsList = screen.getByRole("list", { name: "Unsent drafts" });
+  expect(within(draftsList).getByText("Attached notes.txt")).toBeVisible();
+
+  await user.click(screen.getByRole("button", { name: "Project actions for Caldera" }));
+  await user.click(await screen.findByRole("menuitem", { name: "Remove project" }));
+
+  expect(screen.getByRole("alertdialog", { name: "Remove Caldera?" })).toHaveTextContent(
+    "unsent draft will be deleted",
+  );
 });
 
 test("a failed draft stays visible in All Projects and can be retried", async () => {

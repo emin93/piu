@@ -65,8 +65,8 @@ const snapshot: InboxSnapshot = {
     { id: 2, name: "Beacon", availability: "available", unmergedChatCount: 1 },
   ],
   drafts: [
-    { projectId: 1, prompt: "Explain the parser", updatedAtMs: 500 },
-    { projectId: 2, prompt: "Polish the index", updatedAtMs: 600 },
+    { attachments: [], projectId: 1, prompt: "Explain the parser", updatedAtMs: 500 },
+    { attachments: [], projectId: 2, prompt: "Polish the index", updatedAtMs: 600 },
   ],
   chats,
 };

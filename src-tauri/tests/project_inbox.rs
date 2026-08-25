@@ -15,6 +15,7 @@ use piu_lib::{
         ProjectInbox, ProjectInboxError, RepositoryIdentity, RepositoryInspectionError,
         RepositoryInspector,
     },
+    prompt_attachments::{PromptAttachment, PromptAttachmentKind},
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -60,10 +61,10 @@ fn seed_chat(
                 worktree_root_path, worktree_root_device, worktree_root_inode,
                 worktree_git_dir_path, worktree_git_dir_device, worktree_git_dir_inode,
                 base_commit, pull_request_number, created_at_ms, merge_state,
-                setup_phase, setup_attempt, setup_log
+                setup_phase, setup_attempt, setup_log, initial_attachments_json
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 'fixture-device', ?7,
                        ?8, 'fixture-git-device', ?9, 'fixture-base', ?10, ?11, ?12,
-                       'succeeded', 1, '')",
+                       'succeeded', 1, '', '[]')",
             params![
                 id,
                 project_id,
@@ -125,10 +126,10 @@ fn opens_real_repositories_once_and_retains_one_draft_per_project() {
     assert_eq!(duplicate.project.id, opened.project.id);
 
     inbox
-        .save_draft(opened.project.id, "first prompt")
+        .save_draft(opened.project.id, "first prompt", &[])
         .expect("draft should save");
     inbox
-        .save_draft(opened.project.id, "replacement prompt")
+        .save_draft(opened.project.id, "replacement prompt", &[])
         .expect("draft should update");
     drop(inbox);
 
@@ -137,6 +138,127 @@ fn opens_real_repositories_once_and_retains_one_draft_per_project() {
     assert_eq!(snapshot.projects.len(), 1);
     assert_eq!(snapshot.drafts.len(), 1);
     assert_eq!(snapshot.drafts[0].prompt, "replacement prompt");
+}
+
+#[test]
+fn draft_attachments_survive_relaunch_as_frozen_content() {
+    let fixture = TempDir::new().expect("fixture should be created");
+    let database_path = fixture.path().join("piu.sqlite3");
+    let repository_path = fixture.path().join("alpha");
+    make_repository(&repository_path);
+    let inbox = open_inbox(&database_path);
+    let project = inbox
+        .open_repository(&repository_path)
+        .expect("repository should open")
+        .project;
+    let attachment = PromptAttachment {
+        id: "notes-immutable".into(),
+        name: "notes.txt".into(),
+        kind: PromptAttachmentKind::Text,
+        mime_type: "text/plain".into(),
+        content: "Remember this".into(),
+        size_bytes: 13,
+    };
+
+    inbox
+        .save_draft(
+            project.id,
+            "Use the notes",
+            std::slice::from_ref(&attachment),
+        )
+        .expect("draft should save");
+    drop(inbox);
+
+    let restored = open_inbox(&database_path)
+        .snapshot()
+        .expect("snapshot should restore")
+        .drafts
+        .remove(0);
+    assert_eq!(restored.prompt, "Use the notes");
+    assert_eq!(restored.attachments, vec![attachment]);
+}
+
+#[test]
+fn renaming_a_chat_changes_only_its_presentation_title() {
+    let fixture = TempDir::new().expect("fixture should be created");
+    let database_path = fixture.path().join("piu.sqlite3");
+    let repository_path = fixture.path().join("alpha");
+    make_repository(&repository_path);
+    let inbox = open_inbox(&database_path);
+    let project = inbox
+        .open_repository(&repository_path)
+        .expect("repository should open")
+        .project;
+    seed_chat(
+        &database_path,
+        "renamed-chat",
+        project.id,
+        "Generated title",
+        300,
+        "unmerged",
+    );
+    let before = inbox
+        .snapshot()
+        .expect("snapshot should load")
+        .chats
+        .into_iter()
+        .find(|chat| chat.id == "renamed-chat")
+        .expect("chat should exist");
+
+    let renamed = inbox
+        .rename_chat("renamed-chat", "  A   concise\ncustom title  ")
+        .expect("rename should persist")
+        .chats
+        .into_iter()
+        .find(|chat| chat.id == "renamed-chat")
+        .expect("renamed chat should exist");
+
+    assert_eq!(renamed.title, "A concise custom title");
+    assert_eq!(renamed.branch_name, before.branch_name);
+    assert_eq!(renamed.project_id, before.project_id);
+    assert_eq!(renamed.created_at_ms, before.created_at_ms);
+    assert_eq!(renamed.merge_state, before.merge_state);
+}
+
+#[test]
+fn chat_rename_rejects_empty_titles_and_reports_missing_chats() {
+    let fixture = TempDir::new().expect("fixture should be created");
+    let database_path = fixture.path().join("piu.sqlite3");
+    let repository_path = fixture.path().join("alpha");
+    make_repository(&repository_path);
+    let inbox = open_inbox(&database_path);
+    let project = inbox
+        .open_repository(&repository_path)
+        .expect("repository should open")
+        .project;
+    seed_chat(
+        &database_path,
+        "rename-validation",
+        project.id,
+        "Original title",
+        300,
+        "unmerged",
+    );
+
+    assert!(matches!(
+        inbox.rename_chat("rename-validation", " \n\t "),
+        Err(ProjectInboxError::InvalidChatTitle)
+    ));
+    assert!(matches!(
+        inbox.rename_chat("missing-chat", "Valid title"),
+        Err(ProjectInboxError::ChatNotFound { chat_id }) if chat_id == "missing-chat"
+    ));
+    assert_eq!(
+        inbox
+            .snapshot()
+            .expect("snapshot should load")
+            .chats
+            .into_iter()
+            .find(|chat| chat.id == "rename-validation")
+            .expect("chat should remain")
+            .title,
+        "Original title"
+    );
 }
 
 #[test]
@@ -241,7 +363,7 @@ fn removal_is_transactional_and_preserves_merged_history() {
         .expect("repository should open")
         .project;
     inbox
-        .save_draft(project.id, "keep until removal succeeds")
+        .save_draft(project.id, "keep until removal succeeds", &[])
         .expect("draft should save");
     seed_chat(
         &database_path,
@@ -416,7 +538,7 @@ fn slow_repository_revalidation_does_not_block_draft_storage() {
     let draft_inbox = Arc::clone(&inbox);
     thread::spawn(move || {
         saved_sender
-            .send(draft_inbox.save_draft(project.id, "Store while probing"))
+            .send(draft_inbox.save_draft(project.id, "Store while probing", &[]))
             .expect("draft result should be observed");
     });
     let saved = saved_receiver

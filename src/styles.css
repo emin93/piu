@@ -186,7 +186,7 @@
   gap: 8px;
   align-items: center;
   min-width: 0;
-  padding-left: 80px;
+  padding-left: 96px;
   color: var(--sidebar-foreground);
   font-size: 13px;
   font-weight: 600;
@@ -474,9 +474,16 @@
 }
 
 .chat-row {
+  position: relative;
   min-width: 0;
   content-visibility: auto;
   contain-intrinsic-block-size: 52px;
+}
+
+.chat-row-context-trigger {
+  display: block;
+  width: 100%;
+  min-width: 0;
 }
 
 .chat-row-select {
@@ -488,9 +495,23 @@
   width: 100%;
   min-width: 0;
   min-height: 52px;
-  padding: 8px;
+  padding: 8px 36px 8px 8px;
   border-radius: 8px;
   text-align: left;
+}
+
+.chat-actions-trigger {
+  position: absolute;
+  top: 12px;
+  right: 4px;
+  z-index: 1;
+  opacity: 0;
+}
+
+.chat-row:hover .chat-actions-trigger,
+.chat-actions-trigger:focus-visible,
+.chat-actions-trigger[aria-expanded="true"] {
+  opacity: 1;
 }
 
 .chat-row-select:hover,
@@ -511,14 +532,25 @@
   box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 16%, transparent);
 }
 
+.chat-setup-indicator[data-phase="needs-input"] {
+  background: var(--warning);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--warning) 16%, transparent);
+}
+
 .chat-setup-indicator[data-phase="succeeded"],
-.chat-setup-indicator[data-phase="notRequired"] {
+.chat-setup-indicator[data-phase="notRequired"],
+.chat-setup-indicator[data-phase="finished"] {
   background: var(--success);
 }
 
 .chat-setup-indicator[data-phase="failed"],
-.chat-setup-indicator[data-phase="cancelled"] {
+.chat-setup-indicator[data-phase="cancelled"],
+.chat-setup-indicator[data-phase="interrupted"] {
   background: var(--destructive);
+}
+
+.chat-row[data-unread="true"] .chat-row-title {
+  font-weight: 650;
 }
 
 .chat-row-copy {
@@ -720,7 +752,7 @@ html[data-inbox-sidebar-resizing] {
   width: 100%;
   overflow: hidden;
   border: 1px solid var(--input);
-  border-radius: 12px;
+  border-radius: 16px;
   background: var(--card);
   box-shadow:
     0 1px 0 color-mix(in oklab, var(--foreground) 4%, transparent),
@@ -754,8 +786,76 @@ html[data-inbox-sidebar-resizing] {
   box-shadow: none;
 }
 
+.prompt-attachment-tray {
+  display: flex;
+  gap: 6px;
+  max-width: 100%;
+  margin: 10px 10px 0;
+  padding: 0;
+  overflow-x: auto;
+  list-style: none;
+  scrollbar-width: none;
+}
+
+.prompt-attachment-tray::-webkit-scrollbar {
+  display: none;
+}
+
+.prompt-attachment {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 20px;
+  gap: 7px;
+  align-items: center;
+  flex: 0 0 auto;
+  width: 164px;
+  height: 38px;
+  padding: 4px 4px 4px 5px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--muted) 58%, var(--card));
+}
+
+.prompt-attachment-preview {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 6px;
+  background: color-mix(in oklab, var(--background) 76%, var(--muted));
+  color: var(--muted-foreground);
+}
+
+.prompt-attachment-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.prompt-attachment-preview svg {
+  width: 14px;
+  height: 14px;
+}
+
+.prompt-attachment-name {
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 11px;
+  font-weight: 480;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prompt-attachment-remove {
+  color: var(--muted-foreground);
+}
+
+.attachment-spin {
+  animation: setup-spin 900ms linear infinite;
+}
+
 .product-composer[data-composer-layout="docked"] .product-composer-input {
-  min-height: 72px;
+  min-height: 56px;
   font-size: 13px;
   line-height: 1.5;
 }
@@ -783,6 +883,13 @@ html[data-inbox-sidebar-resizing] {
   padding: 4px 8px 8px 16px;
   color: var(--muted-foreground);
   font-size: 11px;
+}
+
+.product-composer-meta {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
 }
 
 .product-composer-status {

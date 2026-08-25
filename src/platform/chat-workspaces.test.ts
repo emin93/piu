@@ -24,13 +24,16 @@ beforeEach(() => {
 test("chat workspace actions cross the typed host commands without paths or options", async () => {
   tauri.invoke.mockResolvedValue(undefined);
 
-  await createChat(7, "Repair parser ownership");
+  await createChat(7, "Repair parser ownership", []);
   await retryChatSetup("chat-7");
   await cancelChatSetup("chat-7");
   await openChatTerminal("chat-7");
 
   expect(tauri.invoke.mock.calls).toEqual([
-    ["create_chat", { request: { projectId: 7, prompt: "Repair parser ownership" } }],
+    [
+      "create_chat",
+      { request: { attachments: [], projectId: 7, prompt: "Repair parser ownership" } },
+    ],
     ["retry_chat_setup", { request: { chatId: "chat-7" } }],
     ["cancel_chat_setup", { request: { chatId: "chat-7" } }],
     ["open_chat_terminal", { request: { chatId: "chat-7" } }],

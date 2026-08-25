@@ -7,11 +7,13 @@ use piu_lib::{
     chat_runtime_commands::{ConversationPromptRequest, ConversationStreamingBehavior},
     chat_runtime_host::{
         ChatRuntimeChangedEvent, ChatRuntimeHost, ChatRuntimeHostError, ConversationEvent,
-        ConversationItem, ConversationPhase, ConversationSnapshot, ConversationToolStatus,
+        ConversationInputAnswer, ConversationInputKind, ConversationItem, ConversationPhase,
+        ConversationSnapshot, ConversationToolStatus,
     },
     chat_workspaces::ChatWorkspaces,
     git_process::GitProcess,
     project_inbox::{ChatSetupPhase, ProjectInbox},
+    prompt_attachments::{PromptAttachment, PromptAttachmentError, PromptAttachmentKind},
 };
 use support::{TemporaryAppData, TemporaryGitRemote};
 
@@ -59,7 +61,7 @@ impl ChatFixture {
             app_data.path().join("worktrees"),
         ));
         let chat = workspaces
-            .create_chat(project.id, "Inspect the runtime")
+            .create_chat(project.id, "Inspect the runtime", &[])
             .expect("create chat")
             .chat;
         if run_setup {
@@ -115,10 +117,18 @@ impl ChatFixture {
     }
 
     fn create_chat(&self, prompt: &str) -> String {
+        self.create_chat_with_attachments(prompt, &[])
+    }
+
+    fn create_chat_with_attachments(
+        &self,
+        prompt: &str,
+        attachments: &[PromptAttachment],
+    ) -> String {
         let project_id = self.inbox.snapshot().unwrap().projects.first().unwrap().id;
         let chat = self
             .workspaces
-            .create_chat(project_id, prompt)
+            .create_chat(project_id, prompt, attachments)
             .unwrap()
             .chat;
         let setup = self
@@ -127,6 +137,17 @@ impl ChatFixture {
             .unwrap();
         assert_eq!(setup.phase, ChatSetupPhase::NotRequired);
         chat.id
+    }
+
+    fn fresh_host(&self) -> ChatRuntimeHost {
+        ChatRuntimeHost::new(
+            Arc::clone(&self.inbox),
+            Arc::clone(&self.workspaces),
+            self._app_data.path(),
+            &self.resource_directory,
+            &self._app_data.path().join("real-home"),
+        )
+        .expect("create fresh runtime host")
     }
 
     fn live_children(&self) -> usize {
@@ -149,6 +170,21 @@ impl ChatFixture {
             )
         });
     }
+
+    async fn wait_for_record_contains(&self, name: &str, expected: &str) {
+        tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+            loop {
+                if fs::read_to_string(self._app_data.path().join("host-fixture").join(name))
+                    .is_ok_and(|contents| contents.contains(expected))
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected {name} to contain {expected}"));
+    }
 }
 
 #[tokio::test]
@@ -156,8 +192,9 @@ async fn native_pi_events_project_to_one_authoritative_typed_conversation() {
     let fixture = ChatFixture::with_options(true, true, "streaming");
     let mut events = fixture.host.subscribe();
 
-    fixture.host.open(&fixture.chat_id).await.unwrap();
+    let opening_snapshot = fixture.host.open(&fixture.chat_id).await.unwrap();
     let mut received = Vec::new();
+    let mut revisions = Vec::new();
     loop {
         let changed = tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, events.recv())
             .await
@@ -165,11 +202,20 @@ async fn native_pi_events_project_to_one_authoritative_typed_conversation() {
             .expect("event subscription should remain live");
         assert_eq!(changed.chat_id, fixture.chat_id);
         let completed = matches!(changed.event, ConversationEvent::TurnCompleted);
+        revisions.push(changed.revision);
         received.push(changed.event);
         if completed {
             break;
         }
     }
+
+    assert_eq!(revisions.first(), Some(&1));
+    assert!(
+        revisions
+            .windows(2)
+            .all(|window| window[1] == window[0] + 1)
+    );
+    assert!(opening_snapshot.revision <= *revisions.last().unwrap());
 
     assert!(received.iter().any(|event| matches!(
         event,
@@ -262,6 +308,7 @@ async fn native_pi_events_project_to_one_authoritative_typed_conversation() {
 fn conversation_wire_types_match_the_frontend_contract() {
     let snapshot = ConversationSnapshot {
         failure: None,
+        input_request: None,
         items: vec![ConversationItem::Usage {
             cache_read_tokens: Some(3),
             id: "message-1-usage".into(),
@@ -269,11 +316,13 @@ fn conversation_wire_types_match_the_frontend_contract() {
             output_tokens: 7,
         }],
         phase: ConversationPhase::Running,
+        revision: 4,
     };
     assert_eq!(
         serde_json::to_value(snapshot).unwrap(),
         serde_json::json!({
             "failure": null,
+            "inputRequest": null,
             "items": [{
                 "kind": "usage",
                 "cacheReadTokens": 3,
@@ -281,7 +330,8 @@ fn conversation_wire_types_match_the_frontend_contract() {
                 "inputTokens": 12,
                 "outputTokens": 7
             }],
-            "phase": "running"
+            "phase": "running",
+            "revision": 4
         })
     );
 
@@ -292,6 +342,7 @@ fn conversation_wire_types_match_the_frontend_contract() {
             item_id: "tool-call-1".into(),
             status: ConversationToolStatus::Succeeded,
         },
+        revision: 5,
     };
     assert_eq!(
         serde_json::to_value(changed).unwrap(),
@@ -302,7 +353,8 @@ fn conversation_wire_types_match_the_frontend_contract() {
                 "detail": "README.md",
                 "itemId": "tool-call-1",
                 "status": "succeeded"
-            }
+            },
+            "revision": 5
         })
     );
 
@@ -318,6 +370,270 @@ fn conversation_wire_types_match_the_frontend_contract() {
         ConversationStreamingBehavior::Steer
     );
     assert_eq!(prompt.text, "Continue");
+}
+
+fn text_attachment() -> PromptAttachment {
+    PromptAttachment {
+        id: "attachment-notes".into(),
+        name: "notes.txt".into(),
+        kind: PromptAttachmentKind::Text,
+        mime_type: "text/plain".into(),
+        content: "Keep the public boundary".into(),
+        size_bytes: 24,
+    }
+}
+
+fn image_attachment() -> PromptAttachment {
+    PromptAttachment {
+        id: "attachment-view".into(),
+        name: "view.png".into(),
+        kind: PromptAttachmentKind::Image,
+        mime_type: "image/png".into(),
+        content: "iVBORw0KGgpmaXh0dXJl".into(),
+        size_bytes: 15,
+    }
+}
+
+#[tokio::test]
+async fn first_prompt_attachments_are_restored_and_delivered_once() {
+    let fixture = ChatFixture::new(true);
+    let chat_id = fixture
+        .create_chat_with_attachments("Inspect these", &[text_attachment(), image_attachment()]);
+
+    fixture.host.open(&chat_id).await.unwrap();
+
+    let commands = fixture.record(&format!("commands-pi-{chat_id}"));
+    assert!(commands.contains("BEGIN ATTACHED TEXT FILE notes.txt [attachment-notes]"));
+    assert!(commands.contains("\"images\":[{\"data\":\"iVBORw0KGgpmaXh0dXJl\",\"mimeType\":\"image/png\",\"type\":\"image\"}]"));
+    assert_eq!(commands.matches("\"type\":\"prompt\"").count(), 1);
+    fixture.host.stop_runtime(&chat_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn later_turn_attachments_use_delimited_text_and_pi_native_images() {
+    let fixture = ChatFixture::new(true);
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+
+    fixture
+        .host
+        .send_with_attachments(
+            &fixture.chat_id,
+            "Compare these",
+            &[text_attachment(), image_attachment()],
+        )
+        .await
+        .unwrap();
+
+    let commands = fixture.record("commands");
+    assert!(commands.contains("BEGIN ATTACHED TEXT FILE notes.txt [attachment-notes]"));
+    assert!(commands.contains("\"images\":[{\"data\":\"iVBORw0KGgpmaXh0dXJl\",\"mimeType\":\"image/png\",\"type\":\"image\"}]"));
+    assert_eq!(commands.matches("\"type\":\"prompt\"").count(), 2);
+    fixture.host.stop_runtime(&fixture.chat_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn native_extension_ui_requests_pause_for_typed_user_input_and_can_be_cancelled() {
+    let fixture = ChatFixture::with_options(true, true, "needs-input");
+    let mut events = fixture.host.subscribe();
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+
+    let request = tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+        loop {
+            let changed = events.recv().await.unwrap();
+            if let ConversationEvent::InputRequested { request } = changed.event {
+                break request;
+            }
+        }
+    })
+    .await
+    .expect("Pi's extension input should reach the host");
+    assert_eq!(request.id, "extension-choice-1");
+    assert_eq!(request.kind, ConversationInputKind::Select);
+    assert_eq!(request.title, "Choose a strategy");
+    assert_eq!(request.options, ["Keep both", "Replace"]);
+    assert_eq!(
+        fixture
+            .host
+            .snapshot(&fixture.chat_id)
+            .unwrap()
+            .input_request,
+        Some(request.clone())
+    );
+
+    fixture
+        .host
+        .answer_input(
+            &fixture.chat_id,
+            &request.id,
+            ConversationInputAnswer::Value {
+                value: "Keep both".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        events.recv().await.unwrap().event,
+        ConversationEvent::InputResolved { ref request_id }
+            if request_id == "extension-choice-1"
+    ));
+    assert!(
+        fixture
+            .host
+            .snapshot(&fixture.chat_id)
+            .unwrap()
+            .input_request
+            .is_none()
+    );
+    fixture
+        .wait_for_record_contains(
+            "extension-ui-responses",
+            r#"{"id":"extension-choice-1","type":"extension_ui_response","value":"Keep both"}"#,
+        )
+        .await;
+
+    let cancel_request = tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+        loop {
+            let changed = events.recv().await.unwrap();
+            if let ConversationEvent::InputRequested { request } = changed.event {
+                break request;
+            }
+        }
+    })
+    .await
+    .expect("the next extension input should reach the host");
+    assert_eq!(cancel_request.kind, ConversationInputKind::Editor);
+    fixture
+        .host
+        .answer_input(
+            &fixture.chat_id,
+            &cancel_request.id,
+            ConversationInputAnswer::Cancelled,
+        )
+        .await
+        .unwrap();
+    fixture
+        .wait_for_record_contains(
+            "extension-ui-responses",
+            r#"{"cancelled":true,"id":"extension-editor-2","type":"extension_ui_response"}"#,
+        )
+        .await;
+
+    fixture.host.abort(&fixture.chat_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn select_input_rejects_an_unknown_option_without_consuming_the_request() {
+    let fixture = ChatFixture::with_options(true, true, "needs-input");
+    let mut events = fixture.host.subscribe();
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+
+    let request = tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+        loop {
+            let changed = events.recv().await.unwrap();
+            if let ConversationEvent::InputRequested { request } = changed.event {
+                break request;
+            }
+        }
+    })
+    .await
+    .expect("Pi's select input should reach the host");
+
+    let error = fixture
+        .host
+        .answer_input(
+            &fixture.chat_id,
+            &request.id,
+            ConversationInputAnswer::Value {
+                value: "Forged choice".into(),
+            },
+        )
+        .await
+        .expect_err("a select answer must match one of Pi's pending options");
+    assert!(matches!(error, ChatRuntimeHostError::InvalidInputAnswer));
+    assert_eq!(
+        fixture
+            .host
+            .snapshot(&fixture.chat_id)
+            .unwrap()
+            .input_request,
+        Some(request.clone())
+    );
+
+    fixture
+        .host
+        .answer_input(
+            &fixture.chat_id,
+            &request.id,
+            ConversationInputAnswer::Value {
+                value: "Keep both".into(),
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .wait_for_record_contains(
+            "extension-ui-responses",
+            r#"{"id":"extension-choice-1","type":"extension_ui_response","value":"Keep both"}"#,
+        )
+        .await;
+    fixture.host.abort(&fixture.chat_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn image_send_is_typed_when_the_selected_model_has_no_image_input() {
+    let fixture = ChatFixture::with_options(true, true, "text-only");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+
+    let error = fixture
+        .host
+        .send_with_attachments(&fixture.chat_id, "Inspect this", &[image_attachment()])
+        .await
+        .expect_err("text-only route must reject image input");
+
+    assert!(matches!(
+        error,
+        ChatRuntimeHostError::Attachment(PromptAttachmentError::ModelMediaUnsupported)
+    ));
+    assert_eq!(
+        fixture
+            .record("commands")
+            .matches("\"type\":\"prompt\"")
+            .count(),
+        1,
+        "the unsupported turn must not reach Pi"
+    );
+    fixture.host.stop_runtime(&fixture.chat_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_image_send_retires_a_send_only_restored_text_runtime() {
+    let fixture = ChatFixture::with_options(true, true, "text-only");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture.host.abort(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(0).await;
+
+    let fresh_host = fixture.fresh_host();
+    let restored = fresh_host.open(&fixture.chat_id).await.unwrap();
+    let stored_session = fixture.inbox.chat_session(&fixture.chat_id).unwrap();
+    assert_eq!(restored.phase, ConversationPhase::Stopped);
+    fixture.wait_for_live_children(0).await;
+
+    let error = fresh_host
+        .send_with_attachments(&fixture.chat_id, "Inspect this", &[image_attachment()])
+        .await
+        .expect_err("text-only route must reject image input");
+
+    assert!(matches!(
+        error,
+        ChatRuntimeHostError::Attachment(PromptAttachmentError::ModelMediaUnsupported)
+    ));
+    fixture.wait_for_live_children(0).await;
+    assert_eq!(fresh_host.snapshot(&fixture.chat_id).unwrap(), restored);
+    assert_eq!(
+        fixture.inbox.chat_session(&fixture.chat_id).unwrap(),
+        stored_session
+    );
+    fresh_host.shutdown_all().await;
 }
 
 #[tokio::test]
@@ -490,6 +806,284 @@ async fn send_steer_abort_and_stop_preserve_the_resumable_chat() {
 }
 
 #[tokio::test]
+async fn native_steering_queue_keeps_current_turn_output_before_the_accepted_message() {
+    let fixture = ChatFixture::with_options(true, true, "steering-queue");
+    let mut events = fixture.host.subscribe();
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+
+    tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+        loop {
+            let changed = events.recv().await.unwrap();
+            if matches!(
+                changed.event,
+                ConversationEvent::TextDelta { ref delta, .. }
+                    if delta == "Working on the current turn."
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the active turn should begin streaming");
+
+    let host = fixture.host.clone();
+    let chat_id = fixture.chat_id.clone();
+    let pending_send =
+        tokio::spawn(async move { host.send(&chat_id, "Inspect the queued result").await });
+    tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().event,
+                ConversationEvent::ItemAdded {
+                    item: ConversationItem::Message {
+                        ref text,
+                        queued: true,
+                        ..
+                    },
+                    ..
+                } if text == "Inspect the queued result"
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the accepted steering message should project before Pi responds");
+    assert!(!pending_send.is_finished());
+    pending_send.await.unwrap().unwrap();
+
+    tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+        let mut saw_queue = false;
+        let mut saw_tool = false;
+        while !(saw_queue && saw_tool) {
+            match events.recv().await.unwrap().event {
+                ConversationEvent::MessageQueueChanged { queued: true, .. } => saw_queue = true,
+                ConversationEvent::ItemAdded {
+                    item: ConversationItem::Tool { ref id, .. },
+                    ..
+                } if id == "tool-call-queued" => saw_tool = true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the accepted steering message and later tool should both project");
+
+    let snapshot = fixture.host.snapshot(&fixture.chat_id).unwrap();
+    let assistant = snapshot
+        .items
+        .iter()
+        .position(|item| matches!(item, ConversationItem::Message { text, .. } if text == "Working on the current turn."))
+        .unwrap();
+    let tool = snapshot
+        .items
+        .iter()
+        .position(
+            |item| matches!(item, ConversationItem::Tool { id, .. } if id == "tool-call-queued"),
+        )
+        .unwrap();
+    let steering = snapshot
+        .items
+        .iter()
+        .position(|item| matches!(item, ConversationItem::Message { text, queued: true, .. } if text == "Inspect the queued result"))
+        .unwrap();
+    assert!(assistant < tool && tool < steering);
+
+    let commands = fixture.record("commands");
+    assert!(commands.contains("\"type\":\"set_auto_retry\""));
+    assert!(commands.contains("\"enabled\":false"));
+    assert_eq!(commands.matches("\"type\":\"prompt\"").count(), 2);
+    assert_eq!(
+        commands.matches("\"streamingBehavior\":\"steer\"").count(),
+        2
+    );
+    let session = fixture
+        .inbox
+        .chat_session(&fixture.chat_id)
+        .unwrap()
+        .expect("the active chat should keep its exact session binding");
+    fixture.host.abort(&fixture.chat_id).await.unwrap();
+    let mut tool_interrupted = false;
+    let mut turn_stopped = false;
+    while !(tool_interrupted && turn_stopped) {
+        match events.recv().await.unwrap().event {
+            ConversationEvent::ToolUpdate {
+                status: ConversationToolStatus::Interrupted,
+                ..
+            } => tool_interrupted = true,
+            ConversationEvent::TurnStopped => turn_stopped = true,
+            _ => {}
+        }
+    }
+    fixture.wait_for_live_children(0).await;
+    assert_eq!(
+        fixture.host.snapshot(&fixture.chat_id).unwrap().phase,
+        ConversationPhase::Stopped
+    );
+    assert_eq!(
+        fixture.inbox.chat_session(&fixture.chat_id).unwrap(),
+        Some(session)
+    );
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn rejected_steering_is_visible_while_pending_then_rolls_back_without_replay() {
+    let fixture = ChatFixture::with_options(true, true, "reject-steer");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    let mut events = fixture.host.subscribe();
+    let host = fixture.host.clone();
+    let chat_id = fixture.chat_id.clone();
+    let pending_send = tokio::spawn(async move { host.send(&chat_id, "Reject this steer").await });
+
+    let optimistic_item_id = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        loop {
+            if let ConversationEvent::ItemAdded {
+                item:
+                    ConversationItem::Message {
+                        id,
+                        ref text,
+                        queued: true,
+                        ..
+                    },
+                ..
+            } = events.recv().await.unwrap().event
+                && text == "Reject this steer"
+            {
+                break id;
+            }
+        }
+    })
+    .await
+    .expect("the pending steer should be visible before Pi responds");
+    assert!(!pending_send.is_finished());
+    assert!(pending_send.await.unwrap().is_err());
+
+    tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().event,
+                ConversationEvent::ItemRemoved { ref item_id } if item_id == &optimistic_item_id
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("a rejected steer should remove only its optimistic transcript item");
+    assert!(!fixture
+        .host
+        .snapshot(&fixture.chat_id)
+        .unwrap()
+        .items
+        .iter()
+        .any(|item| matches!(item, ConversationItem::Message { text, .. } if text == "Reject this steer")));
+    assert_eq!(
+        fixture
+            .record("commands")
+            .matches("\"type\":\"prompt\"")
+            .count(),
+        2
+    );
+    assert_eq!(
+        fixture.live_children(),
+        1,
+        "rejecting a steer must preserve the child running the underlying turn"
+    );
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn rejected_restored_prompt_retires_its_child_and_preserves_the_session() {
+    let fixture = ChatFixture::new(true);
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture.host.abort(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(0).await;
+    let stored_session = fixture
+        .inbox
+        .chat_session(&fixture.chat_id)
+        .unwrap()
+        .expect("the stopped chat should keep its exact session");
+    fs::write(
+        fixture._app_data.path().join("host-fixture/mode"),
+        "reject-prompt",
+    )
+    .unwrap();
+
+    let fresh_host = fixture.fresh_host();
+    let restored = fresh_host.open(&fixture.chat_id).await.unwrap();
+    assert_eq!(restored.phase, ConversationPhase::Stopped);
+    fixture.wait_for_live_children(0).await;
+    let mut events = fresh_host.subscribe();
+
+    fresh_host
+        .send(&fixture.chat_id, "Reject this restored prompt")
+        .await
+        .expect_err("Pi's prompt rejection should reach the host");
+
+    let failed = fresh_host.snapshot(&fixture.chat_id).unwrap();
+    assert_eq!(failed.phase, ConversationPhase::Failed);
+    assert!(failed.failure.is_some());
+    fixture.wait_for_live_children(0).await;
+    assert_eq!(
+        fixture.inbox.chat_session(&fixture.chat_id).unwrap(),
+        Some(stored_session)
+    );
+    tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().event,
+                ConversationEvent::TurnFailed { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("a rejected normal prompt should emit one terminal failure");
+    fresh_host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn an_unexpected_pi_retry_attempt_becomes_one_terminal_failure_without_replay() {
+    let fixture = ChatFixture::with_options(true, true, "retry-attempt");
+    let mut events = fixture.host.subscribe();
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+
+    let failure = tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+        loop {
+            let changed = events.recv().await.unwrap();
+            if let ConversationEvent::TurnFailed { ref message } = changed.event {
+                break message.clone();
+            }
+        }
+    })
+    .await
+    .expect("an unexpected automatic retry should become a terminal failure");
+
+    assert!(failure.contains("provider unavailable"));
+    fixture.wait_for_live_children(0).await;
+    let snapshot = fixture.host.snapshot(&fixture.chat_id).unwrap();
+    assert_eq!(snapshot.phase, ConversationPhase::Failed);
+    assert!(snapshot.items.iter().any(|item| matches!(
+        item,
+        ConversationItem::Tool {
+            id,
+            status: ConversationToolStatus::Interrupted,
+            ..
+        } if id == "tool-call-retry"
+    )));
+    assert_eq!(
+        fixture
+            .record("commands")
+            .matches("\"type\":\"prompt\"")
+            .count(),
+        1
+    );
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn repeated_user_text_remains_two_distinct_turns() {
     let fixture = ChatFixture::with_options(true, true, "repeated-events");
     let mut events = fixture.host.subscribe();
@@ -498,7 +1092,8 @@ async fn repeated_user_text_remains_two_distinct_turns() {
         assert!(matches!(
             events.recv().await.unwrap().event,
             ConversationEvent::ItemAdded {
-                item: ConversationItem::Message { .. }
+                item: ConversationItem::Message { .. },
+                ..
             }
         ));
     }
@@ -597,30 +1192,62 @@ async fn durable_empty_session_binding_prevents_initial_prompt_replay_after_chil
 }
 
 #[tokio::test]
-async fn accepted_prompt_failure_is_cached_without_an_idle_relaunch() {
+async fn supervised_process_loss_interrupts_the_turn_and_running_tool_without_replay() {
     let fixture = ChatFixture::with_options(true, true, "crash-after-prompt");
     let mut events = fixture.host.subscribe();
 
     fixture.host.open(&fixture.chat_id).await.unwrap();
-    let failure = tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+    let interruption = tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
         loop {
             let changed = events.recv().await.unwrap();
-            if matches!(changed.event, ConversationEvent::TurnFailed { .. }) {
+            if matches!(changed.event, ConversationEvent::TurnInterrupted { .. }) {
                 break changed;
             }
         }
     })
     .await
-    .expect("the supervised child exit should become a typed failure event");
-    assert_eq!(failure.chat_id, fixture.chat_id);
+    .expect("the supervised child exit should become a typed interruption event");
+    assert_eq!(interruption.chat_id, fixture.chat_id);
+    assert!(matches!(
+        interruption.event,
+        ConversationEvent::TurnInterrupted { ref message }
+            if message == "The agent runtime stopped before the turn finished. Send another message to continue."
+    ));
     assert_eq!(
         fixture.host.snapshot(&fixture.chat_id).unwrap().phase,
-        ConversationPhase::Failed
+        ConversationPhase::Interrupted
+    );
+    assert_eq!(
+        fixture
+            .host
+            .snapshot(&fixture.chat_id)
+            .unwrap()
+            .failure
+            .as_deref(),
+        Some(
+            "The agent runtime stopped before the turn finished. Send another message to continue."
+        )
+    );
+    assert!(
+        fixture
+            .host
+            .snapshot(&fixture.chat_id)
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| matches!(
+                item,
+                ConversationItem::Tool {
+                    id,
+                    status: ConversationToolStatus::Interrupted,
+                    ..
+                } if id == "tool-call-crashed"
+            ))
     );
     assert_eq!(fixture.live_children(), 0);
 
     let cached = fixture.host.open(&fixture.chat_id).await.unwrap();
-    assert_eq!(cached.phase, ConversationPhase::Failed);
+    assert_eq!(cached.phase, ConversationPhase::Interrupted);
     assert_eq!(fixture.live_children(), 0);
     assert_eq!(fixture.record("launches").lines().count(), 1);
     assert_eq!(
@@ -631,6 +1258,65 @@ async fn accepted_prompt_failure_is_cached_without_an_idle_relaunch() {
         1
     );
     fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn fresh_host_restores_an_unresolved_tool_as_interrupted_without_replay() {
+    let fixture = ChatFixture::with_options(true, true, "persisted-unresolved-tool");
+    let mut events = fixture.host.subscribe();
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+
+    tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().event,
+                ConversationEvent::TurnInterrupted { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the first host should observe the interrupted owned process");
+    fixture.wait_for_live_children(0).await;
+    let stored_session = fixture
+        .inbox
+        .chat_session(&fixture.chat_id)
+        .unwrap()
+        .expect("the first host should bind the exact session before dispatch");
+    assert!(fs::metadata(&stored_session.path).unwrap().len() > 0);
+
+    let fresh_host = fixture.fresh_host();
+    let restored = fresh_host.open(&fixture.chat_id).await.unwrap();
+
+    assert_eq!(restored.phase, ConversationPhase::Interrupted);
+    assert_eq!(
+        restored.failure.as_deref(),
+        Some("The agent turn was interrupted before Più reopened this chat.")
+    );
+    assert!(restored.items.iter().any(|item| matches!(
+        item,
+        ConversationItem::Tool {
+            id,
+            status: ConversationToolStatus::Interrupted,
+            ..
+        } if id == "tool-call-crashed"
+    )));
+    fixture.wait_for_live_children(0).await;
+    assert_eq!(fixture.record("launches").lines().count(), 2);
+    assert_eq!(
+        fixture.inbox.chat_session(&fixture.chat_id).unwrap(),
+        Some(stored_session)
+    );
+    assert_eq!(
+        fixture
+            .record("commands")
+            .matches("\"type\":\"prompt\"")
+            .count(),
+        1,
+        "restoration must inspect the exact session without replaying its first prompt"
+    );
+    fresh_host.shutdown_all().await;
 }
 
 #[tokio::test]

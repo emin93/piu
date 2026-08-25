@@ -14,13 +14,22 @@ use ts_rs::TS;
 
 use crate::{
     chat_workspaces::{ChatWorkspaceError, ChatWorkspaces},
-    pi_rpc::{PiRpcChild, PiRpcError, PiRpcPolicy, PiRpcProcessSpec},
+    pi_rpc::{PiRpcChild, PiRpcError, PiRpcExtensionUiResponse, PiRpcPolicy, PiRpcProcessSpec},
     project_inbox::{ChatSessionReference, ChatSetupPhase, ProjectInbox, ProjectInboxError},
+    prompt_attachments::{
+        PromptAttachment, PromptAttachmentError, image_payloads, prompt_text,
+        validate as validate_attachments,
+    },
 };
 
 const MODEL_PROVIDER: &str = "openai-codex";
 const MODEL_ID: &str = "gpt-5.6-sol";
 const THINKING_LEVEL: &str = "xhigh";
+const RESTORED_INTERRUPTED_TURN_MESSAGE: &str =
+    "The agent turn was interrupted before Più reopened this chat.";
+const RUNTIME_INTERRUPTED_TURN_MESSAGE: &str =
+    "The agent runtime stopped before the turn finished. Send another message to continue.";
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../src/generated/")]
@@ -29,6 +38,7 @@ pub enum ConversationPhase {
     Running,
     Stopped,
     Failed,
+    Interrupted,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -36,18 +46,55 @@ pub enum ConversationPhase {
 #[ts(export, export_to = "../../src/generated/")]
 pub struct ConversationSnapshot {
     pub failure: Option<String>,
+    pub input_request: Option<ConversationInputRequest>,
     pub items: Vec<ConversationItem>,
     pub phase: ConversationPhase,
+    #[ts(type = "number")]
+    pub revision: u64,
 }
 
 impl ConversationSnapshot {
     fn stopped() -> Self {
         Self {
             failure: None,
+            input_request: None,
             items: Vec::new(),
             phase: ConversationPhase::Stopped,
+            revision: 0,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub enum ConversationInputKind {
+    Select,
+    Confirm,
+    Input,
+    Editor,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct ConversationInputRequest {
+    pub id: String,
+    pub kind: ConversationInputKind,
+    pub title: String,
+    pub message: Option<String>,
+    pub options: Vec<String>,
+    pub placeholder: Option<String>,
+    pub prefill: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub enum ConversationInputAnswer {
+    Value { value: String },
+    Confirmed { confirmed: bool },
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -56,6 +103,7 @@ impl ConversationSnapshot {
 pub enum ConversationItem {
     Message {
         id: String,
+        queued: bool,
         role: ConversationRole,
         text: String,
     },
@@ -98,6 +146,7 @@ pub enum ConversationToolStatus {
     Running,
     Succeeded,
     Failed,
+    Interrupted,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -105,7 +154,18 @@ pub enum ConversationToolStatus {
 #[ts(export, export_to = "../../src/generated/")]
 pub enum ConversationEvent {
     ItemAdded {
+        #[serde(rename = "beforeItemId")]
+        before_item_id: Option<String>,
         item: ConversationItem,
+    },
+    ItemRemoved {
+        #[serde(rename = "itemId")]
+        item_id: String,
+    },
+    MessageQueueChanged {
+        #[serde(rename = "itemId")]
+        item_id: String,
+        queued: bool,
     },
     TextDelta {
         delta: String,
@@ -137,8 +197,18 @@ pub enum ConversationEvent {
         output_tokens: u64,
     },
     TurnStarted,
+    InputRequested {
+        request: ConversationInputRequest,
+    },
+    InputResolved {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
     TurnCompleted,
     TurnStopped,
+    TurnInterrupted {
+        message: String,
+    },
     TurnFailed {
         message: String,
     },
@@ -150,6 +220,8 @@ pub enum ConversationEvent {
 pub struct ChatRuntimeChangedEvent {
     pub chat_id: String,
     pub event: ConversationEvent,
+    #[ts(type = "number")]
+    pub revision: u64,
 }
 
 #[derive(Debug, Error)]
@@ -158,6 +230,10 @@ pub enum ChatRuntimeHostError {
     EmptyMessage,
     #[error("chat {chat_id} has no active Pi runtime")]
     NotActive { chat_id: String },
+    #[error("chat {chat_id} is not waiting for input {request_id}")]
+    InputNotPending { chat_id: String, request_id: String },
+    #[error("the answer does not match the pending extension input")]
+    InvalidInputAnswer,
     #[error("chat {chat_id} cannot start before setup finishes ({phase:?})")]
     SetupIncomplete {
         chat_id: String,
@@ -177,6 +253,8 @@ pub enum ChatRuntimeHostError {
     Inbox(#[from] ProjectInboxError),
     #[error(transparent)]
     Rpc(#[from] PiRpcError),
+    #[error(transparent)]
+    Attachment(#[from] PromptAttachmentError),
     #[error("chat runtime lock is poisoned")]
     Lock,
 }
@@ -217,6 +295,7 @@ impl ChatSlot {
 struct ActiveChat {
     child: Arc<PiRpcChild>,
     command_generation: u64,
+    send_only: bool,
     stop_events: CancellationToken,
 }
 
@@ -226,6 +305,7 @@ struct ConversationProjection {
     next_message_index: usize,
     active_assistant_index: Option<usize>,
     tool_content_ids: HashMap<usize, String>,
+    native_steering_count: usize,
     pending_user_items: VecDeque<(String, String)>,
 }
 
@@ -237,8 +317,23 @@ impl ConversationProjection {
             next_message_index,
             active_assistant_index: None,
             tool_content_ids: HashMap::new(),
+            native_steering_count: 0,
             pending_user_items: VecDeque::new(),
         }
+    }
+
+    fn stamp_events(&mut self, events: Vec<ConversationEvent>) -> Vec<(u64, ConversationEvent)> {
+        events
+            .into_iter()
+            .map(|event| {
+                self.snapshot.revision = self
+                    .snapshot
+                    .revision
+                    .checked_add(1)
+                    .expect("conversation event revision overflowed");
+                (self.snapshot.revision, event)
+            })
+            .collect()
     }
 }
 
@@ -353,23 +448,33 @@ impl ChatRuntimeHost {
     }
 
     pub async fn send(&self, chat_id: &str, text: &str) -> Result<(), ChatRuntimeHostError> {
+        self.send_with_attachments(chat_id, text, &[]).await
+    }
+
+    pub async fn send_with_attachments(
+        &self,
+        chat_id: &str,
+        text: &str,
+        attachments: &[PromptAttachment],
+    ) -> Result<(), ChatRuntimeHostError> {
         let text = text.trim();
-        if text.is_empty() {
+        if text.is_empty() && attachments.is_empty() {
             return Err(ChatRuntimeHostError::EmptyMessage);
         }
+        validate_attachments(attachments)?;
+        let delivered_text = prompt_text(text, attachments);
+        let command = prompt_command(&delivered_text, attachments, true);
         self.open_for_send(chat_id).await?;
-        let command = serde_json::json!({
-            "type": "prompt",
-            "message": text,
-            "streamingBehavior": "steer"
-        });
-        let sent = self.send_active(chat_id, text, command.clone()).await;
+        let sent = self
+            .send_active(chat_id, &delivered_text, command.clone(), attachments)
+            .await;
         if !matches!(sent, Err(ChatRuntimeHostError::NotActive { .. })) {
             return sent;
         }
 
         self.open_for_send(chat_id).await?;
-        self.send_active(chat_id, text, command).await
+        self.send_active(chat_id, &delivered_text, command, attachments)
+            .await
     }
 
     pub async fn steer(&self, chat_id: &str, text: &str) -> Result<(), ChatRuntimeHostError> {
@@ -381,6 +486,7 @@ impl ChatRuntimeHost {
             chat_id,
             text,
             serde_json::json!({ "type": "steer", "message": text }),
+            &[],
         )
         .await
     }
@@ -420,20 +526,100 @@ impl ChatRuntimeHost {
         } else {
             Ok(())
         };
-        let changed = {
+        let (changed, tool_events) = {
             let mut projection = slot
                 .projection
                 .lock()
                 .map_err(|_| ChatRuntimeHostError::Lock)?;
             let changed = projection.snapshot.phase != ConversationPhase::Stopped;
+            let mut tool_events = Vec::new();
+            interrupt_running_tools(&mut projection, &mut tool_events);
             projection.snapshot.failure = None;
+            projection.snapshot.input_request = None;
             projection.snapshot.phase = ConversationPhase::Stopped;
-            changed
+            (changed, tool_events)
         };
+        for event in tool_events {
+            self.emit(chat_id, event);
+        }
         if changed {
             self.emit(chat_id, ConversationEvent::TurnStopped);
         }
         shutdown.map_err(Into::into)
+    }
+
+    pub async fn answer_input(
+        &self,
+        chat_id: &str,
+        request_id: &str,
+        answer: ConversationInputAnswer,
+    ) -> Result<(), ChatRuntimeHostError> {
+        let slot = self.slot(chat_id)?;
+        let _operation = slot.operation.lock().await;
+        let child = slot
+            .active
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)?
+            .as_ref()
+            .map(|active| Arc::clone(&active.child))
+            .ok_or_else(|| ChatRuntimeHostError::NotActive {
+                chat_id: chat_id.to_owned(),
+            })?;
+        let pending = slot
+            .projection
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)?
+            .snapshot
+            .input_request
+            .clone()
+            .filter(|pending| pending.id == request_id)
+            .ok_or_else(|| ChatRuntimeHostError::InputNotPending {
+                chat_id: chat_id.to_owned(),
+                request_id: request_id.to_owned(),
+            })?;
+        let response = match (pending.kind, answer) {
+            (_, ConversationInputAnswer::Cancelled) => PiRpcExtensionUiResponse::Cancelled,
+            (ConversationInputKind::Select, ConversationInputAnswer::Value { value })
+                if pending.options.contains(&value) =>
+            {
+                PiRpcExtensionUiResponse::Value(value)
+            }
+            (
+                ConversationInputKind::Input | ConversationInputKind::Editor,
+                ConversationInputAnswer::Value { value },
+            ) => PiRpcExtensionUiResponse::Value(value),
+            (ConversationInputKind::Confirm, ConversationInputAnswer::Confirmed { confirmed }) => {
+                PiRpcExtensionUiResponse::Confirmed(confirmed)
+            }
+            _ => return Err(ChatRuntimeHostError::InvalidInputAnswer),
+        };
+        child.respond_extension_ui(request_id, response).await?;
+        let resolved = {
+            let mut projection = slot
+                .projection
+                .lock()
+                .map_err(|_| ChatRuntimeHostError::Lock)?;
+            if projection
+                .snapshot
+                .input_request
+                .as_ref()
+                .is_some_and(|request| request.id == request_id)
+            {
+                projection.snapshot.input_request = None;
+                true
+            } else {
+                false
+            }
+        };
+        if resolved {
+            self.emit(
+                chat_id,
+                ConversationEvent::InputResolved {
+                    request_id: request_id.to_owned(),
+                },
+            );
+        }
+        Ok(())
     }
 
     async fn send_active(
@@ -441,6 +627,7 @@ impl ChatRuntimeHost {
         chat_id: &str,
         text: &str,
         command: Value,
+        attachments: &[PromptAttachment],
     ) -> Result<(), ChatRuntimeHostError> {
         let slot = self.slot(chat_id)?;
         let _operation = slot.operation.lock().await;
@@ -454,21 +641,41 @@ impl ChatRuntimeHost {
             active.command_generation = active.command_generation.wrapping_add(1);
             (Arc::clone(&active.child), active.command_generation)
         };
-        let expected_index = slot
-            .projection
+        let has_images = attachments.iter().any(|attachment| {
+            attachment.kind == crate::prompt_attachments::PromptAttachmentKind::Image
+        });
+        if has_images {
+            match child_accepts_images(&child).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    retire_send_only_child(&slot, &child).await?;
+                    return Err(PromptAttachmentError::ModelMediaUnsupported.into());
+                }
+                Err(error) => {
+                    retire_send_only_child(&slot, &child).await?;
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(active) = slot
+            .active
             .lock()
             .map_err(|_| ChatRuntimeHostError::Lock)?
-            .next_message_index;
-        if let Err(error) = child.request(command, CancellationToken::new()).await {
-            let mut active = slot.active.lock().map_err(|_| ChatRuntimeHostError::Lock)?;
-            if let Some(active) = active.as_mut().filter(|active| {
-                Arc::ptr_eq(&active.child, &child)
-                    && active.command_generation == command_generation
-            }) {
-                active.command_generation = active.command_generation.wrapping_add(1);
-            }
-            return Err(error.into());
+            .as_mut()
+            .filter(|active| Arc::ptr_eq(&active.child, &child))
+        {
+            active.send_only = false;
         }
+        let (expected_index, was_running) = {
+            let projection = slot
+                .projection
+                .lock()
+                .map_err(|_| ChatRuntimeHostError::Lock)?;
+            (
+                projection.next_message_index,
+                projection.snapshot.phase == ConversationPhase::Running,
+            )
+        };
         let item_id = format!("message-{expected_index}");
         let (turn_started, item_added) = {
             let mut projection = slot
@@ -487,7 +694,8 @@ impl ChatRuntimeHost {
                 None
             } else {
                 let item = ConversationItem::Message {
-                    id: item_id,
+                    id: item_id.clone(),
+                    queued: was_running,
                     role: ConversationRole::User,
                     text: text.to_owned(),
                 };
@@ -505,7 +713,111 @@ impl ChatRuntimeHost {
             self.emit(chat_id, ConversationEvent::TurnStarted);
         }
         if let Some(item) = item_added {
-            self.emit(chat_id, ConversationEvent::ItemAdded { item });
+            let item_id = item.id().to_owned();
+            self.emit(
+                chat_id,
+                ConversationEvent::ItemAdded {
+                    before_item_id: None,
+                    item,
+                },
+            );
+            if was_running {
+                self.emit(
+                    chat_id,
+                    ConversationEvent::MessageQueueChanged {
+                        item_id,
+                        queued: true,
+                    },
+                );
+            }
+        }
+        if let Err(error) = child.request(command, CancellationToken::new()).await {
+            let retired = {
+                let mut active = slot.active.lock().map_err(|_| ChatRuntimeHostError::Lock)?;
+                let owns_command = active.as_ref().is_some_and(|active| {
+                    Arc::ptr_eq(&active.child, &child)
+                        && active.command_generation == command_generation
+                });
+                if !owns_command {
+                    None
+                } else if was_running {
+                    if let Some(active) = active.as_mut() {
+                        active.command_generation = active.command_generation.wrapping_add(1);
+                    }
+                    None
+                } else {
+                    let retired = active.take();
+                    if let Some(retired) = &retired {
+                        retired.stop_events.cancel();
+                    }
+                    retired
+                }
+            };
+            if let Some(retired) = retired
+                && let Err(shutdown_error) = retired.child.shutdown().await
+            {
+                tracing::warn!(
+                    %shutdown_error,
+                    %chat_id,
+                    "could not retire chat runtime after prompt rejection"
+                );
+            }
+            let (removed, failed) = {
+                let mut projection = slot
+                    .projection
+                    .lock()
+                    .map_err(|_| ChatRuntimeHostError::Lock)?;
+                let pending_index = projection
+                    .pending_user_items
+                    .iter()
+                    .position(|(pending_id, _)| pending_id == &item_id);
+                let removed = if let Some(pending_index) = pending_index {
+                    projection.pending_user_items.remove(pending_index);
+                    if let Some(item_index) = projection
+                        .snapshot
+                        .items
+                        .iter()
+                        .position(|item| item.id() == item_id)
+                    {
+                        projection.snapshot.items.remove(item_index);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let failed = if was_running {
+                    false
+                } else {
+                    projection.snapshot.failure = Some(
+                        "Pi couldn’t accept that message. The conversation is still available."
+                            .into(),
+                    );
+                    projection.snapshot.phase = ConversationPhase::Failed;
+                    true
+                };
+                (removed, failed)
+            };
+            if removed {
+                self.emit(
+                    chat_id,
+                    ConversationEvent::ItemRemoved {
+                        item_id: item_id.clone(),
+                    },
+                );
+            }
+            if failed {
+                self.emit(
+                    chat_id,
+                    ConversationEvent::TurnFailed {
+                        message:
+                            "Pi couldn’t accept that message. The conversation is still available."
+                                .into(),
+                    },
+                );
+            }
+            return Err(error.into());
         }
         Ok(())
     }
@@ -631,13 +943,21 @@ impl ChatRuntimeHost {
         let inbox = Arc::clone(&self.inner.inbox);
         let owned_chat_id = chat_id.to_owned();
         let initial_prompt =
-            tokio::task::spawn_blocking(move || inbox.first_user_message(&owned_chat_id))
+            tokio::task::spawn_blocking(move || inbox.initial_prompt(&owned_chat_id))
                 .await
                 .map_err(|error| ChatRuntimeHostError::InvalidSessionState(error.to_string()))??;
+        validate_attachments(&initial_prompt.attachments)?;
+        let initial_text = prompt_text(&initial_prompt.text, &initial_prompt.attachments);
+        let has_initial_images = initial_prompt.attachments.iter().any(|attachment| {
+            attachment.kind == crate::prompt_attachments::PromptAttachmentKind::Image
+        });
+        if has_initial_images && !child_accepts_images(&child).await? {
+            let _ = child.shutdown().await;
+            return Err(PromptAttachmentError::ModelMediaUnsupported.into());
+        }
         let session_is_empty = messages.is_empty();
         let should_start = stored_session.is_none() && session_is_empty;
-        if !session_is_empty
-            && first_user_text(&messages).as_deref() != Some(initial_prompt.as_str())
+        if !session_is_empty && first_user_text(&messages).as_deref() != Some(initial_text.as_str())
         {
             let _ = child.shutdown().await;
             return Err(ChatRuntimeHostError::InvalidSessionState(
@@ -646,23 +966,29 @@ impl ChatRuntimeHost {
         }
 
         let mut items = conversation_items(&messages);
+        let restored_interruption = interrupt_restored_tools(&mut items);
         if session_is_empty {
             items.push(ConversationItem::Message {
                 id: "message-0".into(),
+                queued: false,
                 role: ConversationRole::User,
-                text: initial_prompt.clone(),
+                text: initial_text.clone(),
             });
         }
         let snapshot = ConversationSnapshot {
-            failure: None,
+            failure: restored_interruption.then(|| RESTORED_INTERRUPTED_TURN_MESSAGE.to_owned()),
+            input_request: None,
             items,
-            phase: if should_start {
+            phase: if restored_interruption {
+                ConversationPhase::Interrupted
+            } else if should_start {
                 ConversationPhase::Running
             } else if stored_session.is_some() {
                 ConversationPhase::Stopped
             } else {
                 ConversationPhase::Idle
             },
+            revision: 0,
         };
         let next_message_index = messages
             .iter()
@@ -679,7 +1005,7 @@ impl ChatRuntimeHost {
         if should_start {
             projection
                 .pending_user_items
-                .push_back(("message-0".into(), initial_prompt.clone()));
+                .push_back(("message-0".into(), initial_text.clone()));
         }
         *slot
             .projection
@@ -695,6 +1021,7 @@ impl ChatRuntimeHost {
         *slot.active.lock().map_err(|_| ChatRuntimeHostError::Lock)? = Some(ActiveChat {
             child: Arc::clone(&child),
             command_generation: 0,
+            send_only: keep_stopped_runtime && !should_start,
             stop_events: stop_events.clone(),
         });
         self.forward_events(
@@ -707,11 +1034,7 @@ impl ChatRuntimeHost {
         if should_start
             && let Err(error) = child
                 .request(
-                    serde_json::json!({
-                        "type": "prompt",
-                        "message": initial_prompt,
-                        "streamingBehavior": "steer"
-                    }),
+                    prompt_command(&initial_text, &initial_prompt.attachments, true),
                     CancellationToken::new(),
                 )
                 .await
@@ -760,9 +1083,15 @@ impl ChatRuntimeHost {
             .lock()
             .map_err(|_| ChatRuntimeHostError::Lock)?;
         let changed = projection.snapshot.phase != ConversationPhase::Stopped;
+        let mut tool_events = Vec::new();
+        interrupt_running_tools(&mut projection, &mut tool_events);
         projection.snapshot.failure = None;
+        projection.snapshot.input_request = None;
         projection.snapshot.phase = ConversationPhase::Stopped;
         drop(projection);
+        for event in tool_events {
+            self.emit(chat_id, event);
+        }
         if changed {
             self.emit(chat_id, ConversationEvent::TurnStopped);
         }
@@ -784,9 +1113,20 @@ impl ChatRuntimeHost {
     }
 
     fn emit(&self, chat_id: &str, event: ConversationEvent) {
+        let Ok(slot) = self.slot(chat_id) else {
+            return;
+        };
+        let Ok(mut projection) = slot.projection.lock() else {
+            return;
+        };
+        let Some((revision, event)) = projection.stamp_events(vec![event]).pop() else {
+            return;
+        };
+        drop(projection);
         let _ = self.inner.events.send(ChatRuntimeChangedEvent {
             chat_id: chat_id.to_owned(),
             event,
+            revision,
         });
     }
 
@@ -843,6 +1183,7 @@ impl ChatRuntimeHost {
                                 return;
                             };
                             let projected = project_pi_event(&mut projection, &event.payload);
+                            let projected = projection.stamp_events(projected);
                             let active = active.take();
                             (projected, active)
                         };
@@ -852,10 +1193,11 @@ impl ChatRuntimeHost {
                                 tracing::warn!(%error, %chat_id, "could not retire completed chat runtime");
                             }
                         }
-                        for event in projected.0 {
+                        for (revision, event) in projected.0 {
                             let _ = inner.events.send(ChatRuntimeChangedEvent {
                                 chat_id: chat_id.clone(),
                                 event,
+                                revision,
                             });
                         }
                         return;
@@ -874,12 +1216,14 @@ impl ChatRuntimeHost {
                             let Ok(mut projection) = slot.projection.lock() else {
                                 return;
                             };
-                            project_pi_event(&mut projection, &event.payload)
+                            let projected = project_pi_event(&mut projection, &event.payload);
+                            projection.stamp_events(projected)
                         };
-                        for event in projected {
+                        for (revision, event) in projected {
                             let _ = inner.events.send(ChatRuntimeChangedEvent {
                                 chat_id: chat_id.clone(),
                                 event,
+                                revision,
                             });
                         }
                     }
@@ -903,11 +1247,19 @@ impl ChatRuntimeHost {
                             }
                             *active = None;
                         }
-                        let message = error.to_string();
-                        if let Ok(mut projection) = slot.projection.lock() {
+                        tracing::warn!(%error, %chat_id, "Pi runtime stopped during an active turn");
+                        let message = RUNTIME_INTERRUPTED_TURN_MESSAGE.to_owned();
+                        let projected = if let Ok(mut projection) = slot.projection.lock() {
+                            let mut projected = Vec::new();
+                            interrupt_running_tools(&mut projection, &mut projected);
                             projection.snapshot.failure = Some(message.clone());
-                            projection.snapshot.phase = ConversationPhase::Failed;
-                        }
+                            clear_pending_input(&mut projection, &mut projected);
+                            projection.snapshot.phase = ConversationPhase::Interrupted;
+                            projected.push(ConversationEvent::TurnInterrupted { message });
+                            projection.stamp_events(projected)
+                        } else {
+                            return;
+                        };
                         if let Err(shutdown_error) = child.shutdown().await {
                             tracing::debug!(
                                 %shutdown_error,
@@ -915,10 +1267,13 @@ impl ChatRuntimeHost {
                                 "failed Pi runtime was already unavailable during retirement"
                             );
                         }
-                        let _ = inner.events.send(ChatRuntimeChangedEvent {
-                            chat_id: chat_id.clone(),
-                            event: ConversationEvent::TurnFailed { message },
-                        });
+                        for (revision, event) in projected {
+                            let _ = inner.events.send(ChatRuntimeChangedEvent {
+                                chat_id: chat_id.clone(),
+                                event,
+                                revision,
+                            });
+                        }
                         return;
                     }
                 }
@@ -1029,6 +1384,12 @@ impl ChatRuntimeHost {
                     "get_state omitted an application-owned session path".into(),
                 )
             })?;
+        child
+            .request(
+                serde_json::json!({ "type": "set_auto_retry", "enabled": false }),
+                CancellationToken::new(),
+            )
+            .await?;
         let messages = child
             .request(
                 serde_json::json!({ "type": "get_messages" }),
@@ -1079,9 +1440,69 @@ fn flag(value: &str) -> OsString {
     OsStr::new(value).to_owned()
 }
 
+fn prompt_command(message: &str, attachments: &[PromptAttachment], steer: bool) -> Value {
+    let mut command = serde_json::json!({
+        "type": "prompt",
+        "message": message,
+    });
+    if steer {
+        command["streamingBehavior"] = Value::String("steer".into());
+    }
+    let images = image_payloads(attachments);
+    if !images.is_empty() {
+        command["images"] = Value::Array(images);
+    }
+    command
+}
+
+async fn retire_send_only_child(
+    slot: &ChatSlot,
+    child: &Arc<PiRpcChild>,
+) -> Result<(), ChatRuntimeHostError> {
+    let active = {
+        let mut active = slot.active.lock().map_err(|_| ChatRuntimeHostError::Lock)?;
+        if active
+            .as_ref()
+            .is_some_and(|active| active.send_only && Arc::ptr_eq(&active.child, child))
+        {
+            active.take()
+        } else {
+            None
+        }
+    };
+    if let Some(active) = active {
+        active.stop_events.cancel();
+        if let Err(error) = active.child.shutdown().await {
+            tracing::warn!(%error, "could not retire send-only chat runtime after preflight failure");
+        }
+    }
+    Ok(())
+}
+
+async fn child_accepts_images(child: &PiRpcChild) -> Result<bool, ChatRuntimeHostError> {
+    let state = child
+        .request(
+            serde_json::json!({ "type": "get_state" }),
+            CancellationToken::new(),
+        )
+        .await?
+        .data
+        .ok_or_else(|| {
+            ChatRuntimeHostError::InvalidSessionState("get_state omitted data".into())
+        })?;
+    Ok(state
+        .get("model")
+        .and_then(|model| model.get("input"))
+        .and_then(Value::as_array)
+        .is_some_and(|inputs| inputs.iter().any(|input| input.as_str() == Some("image"))))
+}
+
 fn is_terminal_pi_event(event: &Value) -> bool {
-    event.get("type").and_then(Value::as_str) == Some("agent_end")
-        && event.get("willRetry").and_then(Value::as_bool) != Some(true)
+    match event.get("type").and_then(Value::as_str) {
+        Some("auto_retry_start") => true,
+        Some("agent_end") => event.get("willRetry").and_then(Value::as_bool) != Some(true),
+        _ => false,
+    }
 }
 
 fn first_user_text(messages: &[Value]) -> Option<String> {
@@ -1116,6 +1537,7 @@ fn conversation_items(messages: &[Value]) -> Vec<ConversationItem> {
                 if let Some(text) = message_content_text(message.get("content")) {
                     items.push(ConversationItem::Message {
                         id: format!("message-{message_index}"),
+                        queued: false,
                         role: ConversationRole::User,
                         text,
                     });
@@ -1133,6 +1555,19 @@ fn conversation_items(messages: &[Value]) -> Vec<ConversationItem> {
     items
 }
 
+fn interrupt_restored_tools(items: &mut [ConversationItem]) -> bool {
+    let mut interrupted = false;
+    for item in items {
+        if let ConversationItem::Tool { status, .. } = item
+            && *status == ConversationToolStatus::Running
+        {
+            *status = ConversationToolStatus::Interrupted;
+            interrupted = true;
+        }
+    }
+    interrupted
+}
+
 fn project_pi_event(
     projection: &mut ConversationProjection,
     event: &Value,
@@ -1143,6 +1578,12 @@ fn project_pi_event(
             projection.snapshot.failure = None;
             projection.snapshot.phase = ConversationPhase::Running;
             emitted.push(ConversationEvent::TurnStarted);
+        }
+        Some("extension_ui_request") => {
+            if let Some(request) = conversation_input_request(event) {
+                projection.snapshot.input_request = Some(request.clone());
+                emitted.push(ConversationEvent::InputRequested { request });
+            }
         }
         Some("message_start") => {
             let Some(message) = event.get("message") else {
@@ -1158,12 +1599,15 @@ fn project_pi_event(
                         .front()
                         .is_some_and(|(_, pending_text)| pending_text == &text)
                     {
-                        projection.pending_user_items.pop_front();
+                        if let Some((item_id, _)) = projection.pending_user_items.pop_front() {
+                            set_message_queued(projection, &item_id, false, &mut emitted);
+                        }
                         return emitted;
                     }
                     projection.pending_user_items.clear();
                     let item = ConversationItem::Message {
                         id: format!("message-{}", projection.next_message_index),
+                        queued: false,
                         role: ConversationRole::User,
                         text,
                     };
@@ -1200,6 +1644,7 @@ fn project_pi_event(
                             projection,
                             ConversationItem::Message {
                                 id: text_item_id(message_index, content_index),
+                                queued: false,
                                 role: ConversationRole::Assistant,
                                 text: String::new(),
                             },
@@ -1361,6 +1806,13 @@ fn project_pi_event(
                 );
             }
         }
+        Some("queue_update") => {
+            projection.native_steering_count = event
+                .get("steering")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            reconcile_native_steering_queue(projection, Some(&mut emitted));
+        }
         Some("message_end") => {
             if let Some(message) = event.get("message")
                 && message.get("role").and_then(Value::as_str) == Some("assistant")
@@ -1371,8 +1823,24 @@ fn project_pi_event(
                 }
             }
         }
+        Some("auto_retry_start") => {
+            let cause = event
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .unwrap_or("The model request failed.");
+            let message = format!(
+                "Pi attempted an automatic retry after this turn failed: {cause} Più stopped the retry; no message was replayed."
+            );
+            interrupt_running_tools(projection, &mut emitted);
+            projection.snapshot.failure = Some(message.clone());
+            projection.snapshot.phase = ConversationPhase::Failed;
+            projection.active_assistant_index = None;
+            projection.tool_content_ids.clear();
+            emitted.push(ConversationEvent::TurnFailed { message });
+        }
         Some("agent_end") if event.get("willRetry").and_then(Value::as_bool) == Some(true) => {}
         Some("agent_end") => {
+            clear_pending_input(projection, &mut emitted);
             let failure = event
                 .get("messages")
                 .and_then(Value::as_array)
@@ -1383,9 +1851,11 @@ fn project_pi_event(
                 });
             match failure.and_then(|message| message.get("stopReason").and_then(Value::as_str)) {
                 Some("aborted") => {
-                    projection.snapshot.failure = None;
-                    projection.snapshot.phase = ConversationPhase::Stopped;
-                    emitted.push(ConversationEvent::TurnStopped);
+                    let message = "The agent turn was interrupted.".to_owned();
+                    interrupt_running_tools(projection, &mut emitted);
+                    projection.snapshot.failure = Some(message.clone());
+                    projection.snapshot.phase = ConversationPhase::Interrupted;
+                    emitted.push(ConversationEvent::TurnInterrupted { message });
                 }
                 Some("error") => {
                     let message = failure
@@ -1395,6 +1865,7 @@ fn project_pi_event(
                         .to_owned();
                     projection.snapshot.failure = Some(message.clone());
                     projection.snapshot.phase = ConversationPhase::Failed;
+                    interrupt_running_tools(projection, &mut emitted);
                     emitted.push(ConversationEvent::TurnFailed { message });
                 }
                 _ => {
@@ -1411,6 +1882,66 @@ fn project_pi_event(
     emitted
 }
 
+fn conversation_input_request(event: &Value) -> Option<ConversationInputRequest> {
+    let id = event.get("id")?.as_str()?.to_owned();
+    let method = event.get("method")?.as_str()?;
+    let title = event
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let kind = match method {
+        "select" => ConversationInputKind::Select,
+        "confirm" => ConversationInputKind::Confirm,
+        "input" => ConversationInputKind::Input,
+        "editor" => ConversationInputKind::Editor,
+        _ => return None,
+    };
+    let options: Vec<String> = event
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if kind == ConversationInputKind::Select && options.is_empty() {
+        return None;
+    }
+    Some(ConversationInputRequest {
+        id,
+        kind,
+        title,
+        message: event
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        options,
+        placeholder: event
+            .get("placeholder")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        prefill: event
+            .get("prefill")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn clear_pending_input(
+    projection: &mut ConversationProjection,
+    emitted: &mut Vec<ConversationEvent>,
+) {
+    if let Some(request) = projection.snapshot.input_request.take() {
+        emitted.push(ConversationEvent::InputResolved {
+            request_id: request.id,
+        });
+    }
+}
+
 fn add_item(
     projection: &mut ConversationProjection,
     item: ConversationItem,
@@ -1424,8 +1955,96 @@ fn add_item(
     {
         return;
     }
-    projection.snapshot.items.push(item.clone());
-    emitted.push(ConversationEvent::ItemAdded { item });
+    let before_item_id = projection.snapshot.items.iter().find_map(|existing| {
+        matches!(
+            existing,
+            ConversationItem::Message {
+                queued: true,
+                role: ConversationRole::User,
+                ..
+            }
+        )
+        .then(|| existing.id().to_owned())
+    });
+    if let Some(before_item_id) = &before_item_id
+        && let Some(index) = projection
+            .snapshot
+            .items
+            .iter()
+            .position(|existing| existing.id() == before_item_id)
+    {
+        projection.snapshot.items.insert(index, item.clone());
+    } else {
+        projection.snapshot.items.push(item.clone());
+    }
+    emitted.push(ConversationEvent::ItemAdded {
+        before_item_id,
+        item,
+    });
+}
+
+fn reconcile_native_steering_queue(
+    projection: &mut ConversationProjection,
+    mut emitted: Option<&mut Vec<ConversationEvent>>,
+) {
+    let queued_start = projection
+        .pending_user_items
+        .len()
+        .saturating_sub(projection.native_steering_count);
+    let desired = projection
+        .pending_user_items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (item_id, _))| (index >= queued_start).then_some(item_id.as_str()))
+        .collect::<std::collections::HashSet<_>>();
+    for item in &mut projection.snapshot.items {
+        let ConversationItem::Message {
+            id,
+            queued,
+            role: ConversationRole::User,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        let next = desired.contains(id.as_str());
+        if *queued == next {
+            continue;
+        }
+        *queued = next;
+        if let Some(events) = emitted.as_deref_mut() {
+            events.push(ConversationEvent::MessageQueueChanged {
+                item_id: id.clone(),
+                queued: next,
+            });
+        }
+    }
+}
+
+fn set_message_queued(
+    projection: &mut ConversationProjection,
+    item_id: &str,
+    queued: bool,
+    emitted: &mut Vec<ConversationEvent>,
+) {
+    let Some(ConversationItem::Message {
+        queued: current, ..
+    }) = projection
+        .snapshot
+        .items
+        .iter_mut()
+        .find(|item| item.id() == item_id)
+    else {
+        return;
+    };
+    if *current == queued {
+        return;
+    }
+    *current = queued;
+    emitted.push(ConversationEvent::MessageQueueChanged {
+        item_id: item_id.to_owned(),
+        queued,
+    });
 }
 
 fn append_item_text(
@@ -1502,6 +2121,29 @@ fn update_tool(
         status,
     };
     add_item(projection, item, emitted);
+}
+
+fn interrupt_running_tools(
+    projection: &mut ConversationProjection,
+    emitted: &mut Vec<ConversationEvent>,
+) {
+    for item in &mut projection.snapshot.items {
+        let ConversationItem::Tool {
+            detail, id, status, ..
+        } = item
+        else {
+            continue;
+        };
+        if *status != ConversationToolStatus::Running {
+            continue;
+        }
+        *status = ConversationToolStatus::Interrupted;
+        emitted.push(ConversationEvent::ToolUpdate {
+            detail: detail.clone(),
+            item_id: id.clone(),
+            status: ConversationToolStatus::Interrupted,
+        });
+    }
 }
 
 fn reconcile_usage(
@@ -1630,6 +2272,7 @@ fn assistant_items(
             match part.get("type").and_then(Value::as_str) {
                 Some("text") => items.push(ConversationItem::Message {
                     id: text_item_id(message_index, content_index),
+                    queued: false,
                     role: ConversationRole::Assistant,
                     text: part
                         .get("text")

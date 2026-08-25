@@ -24,6 +24,7 @@ test("events received while connecting follow the restored transcript", async ()
   const pendingConnection = deferred<ConversationConnection>();
   let receive: ((event: ConversationEvent) => void) | undefined;
   const adapter: ConversationAdapter = {
+    answerInput: vi.fn().mockResolvedValue(undefined),
     connect: vi.fn<ConversationAdapter["connect"]>((_chatId, onEvent) => {
       receive = onEvent;
       return pendingConnection.promise;
@@ -39,15 +40,31 @@ test("events received while connecting follow the restored transcript", async ()
   expect(screen.getByRole("status")).toHaveTextContent("Connecting to chat");
 
   receive?.({
+    beforeItemId: null,
     type: "item-added",
-    item: { id: "live", kind: "message", role: "assistant", text: "Live event" },
+    item: {
+      id: "live",
+      kind: "message",
+      queued: false,
+      role: "assistant",
+      text: "Live event",
+    },
   });
   act(() =>
     pendingConnection.resolve({
       disconnect: vi.fn(),
       snapshot: {
         failure: null,
-        items: [{ id: "restored", kind: "message", role: "user", text: "Restored message" }],
+        inputRequest: null,
+        items: [
+          {
+            id: "restored",
+            kind: "message",
+            queued: false,
+            role: "user",
+            text: "Restored message",
+          },
+        ],
         phase: "running",
       },
     }),
@@ -62,15 +79,18 @@ test("switching chats disconnects the previous conversation", async () => {
   const disconnectFirst = vi.fn();
   const disconnectSecond = vi.fn();
   const adapter: ConversationAdapter = {
+    answerInput: vi.fn().mockResolvedValue(undefined),
     connect: vi.fn<ConversationAdapter["connect"]>((chatId) =>
       Promise.resolve({
         disconnect: chatId === "first" ? disconnectFirst : disconnectSecond,
         snapshot: {
           failure: null,
+          inputRequest: null,
           items: [
             {
               id: `message-${chatId}`,
               kind: "message",
+              queued: false,
               role: "assistant",
               text: chatId === "first" ? "First conversation" : "Second conversation",
             },
@@ -105,6 +125,7 @@ test("a failed connection can be retried without replacing the chat", async () =
   const retryConnection = deferred<ConversationConnection>();
   const requestCodexSignIn = vi.fn();
   const adapter: ConversationAdapter = {
+    answerInput: vi.fn().mockResolvedValue(undefined),
     connect: vi
       .fn<ConversationAdapter["connect"]>()
       .mockRejectedValueOnce({
@@ -144,10 +165,12 @@ test("a failed connection can be retried without replacing the chat", async () =
       disconnect: vi.fn(),
       snapshot: {
         failure: null,
+        inputRequest: null,
         items: [
           {
             id: "preserved-chat",
             kind: "message",
+            queued: false,
             role: "assistant",
             text: "The same chat resumed.",
           },
@@ -171,9 +194,10 @@ test("the connected panel sends steering messages and stops the active turn", as
   const prompt = vi.fn().mockResolvedValue(undefined);
   const stop = vi.fn().mockResolvedValue(undefined);
   const adapter: ConversationAdapter = {
+    answerInput: vi.fn().mockResolvedValue(undefined),
     connect: vi.fn().mockResolvedValue({
       disconnect: vi.fn(),
-      snapshot: { failure: null, items: [], phase: "running" },
+      snapshot: { failure: null, inputRequest: null, items: [], phase: "running" },
     }),
     prompt,
     stop,
@@ -188,6 +212,7 @@ test("the connected panel sends steering messages and stops the active turn", as
   await user.click(screen.getByRole("button", { name: "Steer active turn" }));
 
   expect(prompt).toHaveBeenCalledWith({
+    attachments: [],
     chatId: "active-chat",
     streamingBehavior: "steer",
     text: "Keep working.",
@@ -201,9 +226,10 @@ test("an authentication-related send failure keeps the draft and offers Codex si
   const user = userEvent.setup();
   const requestCodexSignIn = vi.fn();
   const adapter: ConversationAdapter = {
+    answerInput: vi.fn().mockResolvedValue(undefined),
     connect: vi.fn().mockResolvedValue({
       disconnect: vi.fn(),
-      snapshot: { failure: null, items: [], phase: "stopped" },
+      snapshot: { failure: null, inputRequest: null, items: [], phase: "stopped" },
     }),
     prompt: vi.fn().mockRejectedValue({
       code: "authenticationRequired",
@@ -245,4 +271,47 @@ test("an authentication-related send failure keeps the draft and offers Codex si
     "Keep this message while I sign in.",
   );
   expect(adapter.connect).toHaveBeenCalledTimes(2);
+});
+
+test("a live Pi input request is answered through the typed conversation boundary", async () => {
+  const user = userEvent.setup();
+  let receive: ((event: ConversationEvent) => void) | undefined;
+  const answerInput = vi.fn().mockResolvedValue(undefined);
+  const adapter: ConversationAdapter = {
+    answerInput,
+    connect: vi.fn<ConversationAdapter["connect"]>((_chatId, onEvent) => {
+      receive = onEvent;
+      return Promise.resolve({
+        disconnect: vi.fn(),
+        snapshot: { failure: null, inputRequest: null, items: [], phase: "running" },
+      });
+    }),
+    prompt: vi.fn().mockResolvedValue(undefined),
+    stop: vi.fn().mockResolvedValue(undefined),
+  };
+
+  render(
+    <ChatConversationPanel adapter={adapter} chatId="chat-input" onRequestCodexSignIn={vi.fn()} />,
+  );
+  await screen.findByRole("region", { name: "Conversation" });
+  act(() => {
+    receive?.({
+      request: {
+        id: "confirm-1",
+        kind: "confirm",
+        message: "Apply the edit?",
+        options: [],
+        placeholder: null,
+        prefill: null,
+        title: "Confirm edit",
+      },
+      type: "input-requested",
+    });
+  });
+
+  await user.click(await screen.findByRole("button", { name: "Yes" }));
+  expect(answerInput).toHaveBeenCalledWith("chat-input", "confirm-1", {
+    confirmed: true,
+    kind: "confirmed",
+  });
 });

@@ -4,6 +4,7 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ProjectDraftController } from "@/features/inbox/draft-controller";
+import { ChatActivityController } from "@/features/inbox/chat-activity-controller";
 import { InboxWorkspace } from "@/features/inbox/InboxWorkspace";
 import { ChatSetupController } from "@/features/inbox/setup-controller";
 import type { ConversationAdapter, ConversationEvent } from "@/platform/conversations";
@@ -11,7 +12,7 @@ import type { InboxSnapshot } from "@/platform/project-inbox";
 import "@/styles.css";
 import "./harness.css";
 
-const RESULT_PREFIX = "PIU_ISSUE_5_PERFORMANCE:";
+const RESULT_PREFIX = "PIU_CHAT_PERFORMANCE:";
 const CHAT_SWITCH_SAMPLES = 30;
 const NAVIGATION_SAMPLES = 30;
 const INPUT_SAMPLES = 60;
@@ -41,6 +42,15 @@ const readySetup = {
   signal: null,
 };
 
+const performanceAttachments = Array.from({ length: 3 }, (_, index) => ({
+  content: "A".repeat(2 * 1024 * 1024),
+  id: `performance-attachment-${index}`,
+  kind: "image" as const,
+  mimeType: "image/png",
+  name: `reference-${index + 1}.png`,
+  sizeBytes: 2 * 1024 * 1024,
+}));
+
 const snapshot: InboxSnapshot = {
   chats: Array.from({ length: 24 }, (_, index) => ({
     branchName: `agent/performance-chat-${index}`,
@@ -61,12 +71,14 @@ function conversationItems(chatId: string) {
   const items = Array.from({ length: 180 }, (_, index) => ({
     id: `${chatId}-message-${index}`,
     kind: "message" as const,
+    queued: false,
     role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
     text: `Representative transcript line ${index}. This text exercises wrapping and progressive transcript rendering in the production conversation surface.`,
   }));
   items.push({
     id: `stream-${chatId}`,
     kind: "message",
+    queued: false,
     role: "assistant",
     text: `Conversation marker ${chatId}`,
   });
@@ -142,7 +154,16 @@ function PerformanceReview() {
     streaming: [],
   });
   const eventReceivers = useRef(new Map<string, (event: ConversationEvent) => void>());
-  const drafts = useMemo(() => new ProjectDraftController(() => Promise.resolve(undefined)), []);
+  const drafts = useMemo(() => {
+    const controller = new ProjectDraftController(() => Promise.resolve(undefined));
+    controller.reconcile(snapshot);
+    return controller;
+  }, []);
+  const activities = useMemo(() => {
+    const controller = new ChatActivityController();
+    controller.reconcile(snapshot.chats.map((chat) => chat.id));
+    return controller;
+  }, []);
   const setups = useMemo(() => {
     const controller = new ChatSetupController();
     controller.reconcile(snapshot);
@@ -150,13 +171,19 @@ function PerformanceReview() {
   }, []);
   const adapter = useMemo<ConversationAdapter>(
     () => ({
+      answerInput: () => Promise.resolve(undefined),
       connect(chatId, onEvent) {
         eventReceivers.current.set(chatId, onEvent);
         return Promise.resolve({
           disconnect: () => {
             eventReceivers.current.delete(chatId);
           },
-          snapshot: { failure: null, items: conversationItems(chatId), phase: "running" },
+          snapshot: {
+            failure: null,
+            inputRequest: null,
+            items: conversationItems(chatId),
+            phase: "running",
+          },
         });
       },
       prompt: () => Promise.resolve(undefined),
@@ -182,10 +209,25 @@ function PerformanceReview() {
         "the initial transcript",
       );
 
+      await waitFor(
+        () => Boolean(document.querySelector('[data-chat-id="performance-chat-1"] button')),
+        "the warm chat target",
+      );
       click('[data-chat-id="performance-chat-1"] button');
       await waitFor(
         () => visibleText("Conversation marker performance-chat-1"),
         "the warm chat switch",
+      );
+      await afterPaint();
+      click(".project-row-select");
+      await waitFor(
+        () => Boolean(document.querySelector('textarea[aria-label="Draft for Atlas"]')),
+        "the warm project navigation",
+      );
+      click('[data-chat-id="performance-chat-0"] button');
+      await waitFor(
+        () => visibleText("Conversation marker performance-chat-0"),
+        "the warm conversation restore",
       );
       await afterPaint();
 
@@ -193,9 +235,14 @@ function PerformanceReview() {
       const chatSwitchSamples: number[] = [];
       for (let index = 0; index < CHAT_SWITCH_SAMPLES; index += 1) {
         const chatId = `performance-chat-${index % 2}`;
+        const chatSelector = `[data-chat-id="${chatId}"] button`;
+        await waitFor(
+          () => Boolean(document.querySelector(chatSelector)),
+          `chat switch target ${index}`,
+        );
         currentScenario.current = "chatSwitch";
         const startedAt = performance.now();
-        click(`[data-chat-id="${chatId}"] button`);
+        click(chatSelector);
         await waitFor(() => visibleText(`Conversation marker ${chatId}`), `chat switch ${index}`);
         await nextFrame();
         chatSwitchSamples.push(performance.now() - startedAt);
@@ -222,6 +269,7 @@ function PerformanceReview() {
         );
       }
 
+      drafts.changeAttachments(1, performanceAttachments);
       click(".project-row-select");
       await waitFor(
         () => Boolean(document.querySelector('textarea[aria-label="Draft for Atlas"]')),
@@ -287,10 +335,10 @@ function PerformanceReview() {
 
       const report = {
         browser: navigator.userAgent,
-        chatSwitchMs: summarize(chatSwitchSamples),
+        chatSwitchVisibleNextFrameMs: summarize(chatSwitchSamples),
         composerInputNextFrameMs: summarize(inputSamples),
         method: "packaged WKWebView, production bundle with react-dom/profiling",
-        navigationNextFrameMs: summarize(navigationSamples),
+        navigationVisibleNextFrameMs: summarize(navigationSamples),
         reactCommitMs: Object.fromEntries(
           Object.entries(commitDurations.current).map(([scenario, durations]) => [
             scenario,
@@ -308,12 +356,13 @@ function PerformanceReview() {
       await writeText(`${RESULT_PREFIX}${JSON.stringify({ error: message })}`);
       setStatus(`Performance review failed: ${message}`);
     }
-  }, []);
+  }, [drafts]);
 
   return (
     <TooltipProvider>
-      <Profiler id="issue-5-production-ui" onRender={profile}>
+      <Profiler id="chat-production-ui" onRender={profile}>
         <InboxWorkspace
+          activities={activities}
           actionError={undefined}
           conversationAdapter={adapter}
           conversationRevision={0}
@@ -325,6 +374,7 @@ function PerformanceReview() {
           onOpenTerminal={() => Promise.resolve(undefined)}
           onQueryChange={() => undefined}
           onRemoveProject={() => Promise.resolve(undefined)}
+          onRenameChat={() => Promise.resolve(undefined)}
           onRequestCodexSignIn={() => undefined}
           onRetrySetup={() => Promise.resolve(undefined)}
           onSelectChat={setSelectedChatId}

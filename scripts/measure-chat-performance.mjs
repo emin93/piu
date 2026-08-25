@@ -3,24 +3,52 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-const resultPrefix = "PIU_ISSUE_5_PERFORMANCE:";
-const resultPath = resolve("work/issue-5-performance-result.json");
-const tracePath = resolve("work/issue-5-animation-hitches.trace");
+const resultPrefix = "PIU_CHAT_PERFORMANCE:";
+const resultPath = resolve("work/chat-performance-result.json");
+const tracePath = resolve("work/chat-animation-hitches.trace");
 const executable = resolve(
   "src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Più.app/Contents/MacOS/piu",
 );
-const appData = await mkdtemp(join(tmpdir(), "piu-issue-5-performance-"));
+const appData = await mkdtemp(join(tmpdir(), "piu-chat-performance-"));
 const originalClipboard = spawnSync("pbpaste", { encoding: null }).stdout;
 let app;
 let trace;
 
+function requireAtMost(summary, maximum, label) {
+  if (!summary || summary.max > maximum) {
+    throw new Error(`${label} exceeded ${String(maximum)} ms (max ${String(summary?.max)} ms)`);
+  }
+}
+
+function requireNoSlowFrames(summary, label) {
+  if (!summary || summary.framesOver20ms !== 0) {
+    throw new Error(`${label} recorded ${String(summary?.framesOver20ms)} frames over 20 ms`);
+  }
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolveExit) => {
+    const onExit = () => {
+      clearTimeout(timeout);
+      resolveExit(true);
+    };
+    const timeout = setTimeout(() => {
+      child.off("exit", onExit);
+      resolveExit(false);
+    }, timeoutMs);
+    child.once("exit", onExit);
+  });
+}
+
 async function stopChild(child, signal) {
-  if (!child || child.exitCode !== null) return;
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
   child.kill(signal);
-  await Promise.race([
-    new Promise((resolveExit) => child.once("exit", resolveExit)),
-    new Promise((resolveTimeout) => setTimeout(resolveTimeout, 2_000)),
-  ]);
+  if (await waitForChildExit(child, 2_000)) return;
+  child.kill("SIGKILL");
+  if (!(await waitForChildExit(child, 2_000))) {
+    throw new Error(`Child process ${String(child.pid)} did not exit after SIGKILL`);
+  }
 }
 
 function run(command, arguments_) {
@@ -61,7 +89,7 @@ try {
     "--bundles",
     "app",
     "--config",
-    "scripts/performance/issue-5.tauri.conf.json",
+    "scripts/performance/chat.tauri.conf.json",
   ]);
 
   app = spawn(executable, [], {
@@ -89,14 +117,28 @@ try {
   );
 
   const report = await clipboardResult(45_000);
-  if (report.error) throw new Error(report.error);
   await writeFile(resultPath, `${JSON.stringify(report, null, 2)}\n`);
+  if (report.error) throw new Error(report.error);
+  requireAtMost(report.chatSwitchVisibleNextFrameMs, 100, "Visible chat switching");
+  requireAtMost(report.navigationVisibleNextFrameMs, 50, "Visible project navigation");
+  requireAtMost(report.composerInputNextFrameMs, 50, "Composer input");
+  requireNoSlowFrames(report.scrollingFrames, "Transcript scrolling");
+  requireNoSlowFrames(report.streamingFrames, "Transcript streaming");
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   process.stdout.write(`RESULT_PATH=${resultPath}\nTRACE_PATH=${tracePath}\n`);
 } finally {
-  await stopChild(trace, "SIGINT");
-  await stopChild(app, "SIGTERM");
+  const stopResults = await Promise.allSettled([
+    stopChild(trace, "SIGINT"),
+    stopChild(app, "SIGTERM"),
+  ]);
   spawnSync("pbcopy", { input: originalClipboard });
   await rm(appData, { force: true, recursive: true });
   run("npm", ["run", "build"]);
+  const stopFailure = stopResults.find((result) => result.status === "rejected");
+  if (stopFailure?.status === "rejected") {
+    const message =
+      stopFailure.reason instanceof Error ? stopFailure.reason.message : String(stopFailure.reason);
+    process.stderr.write(`Packaged performance cleanup failed: ${message}\n`);
+    process.exitCode = 1;
+  }
 }

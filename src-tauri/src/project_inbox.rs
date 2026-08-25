@@ -14,6 +14,9 @@ use ts_rs::TS;
 use crate::{
     database::{Database, DatabaseError},
     git_process::{GitProcess, GitProcessError},
+    prompt_attachments::{
+        PromptAttachment, PromptAttachmentError, validate as validate_attachments,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -87,6 +90,7 @@ pub struct DraftSummary {
     #[ts(type = "number")]
     pub project_id: i64,
     pub prompt: String,
+    pub attachments: Vec<PromptAttachment>,
     #[ts(type = "number")]
     pub updated_at_ms: i64,
 }
@@ -112,6 +116,12 @@ pub struct ChatSummary {
 pub struct ChatSessionReference {
     pub id: String,
     pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InitialPrompt {
+    pub text: String,
+    pub attachments: Vec<PromptAttachment>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize, TS)]
@@ -150,12 +160,18 @@ pub enum ProjectInboxError {
     ProjectNotFound { project_id: i64 },
     #[error("chat {chat_id} does not exist")]
     ChatNotFound { chat_id: String },
+    #[error("a chat title cannot be empty")]
+    InvalidChatTitle,
     #[error("chat {chat_id} is already bound to another Pi session")]
     ChatSessionAlreadyBound { chat_id: String },
     #[error("chat {chat_id} received an invalid Pi session reference")]
     InvalidChatSessionReference { chat_id: String },
     #[error("project has {count} unmerged chats")]
     ProjectHasUnmergedChats { count: u32 },
+    #[error(transparent)]
+    Attachment(#[from] PromptAttachmentError),
+    #[error("stored prompt attachments are invalid")]
+    InvalidAttachmentState,
     #[error("could not prepare application data: {0}")]
     AppData(#[source] std::io::Error),
     #[error(transparent)]
@@ -273,6 +289,7 @@ pub(crate) struct ChatCreationReservation {
     pub chat_id: String,
     pub project: ProjectLocation,
     pub prompt: String,
+    pub attachments: Vec<PromptAttachment>,
     pub title: String,
     pub branch_name: String,
     pub worktree_path: PathBuf,
@@ -411,7 +428,9 @@ impl ProjectInbox {
         &self,
         project_id: i64,
         prompt: &str,
+        attachments: &[PromptAttachment],
     ) -> Result<DraftSummary, ProjectInboxError> {
+        let attachments_json = encode_attachments(attachments)?;
         let updated_at_ms = now_ms()?;
         self.with_database(|database| {
             let connection = database.connection_mut();
@@ -420,7 +439,7 @@ impl ProjectInbox {
                 .map_err(DatabaseError::Query)
                 .map_err(ProjectInboxError::Database)?;
             require_project(&transaction, project_id)?;
-            if prompt.is_empty() {
+            if prompt.is_empty() && attachments.is_empty() {
                 transaction
                     .execute(
                         "DELETE FROM chat_drafts WHERE project_id = ?1",
@@ -431,12 +450,13 @@ impl ProjectInbox {
             } else {
                 transaction
                     .execute(
-                        "INSERT INTO chat_drafts (project_id, prompt, updated_at_ms)
-                         VALUES (?1, ?2, ?3)
+                        "INSERT INTO chat_drafts (project_id, prompt, attachments_json, updated_at_ms)
+                         VALUES (?1, ?2, ?3, ?4)
                          ON CONFLICT(project_id) DO UPDATE SET
                            prompt = excluded.prompt,
+                           attachments_json = excluded.attachments_json,
                            updated_at_ms = excluded.updated_at_ms",
-                        params![project_id, prompt, updated_at_ms],
+                        params![project_id, prompt, attachments_json, updated_at_ms],
                     )
                     .map_err(DatabaseError::Query)
                     .map_err(ProjectInboxError::Database)?;
@@ -448,9 +468,38 @@ impl ProjectInbox {
             Ok(DraftSummary {
                 project_id,
                 prompt: prompt.to_owned(),
+                attachments: attachments.to_vec(),
                 updated_at_ms,
             })
         })
+    }
+
+    pub fn rename_chat(
+        &self,
+        chat_id: &str,
+        title: &str,
+    ) -> Result<InboxSnapshot, ProjectInboxError> {
+        let title = normalized_chat_title(title);
+        if title.is_empty() {
+            return Err(ProjectInboxError::InvalidChatTitle);
+        }
+        self.with_database(|database| {
+            let changed = database
+                .connection_mut()
+                .execute(
+                    "UPDATE chats SET title = ?1 WHERE id = ?2",
+                    params![title, chat_id],
+                )
+                .map_err(DatabaseError::Query)
+                .map_err(ProjectInboxError::Database)?;
+            if changed == 0 {
+                return Err(ProjectInboxError::ChatNotFound {
+                    chat_id: chat_id.to_owned(),
+                });
+            }
+            Ok(())
+        })?;
+        self.snapshot()
     }
 
     pub fn remove_project(&self, project_id: i64) -> Result<InboxSnapshot, ProjectInboxError> {
@@ -556,22 +605,24 @@ impl ProjectInbox {
         &self,
         reservation: &ChatCreationReservation,
     ) -> Result<(), ProjectInboxError> {
+        let attachments_json = encode_attachments(&reservation.attachments)?;
         self.with_database(|database| {
             database
                 .connection_mut()
                 .execute(
                     "INSERT INTO chat_workspace_creations (
-                       chat_id, project_id, project_name, prompt, title, branch_name,
+                       chat_id, project_id, project_name, prompt, attachments_json, title, branch_name,
                        worktree_path, worktree_root_path, worktree_root_device, worktree_root_inode,
                        base_commit, created_at_ms, worktree_created, branch_attached,
                        worktree_git_dir_path, worktree_git_dir_device, worktree_git_dir_inode
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, 0,
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, 0,
                                NULL, NULL, NULL)",
                     params![
                         reservation.chat_id,
                         reservation.project.id,
                         reservation.project.name,
                         reservation.prompt,
+                        attachments_json,
                         reservation.title,
                         reservation.branch_name,
                         reservation.worktree_path.to_string_lossy(),
@@ -657,6 +708,7 @@ impl ProjectInbox {
                 chat_id: reservation.chat_id.clone(),
             }
         })?;
+        let attachments_json = encode_attachments(&reservation.attachments)?;
         self.with_database(|database| {
             let transaction = database
                 .connection_mut()
@@ -670,10 +722,10 @@ impl ProjectInbox {
                        worktree_git_dir_path, worktree_git_dir_device, worktree_git_dir_inode,
                        base_commit, pull_request_number, created_at_ms, merge_state,
                        setup_phase, setup_failure, setup_exit_code, setup_signal,
-                       setup_attempt, setup_log
+                       setup_attempt, setup_log, initial_attachments_json
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                                ?13, NULL, ?14, 'unmerged',
-                               'pending', NULL, NULL, NULL, 0, '')",
+                               'pending', NULL, NULL, NULL, 0, '', ?15)",
                     params![
                         reservation.chat_id,
                         reservation.project.id,
@@ -689,6 +741,7 @@ impl ProjectInbox {
                         worktree_git_dir.inode,
                         reservation.base_commit,
                         reservation.created_at_ms,
+                        attachments_json,
                     ],
                 )
                 .map_err(DatabaseError::Query)?;
@@ -740,7 +793,8 @@ impl ProjectInbox {
                             journal.worktree_root_inode,
                             journal.base_commit, journal.created_at_ms, journal.worktree_created,
                             journal.branch_attached, journal.worktree_git_dir_path,
-                            journal.worktree_git_dir_device, journal.worktree_git_dir_inode
+                            journal.worktree_git_dir_device, journal.worktree_git_dir_inode,
+                            journal.attachments_json
                      FROM chat_workspace_creations AS journal
                      JOIN projects ON projects.id = journal.project_id
                      ORDER BY journal.created_at_ms ASC, journal.chat_id ASC",
@@ -755,6 +809,7 @@ impl ProjectInbox {
                     let git_dir_path: Option<String> = row.get(16)?;
                     let git_dir_device: Option<String> = row.get(17)?;
                     let git_dir_inode: Option<String> = row.get(18)?;
+                    let attachments_json: String = row.get(19)?;
                     let worktree_git_dir = match (git_dir_path, git_dir_device, git_dir_inode) {
                         (Some(path), Some(device), Some(inode)) => Some(FilesystemIdentity {
                             path: PathBuf::from(path),
@@ -773,6 +828,8 @@ impl ProjectInbox {
                             git_dir_path: PathBuf::from(project_git_dir_path),
                         },
                         prompt: row.get(5)?,
+                        attachments: decode_attachments(&attachments_json)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
                         title: row.get(6)?,
                         branch_name: row.get(7)?,
                         worktree_path: PathBuf::from(&worktree_path),
@@ -953,15 +1010,30 @@ impl ProjectInbox {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn first_user_message(&self, chat_id: &str) -> Result<String, ProjectInboxError> {
+        self.initial_prompt(chat_id).map(|prompt| prompt.text)
+    }
+
+    pub(crate) fn initial_prompt(&self, chat_id: &str) -> Result<InitialPrompt, ProjectInboxError> {
         self.with_database(|database| {
             database
                 .connection()
                 .query_row(
-                    "SELECT content FROM chat_messages
-                     WHERE chat_id = ?1 AND sequence = 1 AND role = 'user'",
+                    "SELECT messages.content, chats.initial_attachments_json
+                     FROM chat_messages AS messages
+                     JOIN chats ON chats.id = messages.chat_id
+                     WHERE messages.chat_id = ?1 AND messages.sequence = 1
+                       AND messages.role = 'user'",
                     [chat_id],
-                    |row| row.get(0),
+                    |row| {
+                        let attachments_json: String = row.get(1)?;
+                        Ok(InitialPrompt {
+                            text: row.get(0)?,
+                            attachments: decode_attachments(&attachments_json)
+                                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        })
+                    },
                 )
                 .optional()
                 .map_err(DatabaseError::Query)?
@@ -1094,6 +1166,15 @@ impl ProjectInbox {
     }
 }
 
+pub(crate) fn normalized_chat_title(input: &str) -> String {
+    let collapsed = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut title = collapsed.chars().take(72).collect::<String>();
+    if collapsed.chars().count() > 72 {
+        title.push('…');
+    }
+    title
+}
+
 fn map_admission_error(error: RepositoryInspectionError) -> ProjectInboxError {
     match error {
         RepositoryInspectionError::Missing => ProjectInboxError::InvalidRepository,
@@ -1202,16 +1283,19 @@ fn load_stored_snapshot(connection: &Connection) -> Result<StoredInboxSnapshot, 
 
     let mut draft_statement = connection
         .prepare(
-            "SELECT project_id, prompt, updated_at_ms
+            "SELECT project_id, prompt, attachments_json, updated_at_ms
              FROM chat_drafts ORDER BY project_id ASC",
         )
         .map_err(DatabaseError::Query)?;
     let drafts = draft_statement
         .query_map([], |row| {
+            let attachments_json: String = row.get(2)?;
             Ok(DraftSummary {
                 project_id: row.get(0)?,
                 prompt: row.get(1)?,
-                updated_at_ms: row.get(2)?,
+                attachments: decode_attachments(&attachments_json)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                updated_at_ms: row.get(3)?,
             })
         })
         .map_err(DatabaseError::Query)?
@@ -1351,6 +1435,18 @@ fn repository_availability(
             ProjectAvailability::Inaccessible
         }
     }
+}
+
+fn encode_attachments(attachments: &[PromptAttachment]) -> Result<String, ProjectInboxError> {
+    validate_attachments(attachments)?;
+    serde_json::to_string(attachments).map_err(|_| ProjectInboxError::InvalidAttachmentState)
+}
+
+fn decode_attachments(value: &str) -> Result<Vec<PromptAttachment>, ProjectInboxError> {
+    let attachments = serde_json::from_str::<Vec<PromptAttachment>>(value)
+        .map_err(|_| ProjectInboxError::InvalidAttachmentState)?;
+    validate_attachments(&attachments)?;
+    Ok(attachments)
 }
 
 fn now_ms() -> Result<i64, ProjectInboxError> {

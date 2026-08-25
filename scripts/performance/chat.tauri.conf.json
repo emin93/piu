@@ -1,0 +1,6 @@
+{
+  "build": {
+    "beforeBuildCommand": "npx tsc -p scripts/performance/tsconfig.json && npm exec vite -- build --config scripts/performance/chat.vite.config.ts",
+    "frontendDist": "../work/chat-performance-dist"
+  }
+}

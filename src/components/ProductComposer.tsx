@@ -9,11 +9,14 @@ interface ProductComposerError {
 
 export interface ProductComposerProps {
   actions?: ReactNode;
+  attachments?: ReactNode;
   ariaDescribedBy?: string;
   ariaLabel: string;
   error?: ProductComposerError;
   inputRef?: Ref<HTMLTextAreaElement>;
+  inputReadOnly?: boolean;
   layout: "centered" | "docked";
+  leadingActions?: ReactNode;
   onSubmit?: () => void;
   onValueChange?: (value: string) => void;
   placeholder?: string;
@@ -25,11 +28,14 @@ export interface ProductComposerProps {
 
 export function ProductComposer({
   actions,
+  attachments,
   ariaDescribedBy,
   ariaLabel,
   error,
   inputRef,
+  inputReadOnly = false,
   layout,
+  leadingActions,
   onSubmit,
   onValueChange,
   placeholder,
@@ -52,6 +58,7 @@ export function ProductComposer({
   };
   const content = (
     <>
+      {attachments}
       <Textarea
         aria-describedby={describedBy}
         aria-label={ariaLabel}
@@ -59,13 +66,16 @@ export function ProductComposer({
         onChange={onValueChange ? (event) => onValueChange(event.target.value) : undefined}
         onKeyDown={submitShortcut}
         placeholder={placeholder}
-        readOnly={readOnly}
+        readOnly={readOnly || inputReadOnly}
         ref={inputRef}
-        rows={layout === "centered" ? 4 : 3}
+        rows={layout === "centered" ? 4 : 2}
         value={value}
       />
       <div className="product-composer-footer">
-        <div className="product-composer-status">{status}</div>
+        <div className="product-composer-meta">
+          {leadingActions}
+          <div className="product-composer-status">{status}</div>
+        </div>
         <div className="product-composer-actions">{actions}</div>
       </div>
       {error ? (

@@ -7,6 +7,7 @@ import type { ChatTerminalRequest } from "../generated/ChatTerminalRequest";
 import type { ChatWorkspaceCommandError } from "../generated/ChatWorkspaceCommandError";
 import type { ChatWorkspaceCommandErrorCode } from "../generated/ChatWorkspaceCommandErrorCode";
 import type { CreateChatResponse } from "../generated/CreateChatResponse";
+import type { PromptAttachment } from "../generated/PromptAttachment";
 
 export type { ChatSetupChangedEvent } from "../generated/ChatSetupChangedEvent";
 export type { ChatSetupSummary } from "../generated/ChatSetupSummary";
@@ -20,10 +21,17 @@ const CHAT_WORKSPACE_ERROR_CODES = new Set<ChatWorkspaceCommandErrorCode>([
   "setupAlreadyRunning",
   "creationFailed",
   "storageUnavailable",
+  "invalidAttachment",
 ]);
 
-export function createChat(projectId: number, prompt: string) {
-  return invoke<CreateChatResponse>("create_chat", { request: { projectId, prompt } });
+export function createChat(
+  projectId: number,
+  prompt: string,
+  attachments: readonly PromptAttachment[],
+) {
+  return invoke<CreateChatResponse>("create_chat", {
+    request: { attachments, projectId, prompt },
+  });
 }
 
 export function retryChatSetup(chatId: string) {

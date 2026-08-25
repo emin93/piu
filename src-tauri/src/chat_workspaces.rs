@@ -29,12 +29,14 @@ use crate::{
         ChatSummary, ChatWorkspaceOwnership, FilesystemIdentity, InboxSnapshot, ProjectInbox,
         ProjectInboxError, ProjectLocation,
     },
+    prompt_attachments::{PromptAttachment, validate as validate_attachments},
 };
 
 const SETUP_SCRIPT: &str = ".piu/setup.sh";
 const MAX_SETUP_LOG_BYTES: usize = 256 * 1024;
 const SETUP_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
 const OUTPUT_TRUNCATED_MARKER: &str = "\n[Setup output truncated]\n";
+const GENERATED_TITLE_MAX_CHARS: usize = 56;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -182,11 +184,15 @@ impl ChatWorkspaces {
         &self,
         project_id: i64,
         prompt: &str,
+        attachments: &[PromptAttachment],
     ) -> Result<CreatedChat, ChatWorkspaceError> {
         let prompt = prompt.trim();
-        if prompt.is_empty() {
+        if prompt.is_empty() && attachments.is_empty() {
             return Err(ChatWorkspaceError::EmptyPrompt);
         }
+        validate_attachments(attachments)
+            .map_err(ProjectInboxError::from)
+            .map_err(ChatWorkspaceError::Inbox)?;
         self.reconcile_once()?;
         let _creation = self
             .creation_lock
@@ -200,7 +206,11 @@ impl ChatWorkspaces {
         fs::create_dir_all(&self.root).map_err(ChatWorkspaceError::WorktreeStorage)?;
         let chat_id = self.inbox.allocate_chat_id()?;
         let short_id = &chat_id[..8];
-        let title = chat_title(prompt);
+        let title = if prompt.is_empty() {
+            generated_attachment_title(attachments)
+        } else {
+            generated_chat_title(prompt)
+        };
         let branch_name = format!("agent/{short_id}-{}", prompt_slug(prompt));
         let worktree_path = self.root.join(&chat_id);
         let created_at_ms = current_time_ms()?;
@@ -219,6 +229,7 @@ impl ChatWorkspaces {
             chat_id,
             project,
             prompt: prompt.to_owned(),
+            attachments: attachments.to_vec(),
             title,
             branch_name,
             base_commit,
@@ -959,15 +970,6 @@ fn current_time_ms() -> Result<i64, ChatWorkspaceError> {
         .map_err(|_| ChatWorkspaceError::Inbox(ProjectInboxError::SystemClock))
 }
 
-fn chat_title(prompt: &str) -> String {
-    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut title = collapsed.chars().take(72).collect::<String>();
-    if collapsed.chars().count() > 72 {
-        title.push('…');
-    }
-    title
-}
-
 fn prompt_slug(prompt: &str) -> String {
     let mut slug = String::new();
     let mut needs_separator = false;
@@ -995,6 +997,50 @@ fn prompt_slug(prompt: &str) -> String {
     }
 }
 
+fn generated_chat_title(prompt: &str) -> String {
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sentence_end = collapsed.char_indices().find_map(|(index, character)| {
+        if !matches!(character, '.' | '?' | '!') {
+            return None;
+        }
+        collapsed[index + character.len_utf8()..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace)
+            .then_some(index)
+    });
+    let sentence = sentence_end
+        .filter(|end| *end > 0)
+        .map(|end| &collapsed[..end])
+        .unwrap_or(&collapsed);
+    if sentence.chars().count() <= GENERATED_TITLE_MAX_CHARS {
+        return sentence.to_owned();
+    }
+
+    let prefix = sentence
+        .chars()
+        .take(GENERATED_TITLE_MAX_CHARS - 1)
+        .collect::<String>();
+    let prefix = prefix
+        .rsplit_once(' ')
+        .map_or(prefix.as_str(), |(complete_words, _)| complete_words);
+    format!("{}…", prefix.trim_end())
+}
+
+fn generated_attachment_title(attachments: &[PromptAttachment]) -> String {
+    match attachments {
+        [attachment] => generated_chat_title(&format!("Review {}", attachment.name)),
+        attachments
+            if attachments.iter().all(|attachment| {
+                attachment.kind == crate::prompt_attachments::PromptAttachmentKind::Image
+            }) =>
+        {
+            format!("Review {} images", attachments.len())
+        }
+        attachments => format!("Review {} attachments", attachments.len()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1016,7 +1062,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::project_inbox::ProjectInbox;
+    use crate::{project_inbox::ProjectInbox, prompt_attachments::PromptAttachmentKind};
 
     struct RemoteFixture {
         _root: TempDir,
@@ -1152,7 +1198,7 @@ mod tests {
 
         fn create(&self, prompt: &str) -> CreatedChat {
             self.manager
-                .create_chat(self.project_id, prompt)
+                .create_chat(self.project_id, prompt, &[])
                 .expect("chat should be created")
         }
 
@@ -1262,6 +1308,90 @@ mod tests {
     }
 
     #[test]
+    fn first_prompt_generates_a_concise_title_and_rename_preserves_workspace_identity() {
+        let fixture = WorkspaceFixture::new(RemoteFixture::new());
+        let created = fixture.create(
+            "Investigate why the parser duplicates imported rows across nested projects while preserving the public API and add regression coverage",
+        );
+        let original_branch = created.chat.branch_name.clone();
+        let original_ownership = fixture
+            .inbox
+            .chat_workspace_ownership(&created.chat.id)
+            .unwrap();
+
+        assert_eq!(
+            created.chat.title,
+            "Investigate why the parser duplicates imported rows…"
+        );
+
+        let renamed = fixture
+            .inbox
+            .rename_chat(&created.chat.id, "Parser import ownership")
+            .unwrap()
+            .chats
+            .into_iter()
+            .find(|chat| chat.id == created.chat.id)
+            .unwrap();
+        let renamed_ownership = fixture
+            .inbox
+            .chat_workspace_ownership(&created.chat.id)
+            .unwrap();
+
+        assert_eq!(renamed.title, "Parser import ownership");
+        assert_eq!(renamed.branch_name, original_branch);
+        assert_eq!(
+            renamed_ownership.worktree_path,
+            original_ownership.worktree_path
+        );
+        assert_eq!(
+            renamed_ownership.worktree_root,
+            original_ownership.worktree_root
+        );
+        assert_eq!(
+            fixture
+                .manager
+                .git
+                .current_branch(&renamed_ownership.worktree_path)
+                .unwrap()
+                .as_deref(),
+            Some(original_branch.as_str())
+        );
+    }
+
+    #[test]
+    fn image_only_first_prompt_uses_the_attachment_name_as_its_title() {
+        let fixture = WorkspaceFixture::new(RemoteFixture::new());
+        let attachment = PromptAttachment {
+            id: "wireframe-image".into(),
+            name: "checkout-wireframe.png".into(),
+            kind: PromptAttachmentKind::Image,
+            mime_type: "image/png".into(),
+            content: "iVBORw0KGgpmaXh0dXJl".into(),
+            size_bytes: 15,
+        };
+
+        let created = fixture
+            .manager
+            .create_chat(fixture.project_id, "", &[attachment])
+            .unwrap();
+
+        assert_eq!(created.chat.title, "Review checkout-wireframe.png");
+        assert_eq!(
+            created.chat.branch_name,
+            format!("agent/{}-chat", &created.chat.id[..8])
+        );
+        assert_eq!(
+            fixture
+                .manager
+                .git
+                .current_branch(&fixture.worktrees.join(&created.chat.id))
+                .unwrap()
+                .as_deref(),
+            Some(created.chat.branch_name.as_str())
+        );
+    }
+
+    #[test]
     fn failed_fetch_never_falls_back_to_a_cached_remote_main() {
         let fixture = WorkspaceFixture::new(RemoteFixture::new());
         fixture
@@ -1277,7 +1407,7 @@ mod tests {
 
         let error = fixture
             .manager
-            .create_chat(fixture.project_id, "Do not use cached state")
+            .create_chat(fixture.project_id, "Do not use cached state", &[])
             .expect_err("fresh fetch should be mandatory");
 
         assert!(matches!(error, ChatWorkspaceError::FreshMain(_)));
@@ -1297,7 +1427,11 @@ mod tests {
 
         let error = fixture
             .manager
-            .create_chat(fixture.project_id, "Never mutate a replacement repository")
+            .create_chat(
+                fixture.project_id,
+                "Never mutate a replacement repository",
+                &[],
+            )
             .expect_err("the stored repository identity must be revalidated");
 
         assert!(matches!(
@@ -1313,11 +1447,12 @@ mod tests {
         let fixture = WorkspaceFixture::new(RemoteFixture::new());
         let manager = Arc::clone(&fixture.manager);
         let first_project = fixture.project_id;
-        let first = thread::spawn(move || manager.create_chat(first_project, "First parser fix"));
+        let first =
+            thread::spawn(move || manager.create_chat(first_project, "First parser fix", &[]));
         let manager = Arc::clone(&fixture.manager);
         let second_project = fixture.project_id;
         let second =
-            thread::spawn(move || manager.create_chat(second_project, "Second parser fix"));
+            thread::spawn(move || manager.create_chat(second_project, "Second parser fix", &[]));
         let first = first.join().unwrap().unwrap().chat;
         let second = second.join().unwrap().unwrap().chat;
 
@@ -1359,7 +1494,7 @@ mod tests {
             Arc::new(FailAt { checkpoint }),
         );
         crashing
-            .create_chat(fixture.project_id, prompt)
+            .create_chat(fixture.project_id, prompt, &[])
             .expect_err("checkpoint should simulate a crash");
         fixture.inbox.pending_chat_creations().unwrap().remove(0)
     }
@@ -1379,7 +1514,7 @@ mod tests {
                 Arc::new(FailAt { checkpoint }),
             );
             crashing
-                .create_chat(fixture.project_id, "Recover owned state")
+                .create_chat(fixture.project_id, "Recover owned state", &[])
                 .expect_err("checkpoint should simulate a crash");
             let reservation = fixture.inbox.pending_chat_creations().unwrap().remove(0);
 
@@ -1657,7 +1792,7 @@ mod tests {
             }),
         );
         crashing
-            .create_chat(fixture.project_id, "Keep committed chat")
+            .create_chat(fixture.project_id, "Keep committed chat", &[])
             .expect_err("checkpoint should simulate a crash");
 
         let relaunched = ChatWorkspaces::new(
@@ -1691,7 +1826,7 @@ mod tests {
             }),
         );
         crashing
-            .create_chat(fixture.project_id, "Protect user branch")
+            .create_chat(fixture.project_id, "Protect user branch", &[])
             .expect_err("checkpoint should leave a reservation");
         let reservation = fixture.inbox.pending_chat_creations().unwrap().remove(0);
         fixture
@@ -1724,7 +1859,7 @@ mod tests {
             }),
         );
         crashing
-            .create_chat(fixture.project_id, "Keep replacement data")
+            .create_chat(fixture.project_id, "Keep replacement data", &[])
             .expect_err("checkpoint should leave a worktree");
         let reservation = fixture.inbox.pending_chat_creations().unwrap().remove(0);
         let moved_owned_worktree = fixture.worktrees.join("interrupted-owned-worktree");
@@ -1761,7 +1896,7 @@ mod tests {
             }),
         );
         crashing
-            .create_chat(fixture.project_id, "Protect untracked recovery data")
+            .create_chat(fixture.project_id, "Protect untracked recovery data", &[])
             .expect_err("checkpoint should leave an owned worktree");
         let reservation = fixture.inbox.pending_chat_creations().unwrap().remove(0);
         fs::write(
@@ -1795,7 +1930,7 @@ mod tests {
             }),
         );
         crashing
-            .create_chat(fixture.project_id, "Protect tracked recovery changes")
+            .create_chat(fixture.project_id, "Protect tracked recovery changes", &[])
             .expect_err("checkpoint should leave an owned worktree");
         let reservation = fixture.inbox.pending_chat_creations().unwrap().remove(0);
         fs::write(
@@ -1829,7 +1964,7 @@ mod tests {
             }),
         );
         crashing
-            .create_chat(fixture.project_id, "Protect exact worktree ownership")
+            .create_chat(fixture.project_id, "Protect exact worktree ownership", &[])
             .expect_err("checkpoint should leave an owned worktree");
         let reservation = fixture.inbox.pending_chat_creations().unwrap().remove(0);
         let replacement = fixture.worktrees.join("same-repository-replacement");

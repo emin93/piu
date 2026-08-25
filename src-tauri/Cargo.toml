@@ -15,6 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
+base64 = "=0.22.1"
 cap-fs-ext = "=4.0.3"
 cap-std = "=4.0.3"
 fs4 = "=1.1.0"

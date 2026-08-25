@@ -2,6 +2,7 @@ import {
   ChevronDownIcon,
   FolderPlusIcon,
   MoreHorizontalIcon,
+  PencilIcon,
   SearchIcon,
   SettingsIcon,
   Trash2Icon,
@@ -32,6 +33,20 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -44,8 +59,11 @@ import { Separator } from "@/components/ui/separator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ChatSummary, InboxSnapshot, ProjectSummary } from "@/platform/project-inbox";
 import type { ConversationAdapter } from "@/platform/conversations";
+import type { PromptAttachment } from "@/platform/prompt-attachments";
 
 import { ChatComposer } from "./ChatComposer";
+import type { TranscriptViewState } from "../conversation/ConversationSurface";
+import { ChatActivityController } from "./chat-activity-controller";
 import { EmptyInbox } from "./EmptyInbox";
 import { type DraftPersistenceStatus, ProjectDraftController } from "./draft-controller";
 import { composerProject, selectInbox } from "./inbox-model";
@@ -55,17 +73,23 @@ import { SidebarResizeHandle } from "./SidebarResizeHandle";
 
 interface InboxWorkspaceProps {
   actionError: string | undefined;
+  activities: ChatActivityController;
   conversationAdapter: ConversationAdapter;
   conversationRevision: number;
   drafts: ProjectDraftController;
   onCancelSetup: (chatId: string) => Promise<string | undefined>;
-  onCreateChat: (projectId: number, prompt: string) => Promise<string | undefined>;
+  onCreateChat: (
+    projectId: number,
+    prompt: string,
+    attachments: readonly PromptAttachment[],
+  ) => Promise<string | undefined>;
   onOpenRepository: () => void;
   onOpenTerminal: (chatId: string) => Promise<string | undefined>;
   onOpenSettings: () => void;
   onRequestCodexSignIn: () => void;
   onQueryChange: (query: string) => void;
   onRemoveProject: (projectId: number) => Promise<string | undefined>;
+  onRenameChat: (chatId: string, title: string) => Promise<string | undefined>;
   onRetrySetup: (chatId: string) => Promise<string | undefined>;
   onSelectChat: (chatId: string) => void;
   onSelectProject: (projectId: number | null) => void;
@@ -160,24 +184,45 @@ const ProjectFilter = memo(function ProjectFilter({
 });
 
 const ChatConversationPanel = lazy(() => import("../conversation/ChatConversationPanel"));
+const MAX_CACHED_TRANSCRIPT_STATES = 32;
+
+class TranscriptStateCache {
+  readonly #states = new Map<string, TranscriptViewState>();
+
+  get(chatId: string) {
+    return this.#states.get(chatId);
+  }
+
+  remember(chatId: string, state: TranscriptViewState) {
+    this.#states.delete(chatId);
+    this.#states.set(chatId, state);
+    if (this.#states.size <= MAX_CACHED_TRANSCRIPT_STATES) return;
+    const oldestChatId = this.#states.keys().next().value;
+    if (oldestChatId) this.#states.delete(oldestChatId);
+  }
+}
 
 function SelectedChatStage({
   chat,
   conversationAdapter,
   conversationRevision,
+  initialTranscriptState,
   onCancelSetup,
   onOpenTerminal,
   onRequestCodexSignIn,
   onRetrySetup,
+  rememberTranscriptState,
   setups,
 }: {
   chat: ChatSummary;
   conversationAdapter: ConversationAdapter;
   conversationRevision: number;
+  initialTranscriptState?: TranscriptViewState;
   onCancelSetup: (chatId: string) => Promise<string | undefined>;
   onOpenTerminal: (chatId: string) => Promise<string | undefined>;
   onRequestCodexSignIn: () => void;
   onRetrySetup: (chatId: string) => Promise<string | undefined>;
+  rememberTranscriptState: (chatId: string, state: TranscriptViewState) => void;
   setups: ChatSetupController;
 }) {
   const subscribe = useCallback(
@@ -187,6 +232,10 @@ function SelectedChatStage({
   const getSnapshot = useCallback(() => setups.get(chat.id), [chat.id, setups]);
   const setup = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   const ready = setup.phase === "notRequired" || setup.phase === "succeeded";
+  const saveTranscriptState = useCallback(
+    (state: TranscriptViewState) => rememberTranscriptState(chat.id, state),
+    [chat.id, rememberTranscriptState],
+  );
 
   if (!ready) {
     return (
@@ -211,8 +260,10 @@ function SelectedChatStage({
       <ChatConversationPanel
         adapter={conversationAdapter}
         chatId={chat.id}
+        initialTranscriptState={initialTranscriptState}
         key={chat.id}
         onRequestCodexSignIn={onRequestCodexSignIn}
+        onTranscriptStateChange={saveTranscriptState}
         revision={conversationRevision}
       />
     </Suspense>
@@ -220,51 +271,111 @@ function SelectedChatStage({
 }
 
 const ChatRow = memo(function ChatRow({
+  activities,
   chat,
+  onRename,
   onSelect,
   selected,
   setups,
 }: {
+  activities: ChatActivityController;
   chat: ChatSummary;
+  onRename: (trigger: HTMLButtonElement) => void;
   onSelect: () => void;
   selected: boolean;
   setups: ChatSetupController;
 }) {
+  const selectTriggerRef = useRef<HTMLButtonElement>(null);
   const subscribe = useCallback(
     (listener: () => void) => setups.subscribe(chat.id, listener),
     [chat.id, setups],
   );
   const getSnapshot = useCallback(() => setups.get(chat.id), [chat.id, setups]);
   const setup = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const activityStore = activities.chat(chat.id);
+  const activity = useSyncExternalStore(
+    activityStore.subscribe,
+    activityStore.getSnapshot,
+    activityStore.getSnapshot,
+  );
+  const rowPhase =
+    setup.phase === "succeeded" || setup.phase === "notRequired" ? activity.phase : setup.phase;
   return (
-    <li className="chat-row" data-chat-id={chat.id}>
-      <Button
-        aria-label={`${chat.title}, ${setup.phase}`}
-        aria-pressed={selected}
-        className="chat-row-select"
-        onClick={onSelect}
-        type="button"
-        variant="ghost"
-      >
-        <span aria-hidden="true" className="chat-setup-indicator" data-phase={setup.phase} />
-        <span className="chat-row-copy">
-          <span className="chat-row-title" title={chat.title}>
-            {chat.title}
-          </span>
-          <span className="chat-row-metadata">
-            <span>{chat.projectName}</span>
-            <span aria-hidden="true">/</span>
-            <span className="font-mono" title={chat.branchName}>
-              {chat.branchName}
+    <li
+      className="chat-row"
+      data-activity={activity.phase}
+      data-chat-id={chat.id}
+      data-unread={activity.unread || undefined}
+    >
+      <ContextMenu>
+        <ContextMenuTrigger className="chat-row-context-trigger">
+          <Button
+            aria-label={`${chat.title}, ${rowPhase}${activity.unread ? ", unread" : ""}`}
+            aria-pressed={selected}
+            className="chat-row-select"
+            onClick={onSelect}
+            ref={selectTriggerRef}
+            type="button"
+            variant="ghost"
+          >
+            <span aria-hidden="true" className="chat-setup-indicator" data-phase={rowPhase} />
+            <span className="chat-row-copy">
+              <span className="chat-row-title" id={`chat-${chat.id}-title`} title={chat.title}>
+                {chat.title}
+              </span>
+              <span className="chat-row-metadata">
+                <span>{chat.projectName}</span>
+                <span aria-hidden="true">/</span>
+                <span className="font-mono" title={chat.branchName}>
+                  {chat.branchName}
+                </span>
+              </span>
             </span>
-          </span>
-        </span>
-        {chat.pullRequestNumber !== null ? (
-          <Badge className="font-mono" variant="outline">
-            #{chat.pullRequestNumber}
-          </Badge>
-        ) : null}
-      </Button>
+            {chat.pullRequestNumber !== null ? (
+              <Badge className="font-mono" variant="outline">
+                #{chat.pullRequestNumber}
+              </Badge>
+            ) : null}
+          </Button>
+        </ContextMenuTrigger>
+        <ContextMenuContent className="w-40">
+          <ContextMenuItem
+            onClick={() => {
+              if (selectTriggerRef.current) onRename(selectTriggerRef.current);
+            }}
+          >
+            <PencilIcon aria-hidden="true" />
+            Rename chat
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
+
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button
+              aria-describedby={`chat-${chat.id}-title`}
+              aria-label="More chat actions"
+              className="chat-actions-trigger"
+              size="icon-sm"
+              type="button"
+              variant="ghost"
+            />
+          }
+        >
+          <MoreHorizontalIcon aria-hidden="true" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-40">
+          <DropdownMenuItem
+            onClick={() => {
+              if (selectTriggerRef.current) onRename(selectTriggerRef.current);
+            }}
+          >
+            <PencilIcon aria-hidden="true" />
+            Rename chat
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
     </li>
   );
 });
@@ -287,14 +398,22 @@ function DraftList({
   const visibleDrafts = projects.flatMap((project) => {
     if (selectedProjectId !== null && project.id !== selectedProjectId) return [];
     const draft = drafts.get(project.id);
-    if (!draft.prompt) return [];
+    if (!draft.prompt && draft.attachments.length === 0) return [];
+    const attachmentNames = draft.attachments.map(({ name }) => name).join(" ");
     if (
       normalizedQuery &&
-      !`${project.name} ${draft.prompt}`.toLocaleLowerCase().includes(normalizedQuery)
+      !`${project.name} ${draft.prompt} ${attachmentNames}`
+        .toLocaleLowerCase()
+        .includes(normalizedQuery)
     ) {
       return [];
     }
-    return [{ draft, project }];
+    const summary =
+      draft.prompt ||
+      (draft.attachments.length === 1
+        ? `Attached ${draft.attachments[0].name}`
+        : `${draft.attachments.length} attached files`);
+    return [{ draft, project, summary }];
   });
 
   if (visibleDrafts.length === 0) return null;
@@ -306,7 +425,7 @@ function DraftList({
         <span className="font-mono">{visibleDrafts.length}</span>
       </div>
       <ul aria-label="Unsent drafts" className="draft-list">
-        {visibleDrafts.map(({ draft, project }) => (
+        {visibleDrafts.map(({ draft, project, summary }) => (
           <li key={project.id}>
             <Button
               className="draft-row"
@@ -315,7 +434,7 @@ function DraftList({
               variant="ghost"
             >
               <span className="draft-row-project">{project.name}</span>
-              <span className="draft-row-prompt">{draft.prompt}</span>
+              <span className="draft-row-prompt">{summary}</span>
               {draft.status.state === "failed" ? (
                 <span className="draft-row-failure">Not saved</span>
               ) : null}
@@ -355,6 +474,7 @@ function SearchStage({ count }: { count: number }) {
 
 export function InboxWorkspace({
   actionError,
+  activities,
   conversationAdapter,
   conversationRevision,
   drafts,
@@ -366,6 +486,7 @@ export function InboxWorkspace({
   onRequestCodexSignIn,
   onQueryChange,
   onRemoveProject,
+  onRenameChat,
   onRetrySetup,
   onSelectChat,
   onSelectProject,
@@ -381,6 +502,13 @@ export function InboxWorkspace({
   const [removing, setRemoving] = useState(false);
   const removalCancelRef = useRef<HTMLButtonElement>(null);
   const removalTriggerRef = useRef<HTMLButtonElement>(null);
+  const [chatPendingRename, setChatPendingRename] = useState<ChatSummary>();
+  const [renameTitle, setRenameTitle] = useState("");
+  const [renameError, setRenameError] = useState<string>();
+  const [renaming, setRenaming] = useState(false);
+  const renameInputRef = useRef<HTMLInputElement>(null);
+  const renameTriggerRef = useRef<HTMLButtonElement>(null);
+  const transcriptStates = useMemo(() => new TranscriptStateCache(), []);
   const selection = useMemo(
     () => selectInbox(snapshot, { projectId: selectedProjectId, query }),
     [query, selectedProjectId, snapshot],
@@ -388,6 +516,12 @@ export function InboxWorkspace({
   const targetProject = composerProject(snapshot, selectedProjectId);
   const selectedChat = snapshot.chats.find(({ id }) => id === selectedChatId);
   const visibleChatCount = selection.unmergedChats.length;
+  const rememberTranscriptState = useCallback(
+    (chatId: string, state: TranscriptViewState) => {
+      transcriptStates.remember(chatId, state);
+    },
+    [transcriptStates],
+  );
 
   const closeRemovalDialog = useCallback(() => {
     setProjectPendingRemoval(undefined);
@@ -404,8 +538,26 @@ export function InboxWorkspace({
     else closeRemovalDialog();
   }, [closeRemovalDialog, onRemoveProject, projectPendingRemoval]);
 
+  const closeRenameDialog = useCallback(() => {
+    setChatPendingRename(undefined);
+    setRenameError(undefined);
+  }, []);
+
+  const confirmRename = useCallback(async () => {
+    if (!chatPendingRename || !renameTitle.trim()) return;
+    setRenaming(true);
+    setRenameError(undefined);
+    const error = await onRenameChat(chatPendingRename.id, renameTitle);
+    setRenaming(false);
+    if (error) setRenameError(error);
+    else closeRenameDialog();
+  }, [chatPendingRename, closeRenameDialog, onRenameChat, renameTitle]);
+
   const pendingRemovalHasDraft = projectPendingRemoval
-    ? Boolean(drafts.get(projectPendingRemoval.id).prompt)
+    ? Boolean(
+        drafts.get(projectPendingRemoval.id).prompt ||
+        drafts.get(projectPendingRemoval.id).attachments.length,
+      )
     : false;
   const totalSearchResults = selection.unmergedChats.length + selection.mergedChats.length;
 
@@ -414,7 +566,7 @@ export function InboxWorkspace({
       <aside
         aria-label="Chat inbox navigation"
         className="inbox-sidebar"
-        inert={projectPendingRemoval ? true : undefined}
+        inert={projectPendingRemoval || chatPendingRename ? true : undefined}
       >
         <div className="sidebar-header">
           <div className="sidebar-title-row">
@@ -518,8 +670,15 @@ export function InboxWorkspace({
                 <ul aria-label="Active chats" className="chat-list">
                   {selection.unmergedChats.map((chat) => (
                     <ChatRow
+                      activities={activities}
                       chat={chat}
                       key={chat.id}
+                      onRename={(trigger) => {
+                        renameTriggerRef.current = trigger;
+                        setRenameTitle(chat.title);
+                        setRenameError(undefined);
+                        setChatPendingRename(chat);
+                      }}
                       onSelect={() => onSelectChat(chat.id)}
                       selected={selectedChatId === chat.id}
                       setups={setups}
@@ -548,8 +707,15 @@ export function InboxWorkspace({
                   <ul aria-label="Merged chats" className="chat-list chat-list-merged">
                     {selection.mergedChats.map((chat) => (
                       <ChatRow
+                        activities={activities}
                         chat={chat}
                         key={chat.id}
+                        onRename={(trigger) => {
+                          renameTriggerRef.current = trigger;
+                          setRenameTitle(chat.title);
+                          setRenameError(undefined);
+                          setChatPendingRename(chat);
+                        }}
                         onSelect={() => onSelectChat(chat.id)}
                         selected={selectedChatId === chat.id}
                         setups={setups}
@@ -580,7 +746,7 @@ export function InboxWorkspace({
       <section
         aria-label="Chat workspace"
         className="conversation-stage"
-        inert={projectPendingRemoval ? true : undefined}
+        inert={projectPendingRemoval || chatPendingRename ? true : undefined}
       >
         {snapshot.projects.length === 0 ? (
           <EmptyInbox actionError={actionError} onOpenRepository={onOpenRepository} />
@@ -591,10 +757,12 @@ export function InboxWorkspace({
             chat={selectedChat}
             conversationAdapter={conversationAdapter}
             conversationRevision={conversationRevision}
+            initialTranscriptState={transcriptStates.get(selectedChat.id)}
             onCancelSetup={onCancelSetup}
             onOpenTerminal={onOpenTerminal}
             onRequestCodexSignIn={onRequestCodexSignIn}
             onRetrySetup={onRetrySetup}
+            rememberTranscriptState={rememberTranscriptState}
             setups={setups}
           />
         ) : targetProject ? (
@@ -639,6 +807,68 @@ export function InboxWorkspace({
           </AlertDialogContent>
         ) : null}
       </AlertDialog>
+
+      <Dialog
+        onOpenChange={(open) => {
+          if (!open && !renaming) closeRenameDialog();
+        }}
+        open={Boolean(chatPendingRename)}
+      >
+        {chatPendingRename ? (
+          <DialogContent
+            finalFocus={renameTriggerRef}
+            initialFocus={renameInputRef}
+            showCloseButton={false}
+          >
+            <form
+              className="grid gap-4"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void confirmRename();
+              }}
+            >
+              <DialogHeader>
+                <DialogTitle>Rename chat</DialogTitle>
+                <DialogDescription>
+                  The branch and worktree keep their current names.
+                </DialogDescription>
+              </DialogHeader>
+              <label className="grid gap-1.5">
+                <span className="text-xs font-medium">Title</span>
+                <Input
+                  aria-invalid={Boolean(renameError)}
+                  maxLength={72}
+                  onChange={(event) => {
+                    setRenameTitle(event.target.value);
+                    setRenameError(undefined);
+                  }}
+                  onFocus={(event) => event.currentTarget.select()}
+                  ref={renameInputRef}
+                  value={renameTitle}
+                />
+              </label>
+              {renameError ? (
+                <p className="dialog-error" role="alert">
+                  {renameError}
+                </p>
+              ) : null}
+              <DialogFooter>
+                <Button
+                  disabled={renaming}
+                  onClick={closeRenameDialog}
+                  type="button"
+                  variant="outline"
+                >
+                  Cancel
+                </Button>
+                <Button disabled={renaming || !renameTitle.trim()} type="submit">
+                  {renaming ? "Saving" : "Save"}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        ) : null}
+      </Dialog>
     </main>
   );
 }

@@ -23,6 +23,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { DeferredSurface, type DeferredSurfaceName } from "./features/deferred/DeferredSurface";
 import { ProjectDraftController } from "./features/inbox/draft-controller";
+import { ChatActivityController } from "./features/inbox/chat-activity-controller";
 import { InboxWorkspace } from "./features/inbox/InboxWorkspace";
 import { ChatSetupController } from "./features/inbox/setup-controller";
 import { useSystemAppearance } from "./hooks/use-system-appearance";
@@ -42,6 +43,7 @@ import {
   openRepository,
   projectErrorMessage,
   removeProject,
+  renameChat,
   saveProjectDraft,
 } from "./platform/project-inbox";
 import { selectRepositoryDirectory } from "./platform/repository-picker";
@@ -51,7 +53,12 @@ import {
   shutdownRuntimeProcesses,
 } from "./platform/runtime-lifecycle";
 import { listenToWindowClose } from "./platform/window-lifecycle";
-import { type ConversationAdapter, tauriConversationAdapter } from "./platform/conversations";
+import {
+  type ConversationAdapter,
+  listenToConversationEvents,
+  tauriConversationAdapter,
+} from "./platform/conversations";
+import type { PromptAttachment } from "./platform/prompt-attachments";
 
 interface AppProps {
   conversationAdapter?: ConversationAdapter;
@@ -117,10 +124,11 @@ export function App({
   const keepWorkingRef = useRef<HTMLButtonElement>(null);
   const restoreSettingsFocus = useRef(false);
   const [setups] = useState(() => new ChatSetupController());
+  const [activities] = useState(() => new ChatActivityController());
   const [drafts] = useState(() => {
     const controller = new ProjectDraftController(
-      async (projectId, prompt) => {
-        await saveProjectDraft(projectId, prompt);
+      async (projectId, prompt, attachments) => {
+        await saveProjectDraft(projectId, prompt, attachments);
         setSnapshot((current) => controller.overlay(current));
       },
       {
@@ -259,10 +267,10 @@ export function App({
   );
 
   const createProjectChat = useCallback(
-    async (projectId: number, prompt: string) => {
+    async (projectId: number, prompt: string, attachments: readonly PromptAttachment[]) => {
       await drafts.flush(projectId);
       try {
-        const created = await createChat(projectId, prompt);
+        const created = await createChat(projectId, prompt, attachments);
         drafts.forget(projectId);
         setups.reconcile(created.snapshot);
         setSnapshot(created.snapshot);
@@ -340,6 +348,16 @@ export function App({
     [drafts, selectedProjectId],
   );
 
+  const renameSelectedChat = useCallback(async (chatId: string, title: string) => {
+    try {
+      const nextSnapshot = await renameChat(chatId, title);
+      setSnapshot(nextSnapshot);
+      return undefined;
+    } catch (error: unknown) {
+      return projectErrorMessage(error, "Couldn't rename that chat. Try again.");
+    }
+  }, []);
+
   useEffect(() => {
     if (visualReviewState === "loading") return;
     const generation = ++verificationGeneration.current;
@@ -375,6 +393,47 @@ export function App({
       stopListening?.();
     };
   }, [drafts, setups]);
+
+  useEffect(() => {
+    activities.reconcile(snapshot.chats.map((chat) => chat.id));
+  }, [activities, snapshot.chats]);
+
+  useEffect(() => {
+    const visibleChatId = activeSurface === "inbox" && !query.trim() ? selectedChatId : null;
+    activities.select(visibleChatId);
+  }, [activeSurface, activities, query, selectedChatId]);
+
+  useEffect(() => {
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    void listenToConversationEvents((chatId, event) => {
+      if (disposed) return;
+      switch (event.type) {
+        case "turn-started":
+        case "turn-completed":
+        case "turn-failed":
+        case "turn-interrupted":
+        case "turn-stopped":
+          activities.apply(chatId, event);
+          break;
+        case "input-requested":
+          activities.apply(chatId, { type: "needs-input" });
+          break;
+        case "input-resolved":
+          activities.apply(chatId, { type: "input-resolved" });
+          break;
+      }
+    })
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else stopListening = unlisten;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, [activities]);
 
   useEffect(() => {
     let disposed = false;
@@ -427,16 +486,14 @@ export function App({
   return (
     <TooltipProvider>
       <div className="app-shell" data-appearance={appearance}>
-        <header className="titlebar" data-tauri-drag-region>
-          <div aria-label="Più" className="wordmark" data-tauri-drag-region>
-            <span aria-hidden="true" className="wordmark-symbol" data-tauri-drag-region>
+        <header className="titlebar" data-tauri-drag-region="deep">
+          <div aria-label="Più" className="wordmark">
+            <span aria-hidden="true" className="wordmark-symbol">
               π
             </span>
-            <span data-tauri-drag-region>Più</span>
+            <span>Più</span>
           </div>
-          <div className="titlebar-context" data-tauri-drag-region>
-            {titlebarContext}
-          </div>
+          <div className="titlebar-context">{titlebarContext}</div>
         </header>
         {hostStatus === "checking" ? (
           <main className="startup-workspace">
@@ -448,6 +505,7 @@ export function App({
           </main>
         ) : activeSurface === "inbox" ? (
           <InboxWorkspace
+            activities={activities}
             actionError={repositoryActionError}
             conversationAdapter={conversationAdapter}
             conversationRevision={conversationRevision}
@@ -460,6 +518,7 @@ export function App({
             onRequestCodexSignIn={openCodexSignIn}
             onQueryChange={changeQuery}
             onRemoveProject={removeSelectedProject}
+            onRenameChat={renameSelectedChat}
             onRetrySetup={retrySetup}
             onSelectChat={selectChat}
             onSelectProject={selectProject}

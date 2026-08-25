@@ -6,14 +6,17 @@ import {
   conversationErrorMessage,
   conversationRequiresCodexSignIn,
 } from "@/platform/conversations";
+import type { PromptAttachment } from "@/platform/prompt-attachments";
 
-import { ConversationSurface } from "./ConversationSurface";
+import { ConversationSurface, type TranscriptViewState } from "./ConversationSurface";
 import { ConversationController } from "./conversation-controller";
 
 interface ChatConversationPanelProps {
   adapter: ConversationAdapter;
   chatId: string;
+  initialTranscriptState?: TranscriptViewState;
   onRequestCodexSignIn: () => void;
+  onTranscriptStateChange?: (state: TranscriptViewState) => void;
   revision?: number;
 }
 
@@ -31,7 +34,9 @@ function failureMessage(error: unknown) {
 function ConnectedChatConversationPanel({
   adapter,
   chatId,
+  initialTranscriptState,
   onRequestCodexSignIn,
+  onTranscriptStateChange,
   revision = 0,
 }: ChatConversationPanelProps) {
   const controller = useMemo(() => new ConversationController(chatId, adapter), [adapter, chatId]);
@@ -41,6 +46,7 @@ function ConnectedChatConversationPanel({
   }));
   const [attempt, setAttempt] = useState(0);
   const [draft, setDraft] = useState("");
+  const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
   const activeConnection: ConnectionState =
     connection.controller === controller ? connection : { controller, phase: "connecting" };
 
@@ -60,7 +66,16 @@ function ConnectedChatConversationPanel({
     };
   }, [attempt, controller, revision]);
 
-  const send = useCallback((text: string) => controller.send(text), [controller]);
+  const send = useCallback(
+    (text: string, selectedAttachments: readonly PromptAttachment[]) =>
+      controller.send(text, selectedAttachments),
+    [controller],
+  );
+  const answerInput = useCallback(
+    (requestId: string, answer: Parameters<ConversationController["answerInput"]>[1]) =>
+      controller.answerInput(requestId, answer),
+    [controller],
+  );
   const stop = useCallback(() => controller.stop(), [controller]);
   const retry = useCallback(() => {
     setConnection({ controller, phase: "connecting" });
@@ -70,11 +85,16 @@ function ConnectedChatConversationPanel({
   if (activeConnection.phase === "connected") {
     return (
       <ConversationSurface
+        attachments={attachments}
         draft={draft}
+        initialTranscriptState={initialTranscriptState}
+        onAnswerInput={answerInput}
+        onAttachmentsChange={setAttachments}
         onDraftChange={setDraft}
         onRequestCodexSignIn={onRequestCodexSignIn}
         onSend={send}
         onStop={stop}
+        onTranscriptStateChange={onTranscriptStateChange}
         store={controller.store}
       />
     );
@@ -86,9 +106,14 @@ function ConnectedChatConversationPanel({
       : undefined;
     return (
       <ConversationSurface
+        attachments={attachments}
         draft={draft}
+        initialTranscriptState={initialTranscriptState}
+        onAnswerInput={answerInput}
+        onAttachmentsChange={setAttachments}
         onDraftChange={setDraft}
         onRequestCodexSignIn={requestCodexSignIn}
+        onTranscriptStateChange={onTranscriptStateChange}
         recovery={{
           message: failureMessage(activeConnection.error),
           onRequestCodexSignIn: requestCodexSignIn,

@@ -8,6 +8,7 @@ import type { ConversationSnapshot as NativeConversationSnapshot } from "../gene
 import {
   conversationErrorMessage,
   conversationRequiresCodexSignIn,
+  listenToConversationEvents,
   tauriConversationAdapter,
 } from "./conversations";
 
@@ -44,8 +45,15 @@ test("a chat observes its first runtime event and ignores events for other chats
   const receive = vi.fn();
   const snapshot: NativeConversationSnapshot = {
     failure: null,
+    inputRequest: null,
     items: [
-      { kind: "message", id: "message-0", role: "user", text: "Fix the parser." },
+      {
+        kind: "message",
+        id: "message-0",
+        queued: false,
+        role: "user",
+        text: "Fix the parser.",
+      },
       { kind: "reasoning", id: "reasoning-1", text: "Inspecting ownership." },
       {
         kind: "tool",
@@ -63,19 +71,28 @@ test("a chat observes its first runtime event and ignores events for other chats
       },
     ],
     phase: "running",
+    revision: 7,
   };
   boundary.invoke.mockImplementationOnce((command: string) => {
     boundary.order.push(`invoke:${command}`);
     boundary.handler?.({
-      payload: { chatId: "chat-other", event: { type: "turn-stopped" } },
+      payload: { chatId: "chat-other", event: { type: "turn-stopped" }, revision: 1 },
     } as Event<ChatRuntimeChangedEvent>);
     boundary.handler?.({
       payload: {
         chatId: "chat-7",
         event: {
+          beforeItemId: null,
           type: "item-added",
-          item: { kind: "message", id: "message-4", role: "assistant", text: "Done." },
+          item: {
+            kind: "message",
+            id: "message-4",
+            queued: false,
+            role: "assistant",
+            text: "Done.",
+          },
         },
+        revision: 8,
       },
     } as Event<ChatRuntimeChangedEvent>);
     return Promise.resolve(snapshot);
@@ -89,18 +106,34 @@ test("a chat observes its first runtime event and ignores events for other chats
   });
   expect(connection.snapshot).toEqual(snapshot);
   expect(receive).toHaveBeenCalledOnce();
-  expect(receive).toHaveBeenCalledWith({
-    type: "item-added",
-    item: { kind: "message", id: "message-4", role: "assistant", text: "Done." },
-  });
+  expect(receive).toHaveBeenCalledWith(
+    {
+      beforeItemId: null,
+      type: "item-added",
+      item: {
+        kind: "message",
+        id: "message-4",
+        queued: false,
+        role: "assistant",
+        text: "Done.",
+      },
+    },
+    8,
+  );
 });
 
 test("runtime changes preserve every generated event field", async () => {
   const receive = vi.fn<(event: NativeConversationEvent) => void>();
-  boundary.invoke.mockResolvedValue({ failure: null, items: [], phase: "idle" });
+  boundary.invoke.mockResolvedValue({
+    failure: null,
+    inputRequest: null,
+    items: [],
+    phase: "idle",
+  });
   await tauriConversationAdapter.connect("chat-7", receive);
   const events: NativeConversationEvent[] = [
     {
+      beforeItemId: null,
       type: "item-added",
       item: {
         kind: "tool",
@@ -110,6 +143,7 @@ test("runtime changes preserve every generated event field", async () => {
         status: "running",
       },
     },
+    { type: "item-removed", itemId: "message-optimistic" },
     { type: "text-delta", delta: "Fixed", itemId: "message-2" },
     { type: "reasoning-delta", delta: "Checking", itemId: "reasoning-3" },
     { type: "tool-update", detail: "Exit 1", itemId: "tool-1", status: "failed" },
@@ -137,6 +171,7 @@ test("every prompt uses the host command that owns steering behavior", async () 
   boundary.invoke.mockResolvedValue(undefined);
 
   await tauriConversationAdapter.prompt({
+    attachments: [],
     chatId: "chat-7",
     streamingBehavior: "steer",
     text: "Check the ownership boundary.",
@@ -145,6 +180,7 @@ test("every prompt uses the host command that owns steering behavior", async () 
   expect(boundary.invoke).toHaveBeenCalledOnce();
   expect(boundary.invoke).toHaveBeenCalledWith("send_chat_message", {
     request: {
+      attachments: [],
       chatId: "chat-7",
       streamingBehavior: "steer",
       text: "Check the ownership boundary.",
@@ -162,11 +198,51 @@ test("stop aborts the active turn without disposing its runtime", async () => {
   });
 });
 
+test("typed input answers cross the native command boundary unchanged", async () => {
+  boundary.invoke.mockResolvedValue(undefined);
+
+  await tauriConversationAdapter.answerInput("chat-7", "confirm-1", {
+    confirmed: true,
+    kind: "confirmed",
+  });
+
+  expect(boundary.invoke).toHaveBeenCalledWith("answer_conversation_input", {
+    request: {
+      answer: { confirmed: true, kind: "confirmed" },
+      chatId: "chat-7",
+      requestId: "confirm-1",
+    },
+  });
+});
+
+test("the global activity listener preserves chat ownership and typed input events", async () => {
+  const receive = vi.fn();
+  await listenToConversationEvents(receive);
+  const request = {
+    id: "choice-1",
+    kind: "select" as const,
+    message: null,
+    options: ["Keep", "Replace"],
+    placeholder: null,
+    prefill: null,
+    title: "Choose a strategy",
+  };
+
+  boundary.handler?.({
+    payload: { chatId: "chat-background", event: { request, type: "input-requested" } },
+  } as Event<ChatRuntimeChangedEvent>);
+
+  expect(receive).toHaveBeenCalledWith("chat-background", {
+    request,
+    type: "input-requested",
+  });
+});
+
 test("disconnect removes only the listener and leaves the chat runtime active", async () => {
   boundary.invoke.mockImplementation((command: string) => {
     boundary.order.push(command);
     if (command === "open_chat_runtime") {
-      return Promise.resolve({ failure: null, items: [], phase: "stopped" });
+      return Promise.resolve({ failure: null, inputRequest: null, items: [], phase: "stopped" });
     }
     return Promise.reject(new Error("unexpected command"));
   });

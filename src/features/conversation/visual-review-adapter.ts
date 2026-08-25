@@ -2,10 +2,12 @@ import type { ConversationAdapter, ConversationSnapshot } from "@/platform/conve
 
 const VISUAL_REVIEW_SNAPSHOT: ConversationSnapshot = {
   failure: null,
+  inputRequest: null,
   items: [
     {
       id: "review-user",
       kind: "message",
+      queued: false,
       role: "user",
       text: "Verify the packaged runtime before release.",
     },
@@ -17,6 +19,7 @@ const VISUAL_REVIEW_SNAPSHOT: ConversationSnapshot = {
     {
       id: "review-assistant",
       kind: "message",
+      queued: false,
       role: "assistant",
       text: "The packaged runtime is streaming from the stored Pi session.",
     },
@@ -53,6 +56,7 @@ const VISUAL_REVIEW_SNAPSHOT: ConversationSnapshot = {
 };
 
 export const visualReviewConnectionRecoveryAdapter: ConversationAdapter = {
+  answerInput: () => Promise.resolve(),
   connect: () =>
     Promise.reject(
       Object.assign(new Error("Più couldn’t save this conversation. Try again."), {
@@ -64,6 +68,7 @@ export const visualReviewConnectionRecoveryAdapter: ConversationAdapter = {
 };
 
 export const visualReviewConversationAdapter: ConversationAdapter = {
+  answerInput: () => Promise.resolve(),
   connect: () =>
     Promise.resolve({
       disconnect: () => undefined,
@@ -74,15 +79,18 @@ export const visualReviewConversationAdapter: ConversationAdapter = {
 };
 
 export const visualReviewSendRecoveryAdapter: ConversationAdapter = {
+  answerInput: () => Promise.resolve(),
   connect: () =>
     Promise.resolve({
       disconnect: () => undefined,
       snapshot: {
         failure: null,
+        inputRequest: null,
         items: [
           {
             id: "recovery-assistant",
             kind: "message",
+            queued: false,
             role: "assistant",
             text: "Your earlier conversation is safe and ready to continue.",
           },
