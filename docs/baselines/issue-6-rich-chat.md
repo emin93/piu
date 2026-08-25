@@ -12,6 +12,16 @@ The checked-in references are native macOS PNG window captures of the final pack
 
 - `issue-6-rich-chat-light.png`
 - `issue-6-rich-chat-dark.png`
+- `issue-6-unread-completion-light.png`
+- `issue-6-unread-completion-dark.png`
+
+## Packaged background completion and unread evidence
+
+The normal packaged product was restored after the performance run and verified from fresh isolated application data before this review: its accessibility root was `Più`, not the performance entry, and it opened the production empty inbox. A real local repository with a bare `origin/main` was then admitted through the native repository picker. Only the packaged Pi launcher resource was temporarily redirected through the existing `chat-runtime-child.zsh` streaming fixture; the Tauri host, event forwarding, React application, activity controller, inbox, and conversation surfaces remained the production package. No product source was changed, and the normal launcher was restored byte-for-byte after capture.
+
+The fixture delayed its terminal `agent_end` by five seconds so the transition could be observed rather than preseeded. The selected chat first rendered as `running`. A second turn was sent and the project surface was selected immediately; while hidden, the same row remained in place as `running` with `Value: off`. After `agent_end`, the unchanged row exposed the exact accessible name `Inspect the runtime, finished, unread`, remained `Value: off`, and did not reorder. The title gained the unread weight treatment while the status indicator transitioned to the semantic finished color. The Light and Dark references capture that same background-completion state at 1180 × 761 points. Selecting the row afterward changed its accessible name to `Inspect the runtime, finished` with `Value: on`, confirming that selection clears unread without changing the finished state.
+
+The unread treatment is visually restrained but clear at inbox density: heavier title weight carries unread ownership, the finished dot communicates the terminal state separately, and neither appearance introduces a competing badge or layout shift. Contrast, alignment, and truncation remained coherent in both appearances; no design blocker was observed.
 
 ## Runtime and recovery evidence
 
@@ -21,11 +31,13 @@ Current-schema integration tests cover attachment restoration, cancellation, uns
 
 ## Production performance
 
-The packaged WKWebView performance harness used React's production profiling renderer with 24 chats, 180 transcript entries per conversation, progressive streaming, and three 2 MiB image attachments in the active draft. The 60 measured attachment-heavy composer inputs reached the next frame in 17 ms median, 18 ms p95, and 19 ms max, with React commits at 0 ms median, 1 ms p95, and 2 ms max.
+The packaged WKWebView performance harness used React's production profiling renderer with 24 chats, 180 transcript entries per conversation, progressive streaming, and three 2 MiB image attachments in the active draft. The 60 measured attachment-heavy composer inputs reached the next frame in 17 ms median and 19 ms p95/max, with React commits at 0 ms median, 1 ms p95, and 2 ms max.
 
-The 119 measured scrolling intervals ran at 60.04 fps with 17 ms median, 19 ms p95, 20 ms max, and no interval over 20 ms. Simulated streaming ran at 60.01 fps with 17 ms median, 19 ms p95/max, and no interval over 20 ms. Streaming and scrolling React commits were 0 ms median and at most 2 ms.
+The 119 measured scrolling intervals ran at 59.98 fps with 17 ms median and 19 ms p95/max, with no interval over 20 ms. Simulated streaming ran at 60.01 fps with 17 ms median and 19 ms p95/max, also with no interval over 20 ms. Streaming and scrolling React commits were 0 ms median and at most 2 ms.
 
-After one explicit warm transition per locally available surface, chat switches measured 84 ms median, 85 ms p95, and 86 ms max while the underlying React commits remained 0 ms median, 2 ms p95, and 3 ms max. Project/composer navigation measured 16 ms median, 19 ms p95/max, with React commits at 2 ms median and 3 ms max. Every measured interaction stayed within the initial navigation budgets.
+After one explicit warm transition per locally available surface, chat switches measured 83 ms median, 85 ms p95, and 86 ms max while the underlying React commits remained 0 ms median, 2 ms p95, and 4 ms max. Project/composer navigation measured 32 ms median and 35 ms p95/max, with React commits at 2 ms median, 3 ms p95/max. Every measured interaction stayed within the initial navigation budgets.
+
+Each navigation sample includes the first animation frame after the expected production UI is present. The corrected uncached transcript measurement initially reached 102 ms despite a 4 ms maximum React commit, identifying Virtuoso's repeated item measurement as the delay. Più now saves and restores Virtuoso's measured list state and manual scroll position for the 32 most recently visited chats. The runner persists its JSON report, then fails if a visible chat switch exceeds 100 ms, navigation or composer input exceeds 50 ms, or scrolling or streaming records a frame over 20 ms.
 
 Run the deterministic packaged measurement with:
 

@@ -14,6 +14,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -26,6 +27,7 @@ import {
   type FollowOutput,
   type ItemProps,
   type ListProps,
+  type StateSnapshot,
   type VirtuosoHandle,
 } from "react-virtuoso";
 
@@ -53,12 +55,14 @@ import "./conversation.css";
 interface ConversationSurfaceProps {
   attachments?: readonly PromptAttachment[];
   draft?: string;
+  initialTranscriptState?: StateSnapshot;
   onAnswerInput?: (requestId: string, answer: ConversationInputAnswer) => Promise<void>;
   onAttachmentsChange?: (attachments: PromptAttachment[]) => void;
   onDraftChange?: (value: string) => void;
   onRequestCodexSignIn?: () => void;
   onSend?: (text: string, attachments: readonly PromptAttachment[]) => Promise<void>;
   onStop?: () => Promise<void>;
+  onTranscriptStateChange?: (state: StateSnapshot) => void;
   recovery?: {
     message: string;
     onRequestCodexSignIn?: () => void;
@@ -523,12 +527,14 @@ function ConversationComposer({
 export function ConversationSurface({
   attachments: controlledAttachments,
   draft: controlledDraft,
+  initialTranscriptState,
   onAnswerInput,
   onAttachmentsChange,
   onDraftChange,
   onRequestCodexSignIn,
   onSend,
   onStop,
+  onTranscriptStateChange,
   recovery,
   store = EMPTY_CONVERSATION,
 }: ConversationSurfaceProps = {}) {
@@ -588,6 +594,12 @@ export function ConversationSurface({
     },
     [],
   );
+  useLayoutEffect(() => {
+    const transcript = transcriptRef.current;
+    return () => {
+      if (transcript && onTranscriptStateChange) transcript.getState(onTranscriptStateChange);
+    };
+  }, [onTranscriptStateChange]);
 
   const inputRequest = snapshot.inputRequest;
 
@@ -660,9 +672,10 @@ export function ConversationSurface({
           defaultItemHeight={84}
           followOutput={followAppendedTranscript}
           increaseViewportBy={TRANSCRIPT_VIEWPORT_BUFFER}
-          initialTopMostItemIndex={initialTranscriptPosition}
+          initialTopMostItemIndex={initialTranscriptState ? undefined : initialTranscriptPosition}
           itemContent={renderTranscriptItem}
           ref={transcriptRef}
+          restoreStateFrom={initialTranscriptState}
           role="region"
           scrollerRef={trackTranscriptScroller}
         />

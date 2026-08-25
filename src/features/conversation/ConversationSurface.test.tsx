@@ -565,6 +565,33 @@ test("appended turns preserve a manual scroll position", () => {
   expect(mockVirtuosoAutoscrollToBottom).not.toHaveBeenCalled();
 });
 
+test("saves and restores the virtualized transcript state across navigation", () => {
+  const saveTranscriptState = vi.fn();
+  const rendered = render(
+    <ConversationSurface
+      onTranscriptStateChange={saveTranscriptState}
+      store={interactionTranscriptStore()}
+    />,
+  );
+  const transcript = screen.getByRole("region", { name: "Conversation transcript" });
+  transcript.scrollTop = 144;
+
+  rendered.unmount();
+
+  expect(saveTranscriptState).toHaveBeenCalledWith({ ranges: [], scrollTop: 144 });
+
+  render(
+    <ConversationSurface
+      initialTranscriptState={{ ranges: [], scrollTop: 144 }}
+      store={interactionTranscriptStore()}
+    />,
+  );
+  expect(screen.getByRole("region", { name: "Conversation transcript" })).toHaveAttribute(
+    "data-restored-scroll-top",
+    "144",
+  );
+});
+
 test("streaming and appended turns preserve an active transcript selection", () => {
   const store = interactionTranscriptStore();
 

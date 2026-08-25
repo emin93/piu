@@ -14,9 +14,12 @@ function startChat({
   credentialLockDirectory,
   cwd,
   home,
+  modelId = "gpt-5.6-sol",
+  modelProvider = "openai-codex",
   sessionDirectory,
   sessionPath,
   skillPaths,
+  thinkingLevel = "xhigh",
 }) {
   const arguments_ = [
     launcher,
@@ -29,11 +32,11 @@ function startChat({
     "--credential-lock-dir",
     credentialLockDirectory,
     "--model-provider",
-    "openai-codex",
+    modelProvider,
     "--model-id",
-    "gpt-5.6-sol",
+    modelId,
     "--thinking-level",
-    "xhigh",
+    thinkingLevel,
   ];
   for (const skillPath of skillPaths) arguments_.push("--skill", skillPath);
   if (sessionPath) arguments_.push("--session-path", sessionPath);
@@ -105,6 +108,9 @@ function startChat({
   });
 
   return {
+    respondToExtension(response) {
+      child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", ...response })}\n`);
+    },
     async request(command) {
       const id = `contract-${++nextRequest}`;
       const response = new Promise((resolveResponse, rejectResponse) => {
@@ -153,8 +159,248 @@ function startChat({
       assert.deepEqual(result, { code: 0, signal: null });
       assert.equal(stderr, "");
     },
+    async terminate(signal = "SIGKILL") {
+      const result = await new Promise((resolveExit) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolveExit({ code: child.exitCode, signal: child.signalCode });
+          return;
+        }
+        child.once("exit", (code, exitSignal) => resolveExit({ code, signal: exitSignal }));
+        child.kill(signal);
+      });
+      return result;
+    },
   };
 }
+
+test("the real pinned Pi process exposes the rich event contract without external inference", async () => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "piu-event-contract-"));
+  const paths = {
+    agentDirectory: join(fixtureRoot, "app", "agent"),
+    credentialLockDirectory: join(fixtureRoot, "app", "credential-locks"),
+    cwd: join(fixtureRoot, "worktree"),
+    home: join(fixtureRoot, "home"),
+    modelId: "event-matrix",
+    modelProvider: "piu-contract",
+    sessionDirectory: join(fixtureRoot, "app", "sessions"),
+    skillPaths: [],
+    thinkingLevel: "high",
+  };
+  const projectExtensionDirectory = join(paths.cwd, ".pi", "extensions");
+  let chat;
+
+  try {
+    await Promise.all([
+      mkdir(paths.agentDirectory, { recursive: true }),
+      mkdir(paths.credentialLockDirectory, { recursive: true }),
+      mkdir(paths.cwd, { recursive: true }),
+      mkdir(paths.sessionDirectory, { recursive: true }),
+      mkdir(projectExtensionDirectory, { recursive: true }),
+    ]);
+    await writeFile(
+      join(projectExtensionDirectory, "piu-event-contract.js"),
+      `import {
+  Type,
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxThinking,
+  fauxToolCall,
+} from "@earendil-works/pi-ai";
+
+export default function (pi) {
+  const provider = fauxProvider({
+    provider: "piu-contract",
+    models: [{ id: "event-matrix", name: "Più event matrix", reasoning: true }],
+    tokenSize: { min: 100, max: 100 },
+    tokensPerSecond: 5000,
+  });
+  provider.setResponses([
+    fauxAssistantMessage([
+      fauxThinking("contract reasoning"),
+      fauxToolCall("piu_contract_tool", { mode: "complete" }, { id: "piu-tool-complete" }),
+    ], { stopReason: "toolUse" }),
+    fauxAssistantMessage("contract tool finished"),
+    fauxAssistantMessage(
+      fauxToolCall("piu_contract_tool", { mode: "abort" }, { id: "piu-tool-abort" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage([], {
+      stopReason: "error",
+      errorMessage: "contract provider failure",
+    }),
+    fauxAssistantMessage(fauxThinking(\`process interruption \${"x".repeat(100_000)}\`)),
+  ]);
+  pi.registerProvider(provider.provider);
+  pi.registerTool({
+    name: "piu_contract_tool",
+    label: "Più contract tool",
+    description: "Exercise Pi's public tool lifecycle",
+    parameters: Type.Object({ mode: Type.Union([Type.Literal("complete"), Type.Literal("abort")]) }),
+    async execute(_toolCallId, params, signal, onUpdate) {
+      onUpdate?.({ content: [{ type: "text", text: "tool:running" }], details: { mode: params.mode } });
+      if (params.mode === "abort") {
+        await new Promise((_resolve, reject) => {
+          const abort = () => reject(new Error("contract tool aborted"));
+          if (signal?.aborted) abort();
+          else signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return {
+        content: [{ type: "text", text: \`tool:\${params.mode}\` }],
+        details: { mode: params.mode },
+      };
+    },
+  });
+  pi.registerCommand("piu-contract-input", {
+    description: "Exercise Pi's public RPC extension input protocol",
+    handler: async (_args, ctx) => {
+      const answer = await ctx.ui.input("Contract input", "Type approved");
+      pi.sendMessage({
+        customType: "piu-contract-input",
+        content: [{ type: "text", text: \`input:\${answer ?? "cancelled"}\` }],
+        display: true,
+      }, { triggerTurn: false });
+    },
+  });
+}
+`,
+    );
+    chat = startChat(paths);
+    const state = (await chat.request({ type: "get_state" })).data;
+    assert.equal(state.model.provider, "piu-contract");
+    assert.equal(state.model.id, "event-matrix");
+    const commands = (await chat.request({ type: "get_commands" })).data.commands;
+    assert.equal(
+      commands.some((command) => command.name === "piu-contract-input"),
+      true,
+    );
+    const inputRequest = chat.waitForEvent(
+      (event) => event.type === "extension_ui_request" && event.method === "input",
+      "the public extension input request",
+    );
+    const inputResult = chat.waitForEvent(
+      (event) => event.type === "message_end" && event.message?.customType === "piu-contract-input",
+      "the extension's accepted input result",
+    );
+    const inputPrompt = chat.request({ type: "prompt", message: "/piu-contract-input" });
+    const request = await inputRequest;
+    assert.equal(request.title, "Contract input");
+    chat.respondToExtension({ id: request.id, value: "approved" });
+    await inputPrompt;
+    assert.deepEqual((await inputResult).message.content, [
+      { type: "text", text: "input:approved" },
+    ]);
+
+    await chat.request({ type: "set_auto_retry", enabled: false });
+    const reasoningDelta = chat.waitForEvent(
+      (event) =>
+        event.type === "message_update" && event.assistantMessageEvent?.type === "thinking_delta",
+      "the provider's real reasoning delta",
+    );
+    const toolStarted = chat.waitForEvent(
+      (event) => event.type === "tool_execution_start" && event.toolName === "piu_contract_tool",
+      "the extension tool start",
+    );
+    const toolUpdated = chat.waitForEvent(
+      (event) => event.type === "tool_execution_update" && event.toolCallId === "piu-tool-complete",
+      "the extension tool's progressive update",
+    );
+    const toolEnded = chat.waitForEvent(
+      (event) => event.type === "tool_execution_end" && event.toolCallId === "piu-tool-complete",
+      "the extension tool result",
+    );
+    const completedTurn = chat.waitForEvent(
+      (event) => event.type === "agent_end" && event.messages?.length > 0,
+      "the completed provider turn",
+    );
+    await chat.request({ type: "prompt", message: "Exercise reasoning and the owned tool" });
+    assert.equal((await reasoningDelta).assistantMessageEvent.delta, "contract reasoning");
+    assert.equal((await toolStarted).toolCallId, "piu-tool-complete");
+    assert.deepEqual((await toolUpdated).partialResult.content, [
+      { type: "text", text: "tool:running" },
+    ]);
+    assert.equal((await toolEnded).isError, false);
+    assert.equal((await completedTurn).willRetry, false);
+
+    const ownedToolStarted = chat.waitForEvent(
+      (event) => event.type === "tool_execution_start" && event.toolCallId === "piu-tool-abort",
+      "the owned tool that remains active until abort",
+    );
+    const ownedToolEnded = chat.waitForEvent(
+      (event) => event.type === "tool_execution_end" && event.toolCallId === "piu-tool-abort",
+      "the aborted owned tool result",
+    );
+    const abortedTurn = chat.waitForEvent(
+      (event) =>
+        event.type === "agent_end" &&
+        event.messages?.some(
+          (message) =>
+            message.role === "assistant" &&
+            message.content?.some((content) => content.id === "piu-tool-abort"),
+        ),
+      "the aborted agent turn",
+    );
+    await chat.request({ type: "prompt", message: "Abort the owned tool" });
+    await ownedToolStarted;
+    await chat.request({ type: "abort" });
+    assert.equal((await ownedToolEnded).isError, true);
+    assert.equal((await abortedTurn).willRetry, false);
+
+    const failedMessage = chat.waitForEvent(
+      (event) =>
+        event.type === "message_end" &&
+        event.message?.role === "assistant" &&
+        event.message.errorMessage === "contract provider failure",
+      "the provider's failed assistant message",
+    );
+    const failedTurn = chat.waitForEvent(
+      (event) =>
+        event.type === "agent_end" &&
+        event.messages?.some((message) => message.errorMessage === "contract provider failure"),
+      "the failed agent turn",
+    );
+    await chat.request({ type: "prompt", message: "Exercise a failed provider turn" });
+    assert.equal((await failedMessage).message.stopReason, "error");
+    assert.equal((await failedTurn).willRetry, false);
+
+    const beforeInterruption = (await chat.request({ type: "get_state" })).data;
+    const interruptedDelta = chat.waitForEvent(
+      (event) =>
+        event.type === "message_update" &&
+        event.assistantMessageEvent?.type === "thinking_delta" &&
+        event.assistantMessageEvent.delta.startsWith("process interruption"),
+      "the provider delta immediately before process interruption",
+    );
+    await chat.request({ type: "prompt", message: "Interrupt the real Pi process" });
+    await interruptedDelta;
+    const interrupted = (await chat.request({ type: "get_state" })).data;
+    assert.equal(interrupted.isStreaming, true);
+    assert.equal(interrupted.sessionId, beforeInterruption.sessionId);
+    assert.deepEqual(await chat.terminate(), { code: null, signal: "SIGKILL" });
+    chat = undefined;
+
+    chat = startChat({ ...paths, sessionPath: interrupted.sessionFile });
+    const resumed = (await chat.request({ type: "get_state" })).data;
+    assert.equal(resumed.sessionId, interrupted.sessionId);
+    assert.equal(resumed.sessionFile, interrupted.sessionFile);
+    assert.equal(resumed.isStreaming, false);
+    assert.equal(resumed.messageCount, beforeInterruption.messageCount + 1);
+    const resumedMessages = (await chat.request({ type: "get_messages" })).data.messages;
+    assert.equal(resumedMessages.at(-1).role, "user");
+    assert.deepEqual(resumedMessages.at(-1).content, [
+      { type: "text", text: "Interrupt the real Pi process" },
+    ]);
+    await assert.rejects(access(join(paths.agentDirectory, "auth.json")), {
+      code: "ENOENT",
+    });
+    await assert.rejects(access(join(paths.home, ".pi", "agent", "auth.json")), {
+      code: "ENOENT",
+    });
+  } finally {
+    if (chat) await chat.stop().catch(() => {});
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
 
 test("the pinned launcher creates and resumes one exact isolated Pi session", async () => {
   await access(nodeExecutable);

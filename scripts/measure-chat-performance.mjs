@@ -14,6 +14,18 @@ const originalClipboard = spawnSync("pbpaste", { encoding: null }).stdout;
 let app;
 let trace;
 
+function requireAtMost(summary, maximum, label) {
+  if (!summary || summary.max > maximum) {
+    throw new Error(`${label} exceeded ${String(maximum)} ms (max ${String(summary?.max)} ms)`);
+  }
+}
+
+function requireNoSlowFrames(summary, label) {
+  if (!summary || summary.framesOver20ms !== 0) {
+    throw new Error(`${label} recorded ${String(summary?.framesOver20ms)} frames over 20 ms`);
+  }
+}
+
 async function stopChild(child, signal) {
   if (!child || child.exitCode !== null) return;
   child.kill(signal);
@@ -89,8 +101,13 @@ try {
   );
 
   const report = await clipboardResult(45_000);
-  if (report.error) throw new Error(report.error);
   await writeFile(resultPath, `${JSON.stringify(report, null, 2)}\n`);
+  if (report.error) throw new Error(report.error);
+  requireAtMost(report.chatSwitchVisibleNextFrameMs, 100, "Visible chat switching");
+  requireAtMost(report.navigationVisibleNextFrameMs, 50, "Visible project navigation");
+  requireAtMost(report.composerInputNextFrameMs, 50, "Composer input");
+  requireNoSlowFrames(report.scrollingFrames, "Transcript scrolling");
+  requireNoSlowFrames(report.streamingFrames, "Transcript streaming");
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   process.stdout.write(`RESULT_PATH=${resultPath}\nTRACE_PATH=${tracePath}\n`);
 } finally {

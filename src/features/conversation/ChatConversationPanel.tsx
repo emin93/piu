@@ -1,5 +1,6 @@
 import { LoaderCircleIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import type { StateSnapshot } from "react-virtuoso";
 
 import {
   type ConversationAdapter,
@@ -14,7 +15,9 @@ import { ConversationController } from "./conversation-controller";
 interface ChatConversationPanelProps {
   adapter: ConversationAdapter;
   chatId: string;
+  initialTranscriptState?: StateSnapshot;
   onRequestCodexSignIn: () => void;
+  onTranscriptStateChange?: (state: StateSnapshot) => void;
   revision?: number;
 }
 
@@ -32,7 +35,9 @@ function failureMessage(error: unknown) {
 function ConnectedChatConversationPanel({
   adapter,
   chatId,
+  initialTranscriptState,
   onRequestCodexSignIn,
+  onTranscriptStateChange,
   revision = 0,
 }: ChatConversationPanelProps) {
   const controller = useMemo(() => new ConversationController(chatId, adapter), [adapter, chatId]);
@@ -83,12 +88,14 @@ function ConnectedChatConversationPanel({
       <ConversationSurface
         attachments={attachments}
         draft={draft}
+        initialTranscriptState={initialTranscriptState}
         onAnswerInput={answerInput}
         onAttachmentsChange={setAttachments}
         onDraftChange={setDraft}
         onRequestCodexSignIn={onRequestCodexSignIn}
         onSend={send}
         onStop={stop}
+        onTranscriptStateChange={onTranscriptStateChange}
         store={controller.store}
       />
     );
@@ -102,10 +109,12 @@ function ConnectedChatConversationPanel({
       <ConversationSurface
         attachments={attachments}
         draft={draft}
+        initialTranscriptState={initialTranscriptState}
         onAnswerInput={answerInput}
         onAttachmentsChange={setAttachments}
         onDraftChange={setDraft}
         onRequestCodexSignIn={requestCodexSignIn}
+        onTranscriptStateChange={onTranscriptStateChange}
         recovery={{
           message: failureMessage(activeConnection.error),
           onRequestCodexSignIn: requestCodexSignIn,

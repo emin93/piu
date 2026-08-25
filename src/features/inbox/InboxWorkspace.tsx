@@ -18,6 +18,7 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
+import type { StateSnapshot } from "react-virtuoso";
 
 import {
   AlertDialog,
@@ -183,24 +184,45 @@ const ProjectFilter = memo(function ProjectFilter({
 });
 
 const ChatConversationPanel = lazy(() => import("../conversation/ChatConversationPanel"));
+const MAX_CACHED_TRANSCRIPT_STATES = 32;
+
+class TranscriptStateCache {
+  readonly #states = new Map<string, StateSnapshot>();
+
+  get(chatId: string) {
+    return this.#states.get(chatId);
+  }
+
+  remember(chatId: string, state: StateSnapshot) {
+    this.#states.delete(chatId);
+    this.#states.set(chatId, state);
+    if (this.#states.size <= MAX_CACHED_TRANSCRIPT_STATES) return;
+    const oldestChatId = this.#states.keys().next().value;
+    if (oldestChatId) this.#states.delete(oldestChatId);
+  }
+}
 
 function SelectedChatStage({
   chat,
   conversationAdapter,
   conversationRevision,
+  initialTranscriptState,
   onCancelSetup,
   onOpenTerminal,
   onRequestCodexSignIn,
   onRetrySetup,
+  rememberTranscriptState,
   setups,
 }: {
   chat: ChatSummary;
   conversationAdapter: ConversationAdapter;
   conversationRevision: number;
+  initialTranscriptState?: StateSnapshot;
   onCancelSetup: (chatId: string) => Promise<string | undefined>;
   onOpenTerminal: (chatId: string) => Promise<string | undefined>;
   onRequestCodexSignIn: () => void;
   onRetrySetup: (chatId: string) => Promise<string | undefined>;
+  rememberTranscriptState: (chatId: string, state: StateSnapshot) => void;
   setups: ChatSetupController;
 }) {
   const subscribe = useCallback(
@@ -210,6 +232,10 @@ function SelectedChatStage({
   const getSnapshot = useCallback(() => setups.get(chat.id), [chat.id, setups]);
   const setup = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   const ready = setup.phase === "notRequired" || setup.phase === "succeeded";
+  const saveTranscriptState = useCallback(
+    (state: StateSnapshot) => rememberTranscriptState(chat.id, state),
+    [chat.id, rememberTranscriptState],
+  );
 
   if (!ready) {
     return (
@@ -234,8 +260,10 @@ function SelectedChatStage({
       <ChatConversationPanel
         adapter={conversationAdapter}
         chatId={chat.id}
+        initialTranscriptState={initialTranscriptState}
         key={chat.id}
         onRequestCodexSignIn={onRequestCodexSignIn}
+        onTranscriptStateChange={saveTranscriptState}
         revision={conversationRevision}
       />
     </Suspense>
@@ -472,6 +500,7 @@ export function InboxWorkspace({
   const [renaming, setRenaming] = useState(false);
   const renameInputRef = useRef<HTMLInputElement>(null);
   const renameTriggerRef = useRef<HTMLButtonElement>(null);
+  const transcriptStates = useMemo(() => new TranscriptStateCache(), []);
   const selection = useMemo(
     () => selectInbox(snapshot, { projectId: selectedProjectId, query }),
     [query, selectedProjectId, snapshot],
@@ -479,6 +508,12 @@ export function InboxWorkspace({
   const targetProject = composerProject(snapshot, selectedProjectId);
   const selectedChat = snapshot.chats.find(({ id }) => id === selectedChatId);
   const visibleChatCount = selection.unmergedChats.length;
+  const rememberTranscriptState = useCallback(
+    (chatId: string, state: StateSnapshot) => {
+      transcriptStates.remember(chatId, state);
+    },
+    [transcriptStates],
+  );
 
   const closeRemovalDialog = useCallback(() => {
     setProjectPendingRemoval(undefined);
@@ -711,10 +746,12 @@ export function InboxWorkspace({
             chat={selectedChat}
             conversationAdapter={conversationAdapter}
             conversationRevision={conversationRevision}
+            initialTranscriptState={transcriptStates.get(selectedChat.id)}
             onCancelSetup={onCancelSetup}
             onOpenTerminal={onOpenTerminal}
             onRequestCodexSignIn={onRequestCodexSignIn}
             onRetrySetup={onRetrySetup}
+            rememberTranscriptState={rememberTranscriptState}
             setups={setups}
           />
         ) : targetProject ? (

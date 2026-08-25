@@ -209,6 +209,10 @@ function PerformanceReview() {
         "the initial transcript",
       );
 
+      await waitFor(
+        () => Boolean(document.querySelector('[data-chat-id="performance-chat-1"] button')),
+        "the warm chat target",
+      );
       click('[data-chat-id="performance-chat-1"] button');
       await waitFor(
         () => visibleText("Conversation marker performance-chat-1"),
@@ -231,13 +235,18 @@ function PerformanceReview() {
       const chatSwitchSamples: number[] = [];
       for (let index = 0; index < CHAT_SWITCH_SAMPLES; index += 1) {
         const chatId = `performance-chat-${index % 2}`;
+        const chatSelector = `[data-chat-id="${chatId}"] button`;
+        await waitFor(
+          () => Boolean(document.querySelector(chatSelector)),
+          `chat switch target ${index}`,
+        );
         currentScenario.current = "chatSwitch";
         const startedAt = performance.now();
-        click(`[data-chat-id="${chatId}"] button`);
+        click(chatSelector);
         await waitFor(() => visibleText(`Conversation marker ${chatId}`), `chat switch ${index}`);
+        await nextFrame();
         chatSwitchSamples.push(performance.now() - startedAt);
         currentScenario.current = undefined;
-        await nextFrame();
       }
 
       setStatus("Measuring project/composer navigation");
@@ -250,9 +259,9 @@ function PerformanceReview() {
           () => Boolean(document.querySelector('textarea[aria-label="Draft for Atlas"]')),
           `composer navigation ${index}`,
         );
+        await nextFrame();
         navigationSamples.push(performance.now() - startedAt);
         currentScenario.current = undefined;
-        await nextFrame();
         click('[data-chat-id="performance-chat-0"] button');
         await waitFor(
           () => visibleText("Conversation marker performance-chat-0"),
@@ -326,10 +335,10 @@ function PerformanceReview() {
 
       const report = {
         browser: navigator.userAgent,
-        chatSwitchMs: summarize(chatSwitchSamples),
+        chatSwitchVisibleNextFrameMs: summarize(chatSwitchSamples),
         composerInputNextFrameMs: summarize(inputSamples),
         method: "packaged WKWebView, production bundle with react-dom/profiling",
-        navigationNextFrameMs: summarize(navigationSamples),
+        navigationVisibleNextFrameMs: summarize(navigationSamples),
         reactCommitMs: Object.fromEntries(
           Object.entries(commitDurations.current).map(([scenario, durations]) => [
             scenario,
