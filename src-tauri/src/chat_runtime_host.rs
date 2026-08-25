@@ -1911,6 +1911,27 @@ impl ChatRuntimeHost {
         self.stop_slot(chat_id).await
     }
 
+    pub async fn retire_for_deletion(&self, chat_id: &str) -> Result<(), ChatRuntimeHostError> {
+        let slot = self.slot(chat_id)?;
+        let operation = slot.operation.lock().await;
+        let active = slot
+            .active
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)?
+            .take();
+        if let Some(active) = active {
+            active.stop_events.cancel();
+            active.child.shutdown().await?;
+        }
+        self.inner
+            .slots
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)?
+            .remove(chat_id);
+        drop(operation);
+        Ok(())
+    }
+
     async fn stop_slot(&self, chat_id: &str) -> Result<(), ChatRuntimeHostError> {
         let slot = self.slot(chat_id)?;
         let _operation = slot.operation.lock().await;

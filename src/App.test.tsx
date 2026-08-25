@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, expect, test, vi } from "vitest";
 
@@ -18,6 +18,7 @@ const windowLifecycle = vi.hoisted(() => ({
   resolveRequest: undefined as (() => Promise<void>) | undefined,
 }));
 const projectInbox = vi.hoisted(() => ({
+  delete: vi.fn(),
   listen: vi.fn(),
   load: vi.fn(),
   open: vi.fn(),
@@ -67,6 +68,7 @@ vi.mock("./platform/window-lifecycle", () => ({
 }));
 vi.mock("./platform/project-inbox", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./platform/project-inbox")>()),
+  deleteChat: projectInbox.delete,
   listenToProjectInbox: projectInbox.listen,
   loadProjectInbox: projectInbox.load,
   openRepository: projectInbox.open,
@@ -143,6 +145,7 @@ const missingModel = {
 };
 
 beforeEach(() => {
+  window.localStorage.clear();
   boundary.verify.mockReset();
   boundary.verify.mockResolvedValue({
     correlationId: "test-boundary",
@@ -158,6 +161,7 @@ beforeEach(() => {
   runtimeLifecycle.exit.mockResolvedValue(undefined);
   projectInbox.load.mockReset();
   projectInbox.load.mockResolvedValue(emptySnapshot);
+  projectInbox.delete.mockReset();
   projectInbox.open.mockReset();
   projectInbox.remove.mockReset();
   projectInbox.saveDraft.mockReset();
@@ -387,7 +391,7 @@ test("background activity becomes unread without reordering chats and clears on 
   const user = userEvent.setup();
 
   render(<App />);
-  const rows = await screen.findByRole("list", { name: "Active chats" });
+  const rows = await screen.findByRole("list", { name: "Chat inbox" });
   expect(
     Array.from(rows.querySelectorAll<HTMLElement>("[data-chat-id]")).map(
       (row) => row.dataset.chatId,
@@ -440,6 +444,102 @@ test("background activity becomes unread without reordering chats and clears on 
   const newerRow = rows.querySelector<HTMLElement>('[data-chat-id="chat-newer"]');
   expect(newerRow).toHaveAttribute("data-activity", "interrupted");
   expect(newerRow).toHaveAttribute("data-unread", "true");
+});
+
+test("deleting the selected chat keeps the stable next row selected", async () => {
+  installMatchMedia("light");
+  const setup = {
+    attempt: 1,
+    exitCode: 0,
+    failure: null,
+    log: "",
+    phase: "succeeded" as const,
+    signal: null,
+  };
+  const chats = [
+    {
+      branchName: "agent/newer",
+      createdAtMs: 30,
+      id: "chat-newer",
+      mergeState: "unmerged" as const,
+      projectId: 1,
+      projectName: "Atlas",
+      pullRequestNumber: null,
+      setup,
+      title: "Newer chat",
+    },
+    {
+      branchName: "agent/middle",
+      createdAtMs: 20,
+      id: "chat-middle",
+      mergeState: "unmerged" as const,
+      projectId: 1,
+      projectName: "Atlas",
+      pullRequestNumber: null,
+      setup,
+      title: "Middle chat",
+    },
+    {
+      branchName: "agent/older",
+      createdAtMs: 10,
+      id: "chat-older",
+      mergeState: "unmerged" as const,
+      projectId: 1,
+      projectName: "Atlas",
+      pullRequestNumber: null,
+      setup,
+      title: "Older chat",
+    },
+  ];
+  const project = {
+    availability: "available" as const,
+    id: 1,
+    name: "Atlas",
+    unmergedChatCount: 3,
+  };
+  projectInbox.load.mockResolvedValueOnce({ chats, drafts: [], projects: [project] });
+  projectInbox.delete.mockResolvedValueOnce({
+    chats: chats.filter(({ id }) => id !== "chat-middle"),
+    drafts: [],
+    projects: [{ ...project, unmergedChatCount: 2 }],
+  });
+  const user = userEvent.setup();
+
+  render(<App />);
+  await user.click(await screen.findByRole("button", { name: "Middle chat, idle" }));
+  const middleRow = document.querySelector<HTMLElement>('[data-chat-id="chat-middle"]');
+  expect(middleRow).not.toBeNull();
+  await user.click(
+    within(middleRow as HTMLElement).getByRole("button", { name: "More chat actions" }),
+  );
+  await user.click(await screen.findByRole("menuitem", { name: "Delete chat" }));
+  await user.click(
+    within(screen.getByRole("alertdialog")).getByRole("button", { name: "Delete chat" }),
+  );
+
+  expect(projectInbox.delete).toHaveBeenCalledWith("chat-middle");
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Older chat, idle" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    ),
+  );
+  expect(screen.getByText("Older chat", { selector: ".titlebar-context" })).toBeVisible();
+});
+
+test("a removed remembered project scope falls back to All Projects", async () => {
+  installMatchMedia("light");
+  window.localStorage.setItem("piu.inbox-scope.v1", "2");
+  projectInbox.load.mockResolvedValueOnce({
+    chats: [],
+    drafts: [],
+    projects: [{ availability: "available", id: 1, name: "Atlas", unmergedChatCount: 0 }],
+  });
+
+  render(<App />);
+
+  expect(await screen.findByRole("button", { name: "Project scope: All Projects" })).toBeVisible();
+  expect(window.localStorage.getItem("piu.inbox-scope.v1")).toBe("all");
 });
 
 test("first send creates a durable chat and moves into streamed setup", async () => {
@@ -565,7 +665,8 @@ test("Settings preserves the selected project and its draft when returning to In
   render(<App />);
 
   const draft = await screen.findByRole("textbox", { name: "Draft for Atlas" });
-  await user.click(screen.getByRole("button", { name: /Atlas, available/ }));
+  await user.click(screen.getByRole("button", { name: "Project scope: All Projects" }));
+  await user.click(await screen.findByRole("menuitemradio", { name: "Atlas" }));
   await user.type(draft, " while away");
   await user.click(screen.getByRole("button", { name: "Settings" }));
 
@@ -579,10 +680,7 @@ test("Settings preserves the selected project and its draft when returning to In
   expect(await screen.findByRole("textbox", { name: "Draft for Atlas" })).toHaveValue(
     "Keep this draft while away",
   );
-  expect(screen.getByRole("button", { name: /Atlas, available/ })).toHaveAttribute(
-    "aria-pressed",
-    "true",
-  );
+  expect(screen.getByRole("button", { name: "Project scope: Atlas" })).toBeVisible();
   expect(screen.getByText("Atlas", { selector: ".titlebar-context" })).toBeVisible();
   await waitFor(() => expect(screen.getByRole("button", { name: "Settings" })).toHaveFocus());
 });
@@ -626,10 +724,7 @@ test("launch keeps All Projects selected and focuses the first available project
 
   render(<App />);
 
-  expect(await screen.findByRole("button", { name: "All Projects, 2 projects" })).toHaveAttribute(
-    "aria-pressed",
-    "true",
-  );
+  expect(await screen.findByRole("button", { name: "Project scope: All Projects" })).toBeVisible();
   const composer = screen.getByRole("textbox", { name: "Draft for Atlas" });
   expect(composer).toHaveValue("Continue the parser work");
   await waitFor(() => expect(composer).toHaveFocus());
@@ -702,7 +797,8 @@ test("draft changes update immediately and cross the persistence boundary", asyn
   const user = userEvent.setup();
 
   render(<App />);
-  await user.click(await screen.findByRole("button", { name: /Atlas, available/ }));
+  await user.click(await screen.findByRole("button", { name: "Project scope: All Projects" }));
+  await user.click(await screen.findByRole("menuitemradio", { name: "Atlas" }));
   await user.type(screen.getByRole("textbox", { name: "Draft for Atlas" }), "Fix parsing");
 
   expect(screen.getByRole("textbox", { name: "Draft for Atlas" })).toHaveValue("Fix parsing");
@@ -724,9 +820,11 @@ test("draft navigation flushes the pending value before the debounce", async () 
   const user = userEvent.setup();
 
   render(<App />);
-  await user.click(await screen.findByRole("button", { name: /Atlas, available/ }));
+  await user.click(await screen.findByRole("button", { name: "Project scope: All Projects" }));
+  await user.click(await screen.findByRole("menuitemradio", { name: "Atlas" }));
   await user.type(screen.getByRole("textbox", { name: "Draft for Atlas" }), "Flush me");
-  await user.click(screen.getByRole("button", { name: "All Projects, 1 project" }));
+  await user.click(screen.getByRole("button", { name: "Project scope: Atlas" }));
+  await user.click(await screen.findByRole("menuitemradio", { name: "All Projects" }));
 
   expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Flush me", []);
 });
@@ -740,7 +838,8 @@ test("a native close waits for the pending draft flush and owned runtimes", asyn
   });
   const user = userEvent.setup();
   render(<App />);
-  await user.click(await screen.findByRole("button", { name: /Atlas, available/ }));
+  await user.click(await screen.findByRole("button", { name: "Project scope: All Projects" }));
+  await user.click(await screen.findByRole("menuitemradio", { name: "Atlas" }));
   await user.type(screen.getByRole("textbox", { name: "Draft for Atlas" }), "Close safely");
 
   await act(async () => {
@@ -783,7 +882,8 @@ test("confirming an active-turn close persists drafts, stops runtimes, and exits
   });
   const user = userEvent.setup();
   render(<App />);
-  await user.click(await screen.findByRole("button", { name: /Atlas, available/ }));
+  await user.click(await screen.findByRole("button", { name: "Project scope: All Projects" }));
+  await user.click(await screen.findByRole("menuitemradio", { name: "Atlas" }));
   await user.type(screen.getByRole("textbox", { name: "Draft for Atlas" }), "Close safely");
 
   await act(async () => {
@@ -807,7 +907,8 @@ test("a failed draft save never claims the draft is saved", async () => {
   const user = userEvent.setup();
 
   render(<App />);
-  await user.click(await screen.findByRole("button", { name: /Atlas, available/ }));
+  await user.click(await screen.findByRole("button", { name: "Project scope: All Projects" }));
+  await user.click(await screen.findByRole("menuitemradio", { name: "Atlas" }));
   await user.type(screen.getByRole("textbox", { name: "Draft for Atlas" }), "Keep me");
 
   expect(await screen.findByText(/Couldn't save this draft/)).toBeVisible();

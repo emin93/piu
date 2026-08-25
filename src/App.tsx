@@ -26,6 +26,8 @@ import type { ReasoningEffort } from "@/generated/ReasoningEffort";
 import { DeferredSurface, type DeferredSurfaceName } from "./features/deferred/DeferredSurface";
 import { ProjectDraftController } from "./features/inbox/draft-controller";
 import { ChatActivityController } from "./features/inbox/chat-activity-controller";
+import { selectInbox } from "./features/inbox/inbox-model";
+import { readRememberedProjectScope, rememberProjectScope } from "./features/inbox/inbox-scope";
 import { InboxWorkspace } from "./features/inbox/InboxWorkspace";
 import { ChatSetupController } from "./features/inbox/setup-controller";
 import { useSystemAppearance } from "./hooks/use-system-appearance";
@@ -40,11 +42,11 @@ import {
 import { verifyHostBoundary } from "./platform/host-boundary";
 import {
   type InboxSnapshot,
+  deleteChat,
   listenToProjectInbox,
   loadProjectInbox,
   openRepository,
   projectErrorMessage,
-  removeProject,
   renameChat,
   saveProjectDraft,
 } from "./platform/project-inbox";
@@ -72,6 +74,18 @@ interface AppProps {
 
 const EMPTY_INBOX: InboxSnapshot = { projects: [], drafts: [], chats: [] };
 const CodexSignInDialog = lazy(() => import("./features/auth/CodexSignInDialog"));
+
+function validRememberedProjectScope(snapshot: InboxSnapshot) {
+  const rememberedProjectId = readRememberedProjectScope();
+  if (
+    rememberedProjectId === null ||
+    snapshot.projects.some((project) => project.id === rememberedProjectId)
+  ) {
+    return rememberedProjectId;
+  }
+  rememberProjectScope(null);
+  return null;
+}
 
 function StartupFailure({ onRetry }: { onRetry: () => void }) {
   return (
@@ -113,7 +127,9 @@ export function App({
   const [activeSurface, setActiveSurface] = useState<"inbox" | DeferredSurfaceName>(surface);
   const [hostStatus, setHostStatus] = useState<"checking" | "ready" | "failed">("checking");
   const [snapshot, setSnapshot] = useState<InboxSnapshot>(EMPTY_INBOX);
-  const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
+  const [selectedProjectId, setSelectedProjectId] = useState<number | null>(
+    readRememberedProjectScope,
+  );
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [repositoryActionError, setRepositoryActionError] = useState<string>();
@@ -149,6 +165,7 @@ export function App({
           drafts.reconcile(loadedSnapshot);
           setups.reconcile(loadedSnapshot);
           setSnapshot(drafts.overlay(loadedSnapshot));
+          setSelectedProjectId(validRememberedProjectScope(loadedSnapshot));
           if (
             visualReviewState === "connectionRecovery" ||
             visualReviewState === "conversation" ||
@@ -239,6 +256,7 @@ export function App({
         drafts.reconcile(opened.snapshot);
         setups.reconcile(opened.snapshot);
         setSnapshot(drafts.overlay(opened.snapshot));
+        rememberProjectScope(opened.focusedProjectId);
         setSelectedProjectId(opened.focusedProjectId);
         setSelectedChatId(null);
         setQuery("");
@@ -250,14 +268,20 @@ export function App({
     })();
   }, [drafts, flushAllDrafts, onOpenRepository, setups]);
 
-  const selectProject = useCallback(
+  const changeProjectScope = useCallback(
     (projectId: number | null) => {
       void flushAllDrafts().catch(() => undefined);
+      rememberProjectScope(projectId);
       setSelectedProjectId(projectId);
-      setSelectedChatId(null);
     },
     [flushAllDrafts],
   );
+
+  const startNewChat = useCallback(() => {
+    void flushAllDrafts().catch(() => undefined);
+    setSelectedChatId(null);
+    setQuery("");
+  }, [flushAllDrafts]);
 
   const selectChat = useCallback(
     (chatId: string) => {
@@ -282,7 +306,6 @@ export function App({
         drafts.forget(projectId);
         setups.reconcile(created.snapshot);
         setSnapshot(created.snapshot);
-        setSelectedProjectId(created.chat.projectId);
         setSelectedChatId(created.chat.id);
         setQuery("");
         return undefined;
@@ -335,27 +358,6 @@ export function App({
     [flushAllDrafts, query],
   );
 
-  const removeSelectedProject = useCallback(
-    async (projectId: number) => {
-      const draftBeforeRemoval = drafts.get(projectId);
-      drafts.cancel(projectId);
-      try {
-        const nextSnapshot = await removeProject(projectId);
-        drafts.forget(projectId);
-        drafts.reconcile(nextSnapshot);
-        setSnapshot(drafts.overlay(nextSnapshot));
-        if (selectedProjectId === projectId) setSelectedProjectId(null);
-        return undefined;
-      } catch (error: unknown) {
-        if (draftBeforeRemoval.status.state === "saving") {
-          drafts.change(projectId, draftBeforeRemoval.prompt);
-        }
-        return projectErrorMessage(error, "Couldn't remove that project. Try again.");
-      }
-    },
-    [drafts, selectedProjectId],
-  );
-
   const renameSelectedChat = useCallback(async (chatId: string, title: string) => {
     try {
       const nextSnapshot = await renameChat(chatId, title);
@@ -365,6 +367,39 @@ export function App({
       return projectErrorMessage(error, "Couldn't rename that chat. Try again.");
     }
   }, []);
+
+  const deleteSelectedChat = useCallback(
+    async (chatId: string) => {
+      const previousChats = selectInbox(snapshot, {
+        projectId: selectedProjectId,
+        query,
+      });
+      const previousOrder = [...previousChats.unmergedChats, ...previousChats.mergedChats];
+      const deletedIndex = previousOrder.findIndex((chat) => chat.id === chatId);
+      try {
+        const nextSnapshot = await deleteChat(chatId);
+        drafts.reconcile(nextSnapshot);
+        setups.reconcile(nextSnapshot);
+        const nextWithDrafts = drafts.overlay(nextSnapshot);
+        setSnapshot(nextWithDrafts);
+        setSelectedChatId((current) => {
+          if (current !== chatId) return current;
+          const nextChats = selectInbox(nextWithDrafts, {
+            projectId: selectedProjectId,
+            query,
+          });
+          const nextOrder = [...nextChats.unmergedChats, ...nextChats.mergedChats];
+          if (nextOrder.length === 0) return null;
+          const neighborIndex = deletedIndex < 0 ? 0 : Math.min(deletedIndex, nextOrder.length - 1);
+          return nextOrder[neighborIndex]?.id ?? null;
+        });
+        return undefined;
+      } catch (error: unknown) {
+        return projectErrorMessage(error, "Couldn't delete that chat. Try again.");
+      }
+    },
+    [drafts, query, selectedProjectId, setups, snapshot],
+  );
 
   useEffect(() => {
     if (visualReviewState === "loading") return;
@@ -389,7 +424,12 @@ export function App({
       drafts.reconcile(event.snapshot);
       setups.reconcile(event.snapshot);
       setSnapshot(drafts.overlay(event.snapshot));
-      if (event.focusedProjectId !== null) setSelectedProjectId(event.focusedProjectId);
+      if (event.focusedProjectId !== null) {
+        rememberProjectScope(event.focusedProjectId);
+        setSelectedProjectId(event.focusedProjectId);
+      } else {
+        setSelectedProjectId(validRememberedProjectScope(event.snapshot));
+      }
     })
       .then((unlisten) => {
         if (disposed) unlisten();
@@ -522,16 +562,17 @@ export function App({
             drafts={drafts}
             onCancelSetup={cancelSetup}
             onCreateChat={createProjectChat}
+            onDeleteChat={deleteSelectedChat}
+            onNewChat={startNewChat}
             onOpenRepository={openSelectedRepository}
             onOpenTerminal={openTerminal}
             onOpenSettings={openSettings}
             onRequestCodexSignIn={openCodexSignIn}
+            onProjectScopeChange={changeProjectScope}
             onQueryChange={changeQuery}
-            onRemoveProject={removeSelectedProject}
             onRenameChat={renameSelectedChat}
             onRetrySetup={retrySetup}
             onSelectChat={selectChat}
-            onSelectProject={selectProject}
             query={query}
             selectedChatId={selectedChatId}
             selectedProjectId={selectedProjectId}

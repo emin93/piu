@@ -246,35 +246,35 @@
 .sidebar-header {
   display: grid;
   gap: 8px;
-  padding: 12px 8px 8px;
+  padding: 10px 8px 8px;
 }
 
-.sidebar-title-row,
-.sidebar-title-actions {
-  display: flex;
+.sidebar-search-row,
+.sidebar-scope-row {
+  display: grid;
   align-items: center;
+  min-width: 0;
 }
 
-.sidebar-title-row {
-  justify-content: space-between;
-  min-height: 28px;
-  padding-left: 3px;
+.sidebar-search-row {
+  grid-template-columns: minmax(0, 1fr) 32px;
+  gap: 6px;
 }
 
-.sidebar-title-row h1 {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 610;
-  letter-spacing: -0.018em;
-}
-
-.sidebar-title-actions {
+.sidebar-scope-row {
+  grid-template-columns: minmax(0, 1fr) 32px;
   gap: 2px;
+}
+
+.sidebar-new-chat-action {
+  width: 32px;
+  min-height: 32px;
 }
 
 .search-field {
   position: relative;
   display: block;
+  min-width: 0;
 }
 
 .search-field > svg {
@@ -291,8 +291,38 @@
 
 .search-field input {
   width: 100%;
+  height: 32px;
   padding-left: 28px;
   background: color-mix(in oklab, var(--background) 42%, transparent);
+}
+
+.project-scope-trigger {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) 14px;
+  gap: 7px;
+  justify-content: stretch;
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  padding: 0 7px;
+  color: var(--sidebar-foreground);
+  font-size: 12px;
+  text-align: left;
+}
+
+.project-scope-trigger > span:nth-child(2) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-scope-trigger > svg {
+  width: 13px;
+  color: var(--muted-foreground);
+}
+
+.project-scope-menu {
+  min-width: max(220px, var(--anchor-width));
 }
 
 .sidebar-error,
@@ -313,7 +343,7 @@
 
 .sidebar-scroll-content {
   display: grid;
-  gap: 12px;
+  gap: 8px;
   padding: 4px 8px 16px;
 }
 
@@ -328,125 +358,15 @@
   color: var(--muted-foreground);
 }
 
-.sidebar-section-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  min-height: 24px;
-  padding: 0 8px;
-  color: var(--muted-foreground);
-  font-size: 11px;
-  font-weight: 510;
-}
-
-.project-filters ul,
-.draft-list,
 .chat-list {
   margin: 0;
   padding: 0;
   list-style: none;
-}
-
-.all-projects-filter {
-  width: 100%;
-  justify-content: space-between;
-  min-height: 32px;
-  padding: 0 8px;
-  color: var(--sidebar-foreground);
-  font-size: 12px;
-}
-
-.all-projects-filter[aria-pressed="true"],
-.project-row-select[aria-pressed="true"] {
-  background: var(--sidebar-accent);
-  color: var(--sidebar-accent-foreground);
-}
-
-.project-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 28px;
-  align-items: center;
-  min-width: 0;
-}
-
-.project-row-select {
-  display: grid;
-  grid-template-columns: 8px minmax(0, 1fr);
-  gap: 8px;
-  justify-content: stretch;
-  width: 100%;
-  min-width: 0;
-  min-height: 40px;
-  padding: 4px 8px;
-  text-align: left;
-}
-
-.project-availability {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--success);
-}
-
-.project-availability:not([data-availability="available"]) {
-  background: var(--warning);
-}
-
-.project-row-copy {
-  display: grid;
-  min-width: 0;
-  line-height: 1.25;
-}
-
-.project-row-name,
-.project-row-copy > span:last-child,
-.draft-row-project,
-.draft-row-prompt,
-.chat-row-copy h3,
-.chat-row-copy p span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.project-row-name,
-.draft-row-prompt {
-  color: var(--sidebar-foreground);
-}
-
-.project-row-name {
-  font-size: 12px;
-  font-weight: 540;
-}
-
-.project-row-copy > span:last-child {
-  color: var(--muted-foreground);
-  font-size: 11px;
-}
-
-.project-actions-trigger {
-  color: var(--muted-foreground);
-  opacity: 0;
-}
-
-.project-row:hover .project-actions-trigger,
-.project-actions-trigger:focus-visible,
-.project-actions-trigger[aria-expanded="true"] {
-  opacity: 1;
-}
-
-.sidebar-separator {
-  margin: 1px 0;
-  background: var(--sidebar-border);
-}
-
-.draft-list,
-.chat-list {
   display: grid;
   gap: 1px;
 }
 
-.draft-list > li {
+.draft-row-shell {
   position: relative;
   min-width: 0;
 }
@@ -456,19 +376,23 @@
   justify-content: stretch;
   width: 100%;
   min-width: 0;
-  min-height: 44px;
-  padding: 4px 8px;
+  min-height: 42px;
+  padding: 5px 8px;
   color: var(--sidebar-foreground);
   text-align: left;
 }
 
 .draft-row-project {
   color: var(--muted-foreground);
-  font-size: 11px;
+  font-size: 10px;
+  font-weight: 560;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .draft-row-prompt {
   overflow: hidden;
+  color: var(--sidebar-foreground);
   font-size: 12px;
   font-weight: 520;
   text-overflow: ellipsis;
@@ -486,15 +410,11 @@
   bottom: 4px;
 }
 
-.chat-list-section {
-  min-width: 0;
-}
-
 .chat-row {
   position: relative;
   min-width: 0;
   content-visibility: auto;
-  contain-intrinsic-block-size: 52px;
+  contain-intrinsic-block-size: 46px;
 }
 
 .chat-row-context-trigger {
@@ -504,22 +424,18 @@
 }
 
 .chat-row-select {
-  display: grid;
-  grid-template-columns: 8px minmax(0, 1fr) auto;
-  gap: 8px;
-  align-items: center;
-  justify-content: initial;
+  display: block;
   width: 100%;
   min-width: 0;
-  min-height: 52px;
-  padding: 8px 36px 8px 8px;
-  border-radius: 8px;
+  min-height: 62px;
+  padding: 6px 36px 6px 8px;
+  border-radius: 7px;
   text-align: left;
 }
 
 .chat-actions-trigger {
   position: absolute;
-  top: 12px;
+  top: 19px;
   right: 4px;
   z-index: 1;
   opacity: 0;
@@ -536,43 +452,58 @@
   background: color-mix(in oklab, var(--sidebar-accent) 68%, transparent);
 }
 
-.chat-setup-indicator {
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
-  background: var(--muted-foreground);
-}
-
-.chat-setup-indicator[data-phase="pending"],
-.chat-setup-indicator[data-phase="running"] {
-  background: var(--ring);
-  box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 16%, transparent);
-}
-
-.chat-setup-indicator[data-phase="needs-input"] {
-  background: var(--warning);
-  box-shadow: 0 0 0 3px color-mix(in oklab, var(--warning) 16%, transparent);
-}
-
-.chat-setup-indicator[data-phase="succeeded"],
-.chat-setup-indicator[data-phase="notRequired"],
-.chat-setup-indicator[data-phase="finished"] {
-  background: var(--success);
-}
-
-.chat-setup-indicator[data-phase="failed"],
-.chat-setup-indicator[data-phase="cancelled"],
-.chat-setup-indicator[data-phase="interrupted"] {
-  background: var(--destructive);
-}
-
 .chat-row[data-unread="true"] .chat-row-title {
   font-weight: 650;
 }
 
 .chat-row-copy {
   display: grid;
+  gap: 1px;
   min-width: 0;
+}
+
+.chat-row-eyebrow,
+.chat-row-metadata {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.chat-row-eyebrow {
+  min-height: 12px;
+}
+
+.chat-row-status {
+  overflow: hidden;
+  margin-left: auto;
+  color: var(--muted-foreground);
+  text-overflow: ellipsis;
+}
+
+.chat-row-status[data-phase="pending"],
+.chat-row-status[data-phase="running"] {
+  color: var(--ring);
+}
+
+.chat-row-status[data-phase="needs-input"] {
+  color: var(--warning);
+}
+
+.chat-row-status[data-phase="finished"],
+.chat-row-status[data-phase="succeeded"] {
+  color: var(--success);
+}
+
+.chat-row-status[data-phase="failed"],
+.chat-row-status[data-phase="cancelled"],
+.chat-row-status[data-phase="interrupted"] {
+  color: var(--destructive);
 }
 
 .chat-row-title {
@@ -580,39 +511,38 @@
   overflow: hidden;
   color: var(--sidebar-foreground);
   font-size: 12px;
-  font-weight: 540;
+  font-weight: 560;
   letter-spacing: -0.01em;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .chat-row-metadata {
-  display: flex;
-  gap: 4px;
-  min-width: 0;
-  margin-top: 4px;
-  overflow: hidden;
-  color: var(--muted-foreground);
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  min-height: 15px;
 }
 
-.chat-row-metadata span:first-child {
+.chat-row-project {
   flex: none;
   max-width: 42%;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.chat-row-metadata span:nth-child(2) {
+.chat-row-metadata > span[aria-hidden="true"] {
   flex: none;
 }
 
-.chat-row-metadata span:last-child {
+.chat-row-branch {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.chat-row-metadata [data-slot="badge"] {
+  flex: none;
+  min-height: 14px;
+  padding-inline: 4px;
+  font-size: 9px;
 }
 
 .sidebar-zero-copy {

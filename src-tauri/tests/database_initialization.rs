@@ -14,6 +14,7 @@ fn empty_database_is_initialized_with_the_current_schema() {
     assert!(database.has_table("chats").unwrap());
     assert!(database.has_table("chat_messages").unwrap());
     assert!(database.has_table("chat_workspace_creations").unwrap());
+    assert!(database.has_table("chat_workspace_deletions").unwrap());
     assert!(database.has_table("runtime_model_selection").unwrap());
     assert!(database.has_table("model_route_efforts").unwrap());
     assert!(
@@ -66,6 +67,7 @@ fn current_database_can_be_opened_repeatedly() {
     assert!(reopened.has_table("chats").unwrap());
     assert!(reopened.has_table("chat_messages").unwrap());
     assert!(reopened.has_table("chat_workspace_creations").unwrap());
+    assert!(reopened.has_table("chat_workspace_deletions").unwrap());
     assert!(reopened.has_table("runtime_model_selection").unwrap());
     assert!(reopened.has_table("model_route_efforts").unwrap());
     assert!(

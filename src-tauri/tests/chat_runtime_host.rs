@@ -63,6 +63,38 @@ fn codex_resource() -> AgentResourceId {
     }
 }
 
+#[tokio::test]
+async fn confirmed_deletion_retires_the_active_pi_child_before_local_cleanup() {
+    let fixture = ChatFixture::new(true);
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    assert_eq!(fixture.live_children(), 1);
+    let deletion = fixture
+        .workspaces
+        .prepare_chat_deletion(&fixture.chat_id)
+        .unwrap();
+
+    fixture
+        .host
+        .retire_for_deletion(&fixture.chat_id)
+        .await
+        .unwrap();
+    let snapshot = deletion.execute().unwrap();
+
+    fixture.wait_for_live_children(0).await;
+    assert!(snapshot.chats.is_empty());
+    assert!(!fixture.worktree.exists());
+    assert!(
+        fixture
+            ._app_data
+            .path()
+            .join("sessions")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
 struct ChatFixture {
     _app_data: TemporaryAppData,
     _remote: TemporaryGitRemote,

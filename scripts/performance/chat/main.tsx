@@ -435,19 +435,17 @@ function PerformanceReview() {
           drafts={drafts}
           onCancelSetup={() => Promise.resolve(undefined)}
           onCreateChat={() => Promise.resolve(undefined)}
+          onDeleteChat={() => Promise.resolve(undefined)}
+          onNewChat={() => setSelectedChatId(null)}
           onOpenRepository={() => undefined}
           onOpenSettings={() => undefined}
           onOpenTerminal={() => Promise.resolve(undefined)}
+          onProjectScopeChange={setSelectedProjectId}
           onQueryChange={() => undefined}
-          onRemoveProject={() => Promise.resolve(undefined)}
           onRenameChat={() => Promise.resolve(undefined)}
           onRequestCodexSignIn={() => undefined}
           onRetrySetup={() => Promise.resolve(undefined)}
           onSelectChat={setSelectedChatId}
-          onSelectProject={(projectId) => {
-            setSelectedProjectId(projectId);
-            setSelectedChatId(null);
-          }}
           query=""
           selectedChatId={selectedChatId}
           selectedProjectId={selectedProjectId}

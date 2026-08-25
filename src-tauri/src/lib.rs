@@ -51,6 +51,7 @@ pub fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
             project_commands::save_project_draft,
             project_commands::remove_project,
             project_commands::rename_chat,
+            project_commands::delete_chat,
             project_commands::create_chat,
             project_commands::retry_chat_setup,
             project_commands::cancel_chat_setup,

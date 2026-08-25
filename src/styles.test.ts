@@ -69,18 +69,16 @@ test("native controls and inherited sidebar copy keep explicit system-theme cont
   expect(stylesheet).toMatch(
     /\.product-composer-input\s*\{[^}]*color: var\(--foreground\);[^}]*caret-color: var\(--foreground\);/,
   );
-  expect(stylesheet).toMatch(
-    /\.project-row-name,[\s\S]*?\.draft-row-prompt\s*\{[^}]*color: var\(--sidebar-foreground\);/,
-  );
+  expect(stylesheet).toMatch(/\.draft-row-prompt\s*\{[^}]*color: var\(--sidebar-foreground\);/);
 });
 
 test("long chat branches stay inside their inbox metadata column", () => {
   expect(stylesheet).toMatch(/\.chat-row-copy\s*\{[\s\S]*?display: grid;[\s\S]*?min-width: 0;/);
   expect(stylesheet).toMatch(
-    /\.chat-row-metadata span:first-child\s*\{[\s\S]*?max-width: 42%;[\s\S]*?overflow: hidden;[\s\S]*?text-overflow: ellipsis;/,
+    /\.chat-row-project\s*\{[\s\S]*?max-width: 42%;[\s\S]*?overflow: hidden;[\s\S]*?text-overflow: ellipsis;/,
   );
   expect(stylesheet).toMatch(
-    /\.chat-row-metadata span:last-child\s*\{[\s\S]*?min-width: 0;[\s\S]*?overflow: hidden;[\s\S]*?text-overflow: ellipsis;/,
+    /\.chat-row-branch\s*\{[\s\S]*?min-width: 0;[\s\S]*?overflow: hidden;[\s\S]*?text-overflow: ellipsis;/,
   );
 });
 

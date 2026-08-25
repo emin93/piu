@@ -313,6 +313,17 @@ pub(crate) struct ChatWorkspaceOwnership {
     pub worktree_git_dir: FilesystemIdentity,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ChatDeletionReservation {
+    pub chat_id: String,
+    pub ownership: ChatWorkspaceOwnership,
+    pub branch_head: String,
+    pub session_file: Option<FilesystemIdentity>,
+    pub worktree_removed: bool,
+    pub branch_removed: bool,
+    pub session_removed: bool,
+}
+
 impl ProjectInbox {
     pub fn with_git(database_path: &Path, git: GitProcess) -> Result<Self, ProjectInboxError> {
         Self::with_inspector(database_path, Arc::new(git))
@@ -910,6 +921,188 @@ impl ProjectInbox {
         })
     }
 
+    pub(crate) fn chat_deletion(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<ChatDeletionReservation>, ProjectInboxError> {
+        self.with_database(|database| load_chat_deletion(database.connection(), chat_id))
+    }
+
+    pub(crate) fn pending_chat_deletions(
+        &self,
+    ) -> Result<Vec<ChatDeletionReservation>, ProjectInboxError> {
+        self.with_database(|database| {
+            let mut statement = database
+                .connection()
+                .prepare(
+                    "SELECT deletions.chat_id, chats.project_id, chats.branch_name,
+                            chats.worktree_path, chats.worktree_root_path,
+                            chats.worktree_root_device, chats.worktree_root_inode,
+                            chats.worktree_git_dir_path, chats.worktree_git_dir_device,
+                            chats.worktree_git_dir_inode, deletions.branch_head,
+                            deletions.session_path, deletions.session_device,
+                            deletions.session_inode, deletions.worktree_removed,
+                            deletions.branch_removed, deletions.session_removed
+                     FROM chat_workspace_deletions AS deletions
+                     JOIN chats ON chats.id = deletions.chat_id
+                     ORDER BY chats.created_at_ms ASC, deletions.chat_id ASC",
+                )
+                .map_err(DatabaseError::Query)?;
+            statement
+                .query_map([], decode_chat_deletion)
+                .map_err(DatabaseError::Query)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(DatabaseError::Query)
+                .map_err(ProjectInboxError::Database)
+        })
+    }
+
+    pub(crate) fn reserve_chat_deletion(
+        &self,
+        chat_id: &str,
+        branch_head: &str,
+        session_file: Option<&FilesystemIdentity>,
+    ) -> Result<ChatDeletionReservation, ProjectInboxError> {
+        self.with_database(|database| {
+            let connection = database.connection_mut();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(DatabaseError::Query)?;
+            require_chat(&transaction, chat_id)?;
+            let session_removed = session_file.is_none();
+            transaction
+                .execute(
+                    "INSERT INTO chat_workspace_deletions (
+                       chat_id, branch_head, worktree_removed, branch_removed,
+                       session_path, session_device, session_inode, session_removed
+                     ) VALUES (?1, ?2, 0, 0, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(chat_id) DO NOTHING",
+                    params![
+                        chat_id,
+                        branch_head,
+                        session_file.map(|identity| identity.path.to_string_lossy()),
+                        session_file.map(|identity| identity.device.as_str()),
+                        session_file.map(|identity| identity.inode.as_str()),
+                        session_removed,
+                    ],
+                )
+                .map_err(DatabaseError::Query)?;
+            transaction.commit().map_err(DatabaseError::Query)?;
+            load_chat_deletion(connection, chat_id)?.ok_or_else(|| {
+                ProjectInboxError::ChatNotFound {
+                    chat_id: chat_id.to_owned(),
+                }
+            })
+        })
+    }
+
+    pub(crate) fn mark_chat_deletion_worktree_removed(
+        &self,
+        chat_id: &str,
+    ) -> Result<(), ProjectInboxError> {
+        self.update_chat_deletion_flag(chat_id, "worktree_removed")
+    }
+
+    pub(crate) fn mark_chat_deletion_branch_removed(
+        &self,
+        chat_id: &str,
+    ) -> Result<(), ProjectInboxError> {
+        self.update_chat_deletion_flag(chat_id, "branch_removed")
+    }
+
+    pub(crate) fn mark_chat_deletion_session_removed(
+        &self,
+        chat_id: &str,
+    ) -> Result<(), ProjectInboxError> {
+        self.update_chat_deletion_flag(chat_id, "session_removed")
+    }
+
+    fn update_chat_deletion_flag(
+        &self,
+        chat_id: &str,
+        column: &str,
+    ) -> Result<(), ProjectInboxError> {
+        debug_assert!(matches!(
+            column,
+            "worktree_removed" | "branch_removed" | "session_removed"
+        ));
+        self.with_database(|database| {
+            let changed = database
+                .connection_mut()
+                .execute(
+                    &format!("UPDATE chat_workspace_deletions SET {column} = 1 WHERE chat_id = ?1"),
+                    [chat_id],
+                )
+                .map_err(DatabaseError::Query)?;
+            if changed == 1 {
+                Ok(())
+            } else {
+                Err(ProjectInboxError::ChatNotFound {
+                    chat_id: chat_id.to_owned(),
+                })
+            }
+        })
+    }
+
+    pub(crate) fn cancel_untouched_chat_deletion(
+        &self,
+        chat_id: &str,
+    ) -> Result<(), ProjectInboxError> {
+        self.with_database(|database| {
+            database
+                .connection_mut()
+                .execute(
+                    "DELETE FROM chat_workspace_deletions
+                     WHERE chat_id = ?1 AND worktree_removed = 0 AND branch_removed = 0
+                       AND (session_path IS NULL OR session_removed = 0)",
+                    [chat_id],
+                )
+                .map_err(DatabaseError::Query)
+                .map_err(ProjectInboxError::Database)?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn commit_chat_deletion(
+        &self,
+        chat_id: &str,
+    ) -> Result<InboxSnapshot, ProjectInboxError> {
+        self.with_database(|database| {
+            let connection = database.connection_mut();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(DatabaseError::Query)?;
+            let ready: bool = transaction
+                .query_row(
+                    "SELECT worktree_removed = 1 AND branch_removed = 1 AND session_removed = 1
+                     FROM chat_workspace_deletions WHERE chat_id = ?1",
+                    [chat_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(DatabaseError::Query)?
+                .ok_or_else(|| ProjectInboxError::ChatNotFound {
+                    chat_id: chat_id.to_owned(),
+                })?;
+            if !ready {
+                return Err(ProjectInboxError::Database(DatabaseError::Query(
+                    rusqlite::Error::InvalidQuery,
+                )));
+            }
+            let removed = transaction
+                .execute("DELETE FROM chats WHERE id = ?1", [chat_id])
+                .map_err(DatabaseError::Query)?;
+            if removed != 1 {
+                return Err(ProjectInboxError::ChatNotFound {
+                    chat_id: chat_id.to_owned(),
+                });
+            }
+            transaction.commit().map_err(DatabaseError::Query)?;
+            Ok(())
+        })?;
+        self.snapshot()
+    }
+
     pub(crate) fn chat_workspace_ownership(
         &self,
         chat_id: &str,
@@ -1236,6 +1429,23 @@ fn repository_name(canonical_path: &Path) -> Result<String, ProjectInboxError> {
         .ok_or(ProjectInboxError::InvalidRepository)
 }
 
+fn require_chat(transaction: &Transaction<'_>, chat_id: &str) -> Result<(), ProjectInboxError> {
+    let exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM chats WHERE id = ?1)",
+            [chat_id],
+            |row| row.get(0),
+        )
+        .map_err(DatabaseError::Query)?;
+    if exists {
+        Ok(())
+    } else {
+        Err(ProjectInboxError::ChatNotFound {
+            chat_id: chat_id.to_owned(),
+        })
+    }
+}
+
 fn require_project(
     transaction: &Transaction<'_>,
     project_id: i64,
@@ -1253,6 +1463,70 @@ fn require_project(
     } else {
         Err(ProjectInboxError::ProjectNotFound { project_id })
     }
+}
+
+fn load_chat_deletion(
+    connection: &Connection,
+    chat_id: &str,
+) -> Result<Option<ChatDeletionReservation>, ProjectInboxError> {
+    connection
+        .query_row(
+            "SELECT deletions.chat_id, chats.project_id, chats.branch_name,
+                    chats.worktree_path, chats.worktree_root_path,
+                    chats.worktree_root_device, chats.worktree_root_inode,
+                    chats.worktree_git_dir_path, chats.worktree_git_dir_device,
+                    chats.worktree_git_dir_inode, deletions.branch_head,
+                    deletions.session_path, deletions.session_device,
+                    deletions.session_inode, deletions.worktree_removed,
+                    deletions.branch_removed, deletions.session_removed
+             FROM chat_workspace_deletions AS deletions
+             JOIN chats ON chats.id = deletions.chat_id
+             WHERE deletions.chat_id = ?1",
+            [chat_id],
+            decode_chat_deletion,
+        )
+        .optional()
+        .map_err(DatabaseError::Query)
+        .map_err(ProjectInboxError::Database)
+}
+
+fn decode_chat_deletion(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatDeletionReservation> {
+    let session_path: Option<String> = row.get(11)?;
+    let session_device: Option<String> = row.get(12)?;
+    let session_inode: Option<String> = row.get(13)?;
+    let session_file = match (session_path, session_device, session_inode) {
+        (Some(path), Some(device), Some(inode)) => Some(FilesystemIdentity {
+            path: PathBuf::from(path),
+            device,
+            inode,
+        }),
+        (None, None, None) => None,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(ChatDeletionReservation {
+        chat_id: row.get(0)?,
+        ownership: ChatWorkspaceOwnership {
+            chat_id: row.get(0)?,
+            project_id: row.get(1)?,
+            branch_name: row.get(2)?,
+            worktree_path: PathBuf::from(row.get::<_, String>(3)?),
+            worktree_root: FilesystemIdentity {
+                path: PathBuf::from(row.get::<_, String>(4)?),
+                device: row.get(5)?,
+                inode: row.get(6)?,
+            },
+            worktree_git_dir: FilesystemIdentity {
+                path: PathBuf::from(row.get::<_, String>(7)?),
+                device: row.get(8)?,
+                inode: row.get(9)?,
+            },
+        },
+        branch_head: row.get(10)?,
+        session_file,
+        worktree_removed: row.get(14)?,
+        branch_removed: row.get(15)?,
+        session_removed: row.get(16)?,
+    })
 }
 
 struct StoredProject {
