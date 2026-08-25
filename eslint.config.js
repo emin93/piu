@@ -10,11 +10,11 @@ export default tseslint.config(
   },
   eslint.configs.recommended,
   {
-    files: ["scripts/**/*.mjs", "eslint.config.js"],
+    files: ["scripts/**/*.mjs", "src-tauri/vendor/agent-runtime/**/*.mjs", "eslint.config.js"],
     languageOptions: { globals: globals.node },
   },
   {
-    files: ["src/**/*.{ts,tsx}", "vite.config.ts"],
+    files: ["scripts/performance/**/*.{ts,tsx}", "src/**/*.{ts,tsx}", "vite.config.ts"],
     extends: [...tseslint.configs.recommendedTypeChecked],
     languageOptions: {
       ecmaVersion: 2022,
@@ -34,6 +34,12 @@ export default tseslint.config(
     rules: {
       ...reactHooks.configs.flat.recommended.rules,
       ...reactRefresh.configs.vite.rules,
+    },
+  },
+  {
+    files: ["scripts/performance/**/*.{ts,tsx}"],
+    rules: {
+      "react-refresh/only-export-components": "off",
     },
   },
 );

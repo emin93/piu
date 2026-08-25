@@ -1,5 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { LoaderCircleIcon } from "lucide-react";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import {
   Empty,
@@ -34,15 +45,24 @@ import {
   saveProjectDraft,
 } from "./platform/project-inbox";
 import { selectRepositoryDirectory } from "./platform/repository-picker";
+import {
+  exitApplication,
+  hasActiveAgentTurn,
+  shutdownRuntimeProcesses,
+} from "./platform/runtime-lifecycle";
 import { listenToWindowClose } from "./platform/window-lifecycle";
+import { type ConversationAdapter, tauriConversationAdapter } from "./platform/conversations";
 
 interface AppProps {
+  conversationAdapter?: ConversationAdapter;
   onOpenRepository?: () => void;
   surface?: "inbox" | DeferredSurfaceName;
-  visualReviewStartup?: "loading";
+  visualReviewState?:
+    "closeConfirmation" | "connectionRecovery" | "conversation" | "loading" | "sendRecovery";
 }
 
 const EMPTY_INBOX: InboxSnapshot = { projects: [], drafts: [], chats: [] };
+const CodexSignInDialog = lazy(() => import("./features/auth/CodexSignInDialog"));
 
 function StartupFailure({ onRetry }: { onRetry: () => void }) {
   return (
@@ -74,8 +94,13 @@ function StartupLoading() {
   );
 }
 
-export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }: AppProps) {
-  useSystemAppearance();
+export function App({
+  conversationAdapter = tauriConversationAdapter,
+  onOpenRepository,
+  surface = "inbox",
+  visualReviewState,
+}: AppProps) {
+  const appearance = useSystemAppearance();
   const [activeSurface, setActiveSurface] = useState<"inbox" | DeferredSurfaceName>(surface);
   const [hostStatus, setHostStatus] = useState<"checking" | "ready" | "failed">("checking");
   const [snapshot, setSnapshot] = useState<InboxSnapshot>(EMPTY_INBOX);
@@ -83,8 +108,13 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [repositoryActionError, setRepositoryActionError] = useState<string>();
+  const [codexSignInOpen, setCodexSignInOpen] = useState(false);
+  const [closeConfirmationOpen, setCloseConfirmationOpen] = useState(false);
+  const [applicationClosing, setApplicationClosing] = useState(false);
+  const [conversationRevision, setConversationRevision] = useState(0);
   const verificationGeneration = useRef(0);
   const settingsTriggerRef = useRef<HTMLButtonElement>(null);
+  const keepWorkingRef = useRef<HTMLButtonElement>(null);
   const restoreSettingsFocus = useRef(false);
   const [setups] = useState(() => new ChatSetupController());
   const [drafts] = useState(() => {
@@ -109,6 +139,13 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
           drafts.reconcile(loadedSnapshot);
           setups.reconcile(loadedSnapshot);
           setSnapshot(drafts.overlay(loadedSnapshot));
+          if (
+            visualReviewState === "connectionRecovery" ||
+            visualReviewState === "conversation" ||
+            visualReviewState === "sendRecovery"
+          ) {
+            setSelectedChatId(loadedSnapshot.chats[0]?.id ?? null);
+          }
           setHostStatus("ready");
         },
         () => {
@@ -116,7 +153,7 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
         },
       );
     },
-    [drafts, setups],
+    [drafts, setups, visualReviewState],
   );
 
   const retryStartup = useCallback(() => {
@@ -126,6 +163,31 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
   }, [completeStartup]);
 
   const flushAllDrafts = useCallback(() => drafts.flushAll(), [drafts]);
+  const closeApplication = useCallback(async () => {
+    await flushAllDrafts();
+    await shutdownRuntimeProcesses();
+  }, [flushAllDrafts]);
+
+  const requestApplicationClose = useCallback(async () => {
+    if (await hasActiveAgentTurn()) {
+      setCloseConfirmationOpen(true);
+      return;
+    }
+    await closeApplication();
+    await exitApplication();
+  }, [closeApplication]);
+
+  const confirmApplicationClose = useCallback(async () => {
+    setApplicationClosing(true);
+    try {
+      await closeApplication();
+      await exitApplication();
+    } catch {
+      // Draft persistence explains its own failure; keep Più open so the user can recover.
+    } finally {
+      setApplicationClosing(false);
+    }
+  }, [closeApplication]);
 
   const openSettings = useCallback(() => {
     void flushAllDrafts().catch(() => undefined);
@@ -134,6 +196,11 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
   }, [flushAllDrafts]);
 
   const closeDeferredSurface = useCallback(() => setActiveSurface("inbox"), []);
+  const openCodexSignIn = useCallback(() => setCodexSignInOpen(true), []);
+  const completeCodexSignIn = useCallback(() => {
+    setCodexSignInOpen(false);
+    setConversationRevision((current) => current + 1);
+  }, []);
 
   useEffect(() => {
     if (activeSurface !== "inbox" || !restoreSettingsFocus.current) return;
@@ -178,6 +245,15 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
       void flushAllDrafts().catch(() => undefined);
       setSelectedProjectId(projectId);
       setSelectedChatId(null);
+    },
+    [flushAllDrafts],
+  );
+
+  const selectChat = useCallback(
+    (chatId: string) => {
+      void flushAllDrafts().catch(() => undefined);
+      setSelectedChatId(chatId);
+      setQuery("");
     },
     [flushAllDrafts],
   );
@@ -265,13 +341,19 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
   );
 
   useEffect(() => {
-    if (visualReviewStartup === "loading") return;
+    if (visualReviewState === "loading") return;
     const generation = ++verificationGeneration.current;
     completeStartup(generation);
     return () => {
       verificationGeneration.current += 1;
     };
-  }, [completeStartup, visualReviewStartup]);
+  }, [completeStartup, visualReviewState]);
+
+  useEffect(() => {
+    if (visualReviewState !== "closeConfirmation" || hostStatus !== "ready") return;
+    const timeout = window.setTimeout(() => setCloseConfirmationOpen(true), 0);
+    return () => window.clearTimeout(timeout);
+  }, [hostStatus, visualReviewState]);
 
   useEffect(() => {
     let disposed = false;
@@ -325,7 +407,7 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
   useEffect(() => {
     let disposed = false;
     let stopListening: (() => void) | undefined;
-    void listenToWindowClose(flushAllDrafts).then((unlisten) => {
+    void listenToWindowClose(requestApplicationClose).then((unlisten) => {
       if (disposed) unlisten();
       else stopListening = unlisten;
     });
@@ -333,23 +415,28 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
       disposed = true;
       stopListening?.();
     };
-  }, [flushAllDrafts]);
+  }, [requestApplicationClose]);
 
   const selectedProject = snapshot.projects.find(({ id }) => id === selectedProjectId);
+  const selectedChat = snapshot.chats.find(({ id }) => id === selectedChatId);
   const titlebarContext =
-    activeSurface === "settings" ? "Settings" : (selectedProject?.name ?? "All Projects");
+    activeSurface === "settings"
+      ? "Settings"
+      : (selectedChat?.title ?? selectedProject?.name ?? "All Projects");
 
   return (
     <TooltipProvider>
-      <div className="app-shell">
+      <div className="app-shell" data-appearance={appearance}>
         <header className="titlebar" data-tauri-drag-region>
-          <div className="wordmark" aria-label="Più">
-            <span className="wordmark-symbol" aria-hidden="true">
+          <div aria-label="Più" className="wordmark" data-tauri-drag-region>
+            <span aria-hidden="true" className="wordmark-symbol" data-tauri-drag-region>
               π
             </span>
-            <span>Più</span>
+            <span data-tauri-drag-region>Più</span>
           </div>
-          <div className="titlebar-context">{titlebarContext}</div>
+          <div className="titlebar-context" data-tauri-drag-region>
+            {titlebarContext}
+          </div>
         </header>
         {hostStatus === "checking" ? (
           <main className="startup-workspace">
@@ -362,16 +449,19 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
         ) : activeSurface === "inbox" ? (
           <InboxWorkspace
             actionError={repositoryActionError}
+            conversationAdapter={conversationAdapter}
+            conversationRevision={conversationRevision}
             drafts={drafts}
             onCancelSetup={cancelSetup}
             onCreateChat={createProjectChat}
             onOpenRepository={openSelectedRepository}
             onOpenTerminal={openTerminal}
             onOpenSettings={openSettings}
+            onRequestCodexSignIn={openCodexSignIn}
             onQueryChange={changeQuery}
             onRemoveProject={removeSelectedProject}
             onRetrySetup={retrySetup}
-            onSelectChat={setSelectedChatId}
+            onSelectChat={selectChat}
             onSelectProject={selectProject}
             query={query}
             selectedChatId={selectedChatId}
@@ -387,6 +477,52 @@ export function App({ onOpenRepository, surface = "inbox", visualReviewStartup }
             </div>
           </main>
         )}
+        {codexSignInOpen ? (
+          <Suspense
+            fallback={
+              <div className="lazy-dialog-backdrop">
+                <div aria-live="polite" className="lazy-dialog-card" role="status">
+                  <LoaderCircleIcon aria-hidden="true" />
+                  Opening Codex sign-in
+                </div>
+              </div>
+            }
+          >
+            <CodexSignInDialog
+              onComplete={completeCodexSignIn}
+              onOpenChange={setCodexSignInOpen}
+              open={codexSignInOpen}
+            />
+          </Suspense>
+        ) : null}
+        <AlertDialog
+          onOpenChange={(open) => {
+            if (!applicationClosing) setCloseConfirmationOpen(open);
+          }}
+          open={closeConfirmationOpen}
+        >
+          <AlertDialogContent initialFocus={keepWorkingRef}>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Stop active work and quit?</AlertDialogTitle>
+              <AlertDialogDescription>
+                Active agent work will be stopped. Your conversation and draft will remain available
+                when you reopen Più.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={applicationClosing} ref={keepWorkingRef}>
+                Keep working
+              </AlertDialogCancel>
+              <AlertDialogAction
+                disabled={applicationClosing}
+                onClick={() => void confirmApplicationClose()}
+                variant="destructive"
+              >
+                {applicationClosing ? "Quitting…" : "Stop and quit"}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </div>
     </TooltipProvider>
   );

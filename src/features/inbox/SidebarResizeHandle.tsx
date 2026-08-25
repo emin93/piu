@@ -28,8 +28,16 @@ export function SidebarResizeHandle({ disabled = false }: { disabled?: boolean }
     applyWidth(DEFAULT_WIDTH);
     return () => {
       document.documentElement.style.removeProperty("--inbox-sidebar-width");
+      document.documentElement.removeAttribute("data-inbox-sidebar-resizing");
     };
   }, [applyWidth]);
+
+  const finishDrag = useCallback((pointerId: number) => {
+    if (dragRef.current?.pointerId !== pointerId) return false;
+    dragRef.current = undefined;
+    document.documentElement.removeAttribute("data-inbox-sidebar-resizing");
+    return true;
+  }, []);
 
   return (
     <div
@@ -51,11 +59,14 @@ export function SidebarResizeHandle({ disabled = false }: { disabled?: boolean }
       }}
       onPointerDown={(event) => {
         if (disabled) return;
+        event.preventDefault();
+        event.currentTarget.focus();
         dragRef.current = {
           pointerId: event.pointerId,
           startX: event.clientX,
           startWidth: widthRef.current,
         };
+        document.documentElement.setAttribute("data-inbox-sidebar-resizing", "");
         event.currentTarget.setPointerCapture?.(event.pointerId);
       }}
       onPointerMove={(event) => {
@@ -64,8 +75,11 @@ export function SidebarResizeHandle({ disabled = false }: { disabled?: boolean }
         applyWidth(drag.startWidth + event.clientX - drag.startX);
       }}
       onPointerUp={(event) => {
-        if (dragRef.current?.pointerId !== event.pointerId) return;
-        dragRef.current = undefined;
+        if (!finishDrag(event.pointerId)) return;
+        event.currentTarget.releasePointerCapture?.(event.pointerId);
+      }}
+      onPointerCancel={(event) => {
+        if (!finishDrag(event.pointerId)) return;
         event.currentTarget.releasePointerCapture?.(event.pointerId);
       }}
       ref={handleRef}

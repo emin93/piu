@@ -1,8 +1,8 @@
 import { ArrowUpIcon, TriangleAlertIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 
+import { ProductComposer } from "@/components/ProductComposer";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
 import type { ProjectSummary } from "@/platform/project-inbox";
 
 import { ProjectDraftController, type DraftPersistenceStatus } from "./draft-controller";
@@ -78,31 +78,8 @@ export function ChatComposer({
       </div>
 
       {available ? (
-        <form
-          className="composer-shell"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void submit();
-          }}
-        >
-          <Textarea
-            aria-describedby="draft-persistence-status"
-            aria-label={`Draft for ${project.name}`}
-            className="composer-input"
-            onChange={(event) => drafts.change(project.id, event.target.value)}
-            placeholder="Describe what you want to change"
-            ref={textareaRef}
-            rows={4}
-            value={draft.prompt}
-          />
-          <div className="composer-footer">
-            <span
-              aria-live="polite"
-              className={draft.status.state === "failed" ? "text-destructive" : undefined}
-              id="draft-persistence-status"
-            >
-              {draftStatusCopy(draft.status)}
-            </span>
+        <ProductComposer
+          actions={
             <Button
               aria-label="Send message"
               disabled={!onSubmit || !draft.prompt.trim() || submitting}
@@ -111,34 +88,56 @@ export function ChatComposer({
             >
               <ArrowUpIcon aria-hidden="true" />
             </Button>
-          </div>
-          {draft.status.state === "failed" ? (
-            <div className="composer-error" role="alert">
-              <span>{draft.status.message}</span>
-              <Button onClick={() => void drafts.retry(project.id)} size="sm" variant="outline">
-                Retry save
-              </Button>
-            </div>
-          ) : null}
-          {submissionError ? (
-            <div className="composer-error" role="alert">
-              <span>{submissionError}</span>
-            </div>
-          ) : null}
-        </form>
+          }
+          ariaDescribedBy="draft-persistence-status"
+          ariaLabel={`Draft for ${project.name}`}
+          error={
+            draft.status.state === "failed" || submissionError
+              ? {
+                  action:
+                    draft.status.state === "failed" ? (
+                      <Button
+                        onClick={() => void drafts.retry(project.id)}
+                        size="sm"
+                        type="button"
+                        variant="outline"
+                      >
+                        Retry save
+                      </Button>
+                    ) : undefined,
+                  message: (
+                    <>
+                      {draft.status.state === "failed" ? <span>{draft.status.message}</span> : null}
+                      {submissionError ? <span>{submissionError}</span> : null}
+                    </>
+                  ),
+                }
+              : undefined
+          }
+          inputRef={textareaRef}
+          layout={layout}
+          onSubmit={() => void submit()}
+          onValueChange={(value) => drafts.change(project.id, value)}
+          placeholder="Describe what you want to change"
+          status={
+            <span
+              aria-live="polite"
+              className={draft.status.state === "failed" ? "text-destructive" : undefined}
+              id="draft-persistence-status"
+            >
+              {draftStatusCopy(draft.status)}
+            </span>
+          }
+          value={draft.prompt}
+        />
       ) : hasRetainedDraft ? (
-        <div className="composer-shell composer-shell-readonly">
-          <Textarea
-            aria-label={`Retained draft for ${project.name}`}
-            className="composer-input"
-            readOnly
-            rows={4}
-            value={draft.prompt}
-          />
-          <div className="composer-footer">
-            <span>Draft retained locally · read-only</span>
-          </div>
-        </div>
+        <ProductComposer
+          ariaLabel={`Retained draft for ${project.name}`}
+          layout={layout}
+          readOnly
+          status={<span>Draft retained locally · read-only</span>}
+          value={draft.prompt}
+        />
       ) : null}
     </section>
   );

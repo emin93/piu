@@ -1,20 +1,34 @@
 pub mod application;
+pub mod chat_runtime_commands;
+pub mod chat_runtime_host;
 pub mod chat_workspaces;
+pub mod codex_auth;
+pub mod codex_auth_boundary;
 pub mod database;
 pub mod git_process;
 pub mod host_boundary;
 pub mod model_asset_boundary;
 pub mod model_assets;
+mod owned_process;
+pub mod pi_rpc;
 pub mod project_commands;
 pub mod project_inbox;
+pub mod runtime_lifecycle;
+pub mod system_appearance;
 
 const TEST_APP_DATA_DIR_ENV: &str = "PIU_TEST_APP_DATA_DIR";
 
 pub fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             host_boundary::host_round_trip,
+            codex_auth_boundary::codex_auth_status,
+            codex_auth_boundary::start_codex_sign_in,
+            codex_auth_boundary::answer_codex_auth_prompt,
+            codex_auth_boundary::cancel_codex_sign_in,
             model_asset_boundary::model_asset_status,
             model_asset_boundary::start_model_download,
             model_asset_boundary::cancel_model_download,
@@ -29,6 +43,15 @@ pub fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
             project_commands::retry_chat_setup,
             project_commands::cancel_chat_setup,
             project_commands::open_chat_terminal,
+            chat_runtime_commands::open_chat_runtime,
+            chat_runtime_commands::send_chat_message,
+            chat_runtime_commands::steer_chat,
+            chat_runtime_commands::abort_chat_turn,
+            chat_runtime_commands::stop_chat_runtime,
+            runtime_lifecycle::has_active_agent_turn,
+            runtime_lifecycle::shutdown_runtime_processes,
+            runtime_lifecycle::exit_application,
+            system_appearance::system_appearance,
         ])
 }
 
@@ -52,13 +75,31 @@ pub fn run() {
             let app_data = env::var_os(TEST_APP_DATA_DIR_ENV)
                 .map(PathBuf::from)
                 .unwrap_or(default_app_data);
+            let real_home = env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or("Più requires the user's HOME directory")?;
             let git = git_process::GitProcess::from_bundled_runtime(&resource_dir.join("git"));
             let core = application::ApplicationCore::deferred(app_data.join("piu.sqlite3"), git);
+            let chat_runtime = chat_runtime_host::ChatRuntimeHost::production(
+                core.project_inbox(),
+                core.chat_workspaces(),
+                &app_data,
+                &resource_dir,
+            )?;
+            chat_runtime_commands::forward_chat_runtime_events(app.handle().clone(), &chat_runtime);
             app.manage(core);
+            app.manage(chat_runtime);
             let model_assets =
                 model_assets::ModelAssetManager::production_or_unavailable(&app_data);
             model_asset_boundary::forward_status_events(app.handle().clone(), &model_assets);
             app.manage(model_assets);
+            let codex_auth = codex_auth::CodexAuthManager::from_bundled_runtime(
+                &resource_dir,
+                &app_data,
+                &real_home,
+            )?;
+            codex_auth_boundary::forward_updates(app.handle().clone(), &codex_auth);
+            app.manage(codex_auth);
             tracing::info!("application core configured");
             Ok(())
         })

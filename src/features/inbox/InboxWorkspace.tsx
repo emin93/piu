@@ -7,7 +7,9 @@ import {
   Trash2Icon,
 } from "lucide-react";
 import {
+  lazy,
   memo,
+  Suspense,
   type RefObject,
   useCallback,
   useMemo,
@@ -41,6 +43,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ChatSummary, InboxSnapshot, ProjectSummary } from "@/platform/project-inbox";
+import type { ConversationAdapter } from "@/platform/conversations";
 
 import { ChatComposer } from "./ChatComposer";
 import { EmptyInbox } from "./EmptyInbox";
@@ -52,12 +55,15 @@ import { SidebarResizeHandle } from "./SidebarResizeHandle";
 
 interface InboxWorkspaceProps {
   actionError: string | undefined;
+  conversationAdapter: ConversationAdapter;
+  conversationRevision: number;
   drafts: ProjectDraftController;
   onCancelSetup: (chatId: string) => Promise<string | undefined>;
   onCreateChat: (projectId: number, prompt: string) => Promise<string | undefined>;
   onOpenRepository: () => void;
   onOpenTerminal: (chatId: string) => Promise<string | undefined>;
   onOpenSettings: () => void;
+  onRequestCodexSignIn: () => void;
   onQueryChange: (query: string) => void;
   onRemoveProject: (projectId: number) => Promise<string | undefined>;
   onRetrySetup: (chatId: string) => Promise<string | undefined>;
@@ -152,6 +158,66 @@ const ProjectFilter = memo(function ProjectFilter({
     </li>
   );
 });
+
+const ChatConversationPanel = lazy(() => import("../conversation/ChatConversationPanel"));
+
+function SelectedChatStage({
+  chat,
+  conversationAdapter,
+  conversationRevision,
+  onCancelSetup,
+  onOpenTerminal,
+  onRequestCodexSignIn,
+  onRetrySetup,
+  setups,
+}: {
+  chat: ChatSummary;
+  conversationAdapter: ConversationAdapter;
+  conversationRevision: number;
+  onCancelSetup: (chatId: string) => Promise<string | undefined>;
+  onOpenTerminal: (chatId: string) => Promise<string | undefined>;
+  onRequestCodexSignIn: () => void;
+  onRetrySetup: (chatId: string) => Promise<string | undefined>;
+  setups: ChatSetupController;
+}) {
+  const subscribe = useCallback(
+    (listener: () => void) => setups.subscribe(chat.id, listener),
+    [chat.id, setups],
+  );
+  const getSnapshot = useCallback(() => setups.get(chat.id), [chat.id, setups]);
+  const setup = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const ready = setup.phase === "notRequired" || setup.phase === "succeeded";
+
+  if (!ready) {
+    return (
+      <ChatSetupPanel
+        chat={chat}
+        onCancel={onCancelSetup}
+        onOpenTerminal={onOpenTerminal}
+        onRetry={onRetrySetup}
+        setups={setups}
+      />
+    );
+  }
+
+  return (
+    <Suspense
+      fallback={
+        <div aria-busy="true" className="conversation-connection" role="status">
+          Opening chat
+        </div>
+      }
+    >
+      <ChatConversationPanel
+        adapter={conversationAdapter}
+        chatId={chat.id}
+        key={chat.id}
+        onRequestCodexSignIn={onRequestCodexSignIn}
+        revision={conversationRevision}
+      />
+    </Suspense>
+  );
+}
 
 const ChatRow = memo(function ChatRow({
   chat,
@@ -289,12 +355,15 @@ function SearchStage({ count }: { count: number }) {
 
 export function InboxWorkspace({
   actionError,
+  conversationAdapter,
+  conversationRevision,
   drafts,
   onCancelSetup,
   onCreateChat,
   onOpenRepository,
   onOpenTerminal,
   onOpenSettings,
+  onRequestCodexSignIn,
   onQueryChange,
   onRemoveProject,
   onRetrySetup,
@@ -518,11 +587,14 @@ export function InboxWorkspace({
         ) : query.trim() ? (
           <SearchStage count={totalSearchResults} />
         ) : selectedChat ? (
-          <ChatSetupPanel
+          <SelectedChatStage
             chat={selectedChat}
-            onCancel={onCancelSetup}
+            conversationAdapter={conversationAdapter}
+            conversationRevision={conversationRevision}
+            onCancelSetup={onCancelSetup}
             onOpenTerminal={onOpenTerminal}
-            onRetry={onRetrySetup}
+            onRequestCodexSignIn={onRequestCodexSignIn}
+            onRetrySetup={onRetrySetup}
             setups={setups}
           />
         ) : targetProject ? (

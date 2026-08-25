@@ -6,6 +6,15 @@ use std::{
 
 use tempfile::TempDir;
 
+fn isolated_git_command() -> Command {
+    let mut command = Command::new("git");
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "0");
+    command
+}
+
 pub struct TemporaryAppData {
     root: TempDir,
 }
@@ -47,13 +56,13 @@ impl TemporaryGitRemote {
         let remote = root.path().join("remote.git");
 
         run(
-            Command::new("git")
+            isolated_git_command()
                 .args(["init", "--bare", "--initial-branch=main"])
                 .arg(&remote),
             "initialize bare remote",
         );
         run(
-            Command::new("git")
+            isolated_git_command()
                 .args(["init", "--initial-branch=main"])
                 .arg(&working),
             "initialize working repository",
@@ -96,13 +105,13 @@ impl TemporaryGitRemote {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut command = Command::new("git");
+        let mut command = isolated_git_command();
         command.arg("--git-dir").arg(&self.remote).args(arguments);
         run(&mut command, "run bare Git fixture command")
     }
 
     fn git_command(&self) -> Command {
-        let mut command = Command::new("git");
+        let mut command = isolated_git_command();
         command.arg("-C").arg(&self.working);
         command
     }

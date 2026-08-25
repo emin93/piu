@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "target": "darwin-arm64",
+  "node": {
+    "version": "24.19.0",
+    "archive": "node-v24.19.0-darwin-arm64.tar.gz",
+    "archiveUrl": "https://nodejs.org/dist/v24.19.0/node-v24.19.0-darwin-arm64.tar.gz",
+    "archiveSha256": "8294b7aa9b03997481c06babf1e8b270c859358f27da57a11509afe537ac381d",
+    "licenseSha256": "148eacf7863ef4329224a29398623077200a27194aa075569faf4a0a85566ca5"
+  },
+  "pi": {
+    "repository": "https://github.com/earendil-works/pi",
+    "commit": "4e58f324fae8ebfa98a3d45181fb248072a2afac",
+    "licenseSha256": "4f6a1985796db5225e3b1e59972bd47e07a27a0748427cb3d3c8fbf39f9311f0",
+    "packages": {
+      "@earendil-works/pi-coding-agent": {
+        "version": "0.84.3",
+        "integrity": "sha512-Yr2p9PubrbFZmYEPYI+C8KmZP9xlFuLDnAG64RtU0ZDgrdiXYWa+y7WGyJO5OlqPliOkVCMd9IzVszO3/t0D0w=="
+      },
+      "@earendil-works/pi-ai": {
+        "version": "0.84.3",
+        "integrity": "sha512-M0YUV8vNO3y2WwWSyY8ijKJV5W4gkSUixuvk+Z00ZBjsyMfsdXfITsHEwP1UIf09YRWXT6oGn0GlCamt+P32XQ=="
+      },
+      "proper-lockfile": {
+        "version": "4.1.2",
+        "integrity": "sha512-TjNPblN4BwAWMXU8s9AEz4JmQxnD1NNL7bNOY/AKUzyamc379FWASUhc/K1pL2noVb+XmZKLL68cjzLsiOAMaA=="
+      }
+    }
+  }
+}

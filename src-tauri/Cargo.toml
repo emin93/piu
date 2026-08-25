@@ -26,9 +26,11 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"
 tauri = { version = "=2.11.5", features = [] }
+tauri-plugin-clipboard-manager = "=2.3.2"
 tauri-plugin-dialog = "=2.7.2"
+tauri-plugin-opener = "=2.5.4"
 thiserror = "=2.0.20"
-tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "=0.7.19", features = ["rt"] }
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
@@ -36,6 +38,7 @@ ts-rs = { version = "=12.0.1", features = ["serde-compat"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "=0.2.189"
+objc2-foundation = { version = "=0.3.2", features = ["NSString", "NSUserDefaults"] }
 security-framework = "=3.7.0"
 
 [dev-dependencies]

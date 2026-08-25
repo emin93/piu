@@ -22,7 +22,8 @@
         "resizable": true,
         "fullscreen": false,
         "titleBarStyle": "Overlay",
-        "hiddenTitle": true
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 14, "y": 20 }
       }
     ],
     "security": {
@@ -51,7 +52,8 @@
     "targets": ["app"],
     "icon": ["icons/icon.icns", "icons/icon.png"],
     "resources": {
-      "vendor/git/runtime/": "git/"
+      "vendor/git/runtime/": "git/",
+      "vendor/agent-runtime/runtime/": "agent-runtime/"
     },
     "macOS": {
       "minimumSystemVersion": "15.0"

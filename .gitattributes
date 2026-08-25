@@ -1,2 +1,5 @@
 # Preserve Git's intentional whitespace in its vendored shell library.
 src-tauri/vendor/git/runtime/libexec/git-core/git-sh-setup -whitespace
+
+# Preserve Node's upstream third-party license formatting byte-for-byte.
+docs/licenses/Node-LICENSE.txt -whitespace

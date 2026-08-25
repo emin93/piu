@@ -1,4 +1,5 @@
 use piu_lib::database::Database;
+use rusqlite::Connection;
 use tempfile::TempDir;
 
 #[test]
@@ -13,6 +14,20 @@ fn empty_database_is_initialized_with_the_current_schema() {
     assert!(database.has_table("chats").unwrap());
     assert!(database.has_table("chat_messages").unwrap());
     assert!(database.has_table("chat_workspace_creations").unwrap());
+    assert!(!database.has_table("schema_migrations").unwrap());
+    drop(database);
+
+    let connection = Connection::open(&database_path).expect("current database should reopen");
+    let mut columns = connection
+        .prepare("SELECT name FROM pragma_table_info('chats')")
+        .expect("chat columns should be readable");
+    let columns = columns
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("chat columns should query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("chat columns should decode");
+    assert!(columns.iter().any(|column| column == "pi_session_id"));
+    assert!(columns.iter().any(|column| column == "pi_session_path"));
 }
 
 #[test]

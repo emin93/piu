@@ -11,8 +11,9 @@ use std::{
 use piu_lib::{
     git_process::GitProcess,
     project_inbox::{
-        ChatMergeState, OpenRepositoryOutcome, ProjectAvailability, ProjectInbox,
-        ProjectInboxError, RepositoryIdentity, RepositoryInspectionError, RepositoryInspector,
+        ChatMergeState, ChatSessionReference, OpenRepositoryOutcome, ProjectAvailability,
+        ProjectInbox, ProjectInboxError, RepositoryIdentity, RepositoryInspectionError,
+        RepositoryInspector,
     },
 };
 use rusqlite::{Connection, params};
@@ -280,6 +281,77 @@ fn removal_is_transactional_and_preserves_merged_history() {
     assert_eq!(removed.chats[0].merge_state, ChatMergeState::Merged);
     assert_eq!(removed.chats[0].project_id, None);
     assert_eq!(removed.chats[0].project_name, "alpha");
+}
+
+#[test]
+fn chat_session_binding_is_exact_idempotent_and_durable() {
+    let fixture = TempDir::new().expect("fixture should be created");
+    let database_path = fixture.path().join("piu.sqlite3");
+    let repository_path = fixture.path().join("alpha");
+    make_repository(&repository_path);
+    let inbox = open_inbox(&database_path);
+    let project = inbox
+        .open_repository(&repository_path)
+        .expect("repository should open")
+        .project;
+    seed_chat(
+        &database_path,
+        "chat-with-session",
+        project.id,
+        "Persistent conversation",
+        300,
+        "unmerged",
+    );
+    let expected = ChatSessionReference {
+        id: "pi-session-1".into(),
+        path: fixture.path().join("sessions/pi-session-1.jsonl"),
+    };
+
+    assert_eq!(
+        inbox
+            .chat_session("chat-with-session")
+            .expect("chat should exist"),
+        None
+    );
+    assert_eq!(
+        inbox
+            .bind_chat_session("chat-with-session", &expected.id, &expected.path)
+            .expect("first binding should persist"),
+        expected
+    );
+    assert_eq!(
+        inbox
+            .bind_chat_session("chat-with-session", &expected.id, &expected.path)
+            .expect("the exact binding should be idempotent"),
+        expected
+    );
+    drop(inbox);
+
+    let reopened = open_inbox(&database_path);
+    assert_eq!(
+        reopened
+            .chat_session("chat-with-session")
+            .expect("chat should reopen"),
+        Some(expected.clone())
+    );
+    let conflict = reopened
+        .bind_chat_session(
+            "chat-with-session",
+            "pi-session-2",
+            &fixture.path().join("sessions/pi-session-2.jsonl"),
+        )
+        .expect_err("a chat cannot drift to another Pi session");
+    assert!(matches!(
+        conflict,
+        ProjectInboxError::ChatSessionAlreadyBound { chat_id }
+            if chat_id == "chat-with-session"
+    ));
+    assert_eq!(
+        reopened
+            .chat_session("chat-with-session")
+            .expect("original session should remain readable"),
+        Some(expected)
+    );
 }
 
 struct BlockingRepositoryInspector {

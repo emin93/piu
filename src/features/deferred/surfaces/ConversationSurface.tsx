@@ -1,3 +1,1 @@
-export default function ConversationSurface() {
-  return <section aria-label="Conversation" />;
-}
+export { ConversationSurface as default } from "../../conversation/ConversationSurface";

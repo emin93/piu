@@ -50,7 +50,13 @@ const CURRENT_SCHEMA: &str = r#"
         setup_exit_code INTEGER,
         setup_signal INTEGER,
         setup_attempt INTEGER NOT NULL,
-        setup_log TEXT NOT NULL
+        setup_log TEXT NOT NULL,
+        pi_session_id TEXT UNIQUE,
+        pi_session_path TEXT UNIQUE,
+        CHECK (
+            (pi_session_id IS NULL AND pi_session_path IS NULL)
+            OR (pi_session_id IS NOT NULL AND pi_session_path IS NOT NULL)
+        )
     );
 
     CREATE TABLE IF NOT EXISTS chat_messages (

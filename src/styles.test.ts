@@ -49,6 +49,40 @@ test("the keyboard splitter uses a short focus indicator rather than a full-heig
   );
 });
 
+test("the sidebar splitter keeps a wide hit target with only a one-pixel visual divider", () => {
+  expect(stylesheet).toMatch(
+    /\.sidebar-resize-handle\s*\{[^}]*width: 4px;[^}]*background: transparent;/,
+  );
+  expect(stylesheet).toMatch(
+    /\.sidebar-resize-handle::after\s*\{[^}]*left: 1px;[^}]*width: 1px;[^}]*background: var\(--sidebar-border\);/,
+  );
+  expect(stylesheet).toMatch(
+    /html\[data-inbox-sidebar-resizing\]\s*\{[^}]*cursor: col-resize;[^}]*user-select: none;/,
+  );
+});
+
+test("native controls and inherited sidebar copy keep explicit system-theme contrast", () => {
+  expect(stylesheet).toMatch(/:root\s*\{[^}]*color-scheme: light;/);
+  expect(stylesheet).toMatch(/:root\[data-appearance="dark"\]\s*\{[^}]*color-scheme: dark;/);
+  expect(stylesheet).not.toMatch(/@media \(prefers-color-scheme: dark\)/);
+  expect(stylesheet).toMatch(
+    /\.product-composer-input\s*\{[^}]*color: var\(--foreground\);[^}]*caret-color: var\(--foreground\);/,
+  );
+  expect(stylesheet).toMatch(
+    /\.project-row-name,[\s\S]*?\.draft-row-prompt\s*\{[^}]*color: var\(--sidebar-foreground\);/,
+  );
+});
+
+test("long chat branches stay inside their inbox metadata column", () => {
+  expect(stylesheet).toMatch(/\.chat-row-copy\s*\{[\s\S]*?display: grid;[\s\S]*?min-width: 0;/);
+  expect(stylesheet).toMatch(
+    /\.chat-row-metadata span:first-child\s*\{[\s\S]*?max-width: 42%;[\s\S]*?overflow: hidden;[\s\S]*?text-overflow: ellipsis;/,
+  );
+  expect(stylesheet).toMatch(
+    /\.chat-row-metadata span:last-child\s*\{[\s\S]*?min-width: 0;[\s\S]*?overflow: hidden;[\s\S]*?text-overflow: ellipsis;/,
+  );
+});
+
 test("model resources compose the shared controls without a second custom control system", () => {
   expect(modelResourceSource).not.toMatch(/<(?:button|input)\b/);
   expect(modelResourceSource).toContain("<Button");

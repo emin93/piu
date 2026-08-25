@@ -11,6 +11,9 @@ const gitSmoke = await mkdtemp(join(tmpdir(), "piu-packaged-git-smoke-"));
 const appContents = resolve(dirname(executable), "..");
 const gitRoot = join(appContents, "Resources", "git");
 const gitExecutable = join(gitRoot, "bin", "git");
+const agentRuntimeRoot = join(appContents, "Resources", "agent-runtime");
+const nodeExecutable = join(agentRuntimeRoot, "node", "bin", "node");
+const piRoot = join(agentRuntimeRoot, "pi");
 const gitEnvironment = {
   HOME: join(gitSmoke, "home"),
   PATH: "/usr/bin:/bin",
@@ -20,7 +23,6 @@ const gitEnvironment = {
   GIT_EXEC_PATH: join(gitRoot, "libexec", "git-core"),
   GIT_TEMPLATE_DIR: join(gitRoot, "share", "git-core", "templates"),
 };
-const startedAt = performance.now();
 const output = [];
 let child;
 let readinessTimeout;
@@ -71,6 +73,43 @@ try {
   );
   console.log("PACKAGED_GIT_VERSION=2.55.0");
 
+  const nodeVersion = spawnSync(nodeExecutable, ["--version"], {
+    cwd: piRoot,
+    env: { LC_ALL: "C", PATH: "/usr/bin:/bin" },
+    encoding: "utf8",
+  });
+  if (nodeVersion.status !== 0 || nodeVersion.stdout.trim() !== "v24.19.0") {
+    throw new Error(
+      `Packaged Node did not report v24.19.0: ${nodeVersion.stderr || nodeVersion.error}`,
+    );
+  }
+  const piProbe = spawnSync(
+    nodeExecutable,
+    [
+      "--input-type=module",
+      "--eval",
+      [
+        'const agent = await import("@earendil-works/pi-coding-agent");',
+        'const ai = await import("@earendil-works/pi-ai");',
+        'if (typeof agent.createAgentSessionRuntime !== "function") throw new Error("missing createAgentSessionRuntime");',
+        'if (typeof agent.runRpcMode !== "function") throw new Error("missing runRpcMode");',
+        'if (typeof agent.ModelRuntime !== "function") throw new Error("missing ModelRuntime");',
+        'if (typeof ai.createModels !== "function") throw new Error("missing createModels");',
+      ].join("\n"),
+    ],
+    {
+      cwd: piRoot,
+      env: { LC_ALL: "C", PATH: "/usr/bin:/bin" },
+      encoding: "utf8",
+    },
+  );
+  if (piProbe.status !== 0) {
+    throw new Error(`Packaged Pi public exports failed: ${piProbe.stderr || piProbe.error}`);
+  }
+  console.log("PACKAGED_NODE_VERSION=24.19.0");
+  console.log("PACKAGED_PI_VERSION=0.84.3");
+
+  const processStartedAt = performance.now();
   child = spawn(executable, [], {
     cwd: dirname(executable),
     env: {
@@ -108,7 +147,7 @@ try {
 
   await Promise.race([ready, timeout]);
   clearTimeout(readinessTimeout);
-  console.log(`PACKAGED_LAUNCH_MS=${Math.round(performance.now() - startedAt)}`);
+  console.log(`PACKAGED_LAUNCH_MS=${Math.round(performance.now() - processStartedAt)}`);
 } catch (error) {
   throw new Error(`${error.message}\n${output.join("")}`, { cause: error });
 } finally {

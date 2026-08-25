@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { expect, test, vi } from "vitest";
 
 import type { InboxSnapshot } from "../../platform/project-inbox";
+import type { ConversationAdapter } from "../../platform/conversations";
 import { ProjectDraftController } from "./draft-controller";
 import { InboxWorkspace } from "./InboxWorkspace";
 import { ChatSetupController } from "./setup-controller";
@@ -15,6 +16,15 @@ const readySetup = {
   signal: null,
   attempt: 1,
   log: "",
+};
+
+const conversationAdapter: ConversationAdapter = {
+  connect: vi.fn().mockResolvedValue({
+    disconnect: vi.fn(),
+    snapshot: { failure: null, items: [], phase: "idle" },
+  }),
+  prompt: vi.fn().mockResolvedValue(undefined),
+  stop: vi.fn().mockResolvedValue(undefined),
 };
 
 const populatedSnapshot: InboxSnapshot = {
@@ -110,12 +120,15 @@ function WorkspaceHarness({
   return (
     <InboxWorkspace
       actionError={undefined}
+      conversationAdapter={conversationAdapter}
+      conversationRevision={0}
       drafts={drafts}
       onCancelSetup={vi.fn().mockResolvedValue(undefined)}
       onCreateChat={vi.fn().mockResolvedValue(undefined)}
       onOpenRepository={vi.fn()}
       onOpenTerminal={vi.fn().mockResolvedValue(undefined)}
       onOpenSettings={vi.fn()}
+      onRequestCodexSignIn={vi.fn()}
       onQueryChange={setQuery}
       onRemoveProject={onRemove}
       onRetrySetup={vi.fn().mockResolvedValue(undefined)}
@@ -139,12 +152,15 @@ test("exposes Settings as a quiet sidebar footer action", async () => {
   render(
     <InboxWorkspace
       actionError={undefined}
+      conversationAdapter={conversationAdapter}
+      conversationRevision={0}
       drafts={new ProjectDraftController(() => Promise.resolve())}
       onCancelSetup={vi.fn().mockResolvedValue(undefined)}
       onCreateChat={vi.fn().mockResolvedValue(undefined)}
       onOpenRepository={vi.fn()}
       onOpenTerminal={vi.fn().mockResolvedValue(undefined)}
       onOpenSettings={openSettings}
+      onRequestCodexSignIn={vi.fn()}
       onQueryChange={vi.fn()}
       onRemoveProject={vi.fn().mockResolvedValue(undefined)}
       onRetrySetup={vi.fn().mockResolvedValue(undefined)}
@@ -240,10 +256,14 @@ test("the inbox sidebar drag width stays on the four-pixel grid", () => {
   render(<WorkspaceHarness />);
 
   const resizeHandle = screen.getByRole("separator", { name: "Resize inbox" });
-  fireEvent.pointerDown(resizeHandle, { clientX: 100, pointerId: 1 });
+  expect(fireEvent.pointerDown(resizeHandle, { clientX: 100, pointerId: 1 })).toBe(false);
+  expect(document.documentElement).toHaveAttribute("data-inbox-sidebar-resizing");
   fireEvent.pointerMove(resizeHandle, { clientX: 111, pointerId: 1 });
 
   expect(resizeHandle).toHaveAttribute("aria-valuenow", "268");
+
+  fireEvent.pointerUp(resizeHandle, { pointerId: 1 });
+  expect(document.documentElement).not.toHaveAttribute("data-inbox-sidebar-resizing");
 });
 
 test("explains unavailable projects and enforces removal rules", async () => {
