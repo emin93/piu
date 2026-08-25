@@ -118,6 +118,7 @@ test("groups the complete inventory with accessible scoped switches", async () =
     <ModelsResourcesPanel
       onResourceEnabledChange={onResourceEnabledChange}
       onRetry={vi.fn()}
+      projectName="Atlas"
       snapshot={snapshot}
     />,
   );
@@ -134,7 +135,7 @@ test("groups the complete inventory with accessible scoped switches", async () =
   expect(screen.getByTestId("managed-local-model")).toBeVisible();
   expect(screen.getByText("Required")).toBeVisible();
   expect(screen.getAllByText("Più").length).toBeGreaterThan(0);
-  expect(screen.getAllByText("Project").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("Project · Atlas").length).toBeGreaterThan(0);
 
   await user.click(screen.getByRole("switch", { name: "Review tools" }));
   expect(onResourceEnabledChange).toHaveBeenCalledWith(
@@ -207,6 +208,23 @@ test("renders a compact loading inventory without blocking managed model control
   );
 
   expect(screen.getByRole("status", { name: "Loading models and resources" })).toBeVisible();
+  expect(screen.getByTestId("managed-local-model")).toBeVisible();
+});
+
+test("does not keep presenting loading rows after an initial inspection failure", () => {
+  render(
+    <ModelsResourcesPanel
+      error="Più couldn’t inspect this project’s agent environment."
+      onResourceEnabledChange={vi.fn()}
+      onRetry={vi.fn()}
+      snapshot={null}
+    />,
+  );
+
+  expect(screen.getByRole("alert")).toBeVisible();
+  expect(
+    screen.queryByRole("status", { name: "Loading models and resources" }),
+  ).not.toBeInTheDocument();
   expect(screen.getByTestId("managed-local-model")).toBeVisible();
 });
 

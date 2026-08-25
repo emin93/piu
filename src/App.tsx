@@ -477,10 +477,12 @@ export function App({
   }, [requestApplicationClose]);
 
   const selectedProject = snapshot.projects.find(({ id }) => id === selectedProjectId);
+  const settingsProject =
+    selectedProject ?? snapshot.projects.find(({ availability }) => availability === "available");
   const selectedChat = snapshot.chats.find(({ id }) => id === selectedChatId);
   const titlebarContext =
     activeSurface === "settings"
-      ? "Settings"
+      ? "Models & Resources"
       : (selectedChat?.title ?? selectedProject?.name ?? "All Projects");
 
   return (
@@ -532,7 +534,11 @@ export function App({
         ) : (
           <main className="deferred-workspace">
             <div className="conversation-stage">
-              <DeferredSurface onClose={closeDeferredSurface} surface={activeSurface} />
+              <DeferredSurface
+                onClose={closeDeferredSurface}
+                project={settingsProject}
+                surface={activeSurface}
+              />
             </div>
           </main>
         )}

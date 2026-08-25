@@ -95,10 +95,7 @@ test("a new chat uses the exact app directories and explicit resource paths", as
   assert.deepEqual(result.session, { id: "session" });
   assert.deepEqual(
     calls.find(([kind]) => kind === "modelRuntime"),
-    [
-      "modelRuntime",
-      { credentials, modelsPath: join(paths.agentDirectory, "models.json") },
-    ],
+    ["modelRuntime", { credentials, modelsPath: join(paths.agentDirectory, "models.json") }],
   );
   assert.deepEqual(
     calls.find(([kind]) => kind === "createSession"),

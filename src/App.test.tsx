@@ -534,10 +534,10 @@ test("Settings preserves the selected project and its draft when returning to In
   await user.type(draft, " while away");
   await user.click(screen.getByRole("button", { name: "Settings" }));
 
-  expect(await screen.findByRole("heading", { name: "Settings" })).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "Models & Resources" })).toBeVisible();
   const backToInbox = screen.getByRole("button", { name: "Back to Inbox" });
   await waitFor(() => expect(backToInbox).toHaveFocus());
-  expect(screen.getByText("Settings", { selector: ".titlebar-context" })).toBeVisible();
+  expect(screen.getByText("Models & Resources", { selector: ".titlebar-context" })).toBeVisible();
   expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Keep this draft while away", []);
 
   await user.click(backToInbox);

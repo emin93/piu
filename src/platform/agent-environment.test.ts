@@ -2,7 +2,10 @@ import { beforeEach, expect, test, vi } from "vitest";
 
 import type { ModelControlsSnapshot } from "@/generated/ModelControlsSnapshot";
 
-import { tauriProjectModelControlsAdapter } from "./agent-environment";
+import {
+  tauriAgentEnvironmentAdapter,
+  tauriProjectModelControlsAdapter,
+} from "./agent-environment";
 
 const boundary = vi.hoisted(() => ({ invoke: vi.fn() }));
 
@@ -51,5 +54,47 @@ test("project model controls use the typed agent environment commands", async ()
       },
     ],
     ["select_project_reasoning_effort", { request: { projectId: 7, effort: "xhigh" } }],
+  ]);
+});
+
+test("resource inventory and preference changes stay behind the typed environment boundary", async () => {
+  const environment = {
+    diagnostics: [],
+    modelControls: controls,
+    modelRoutes: [],
+    resources: { extensions: [], packages: [], skills: [] },
+  };
+  const change = {
+    deferredChatCount: 1,
+    enabled: false,
+    resource: { kind: "skill" as const, id: "project://skills/review" },
+    scope: "project" as const,
+    status: "deferred" as const,
+  };
+  boundary.invoke.mockResolvedValueOnce(environment).mockResolvedValueOnce(change);
+
+  await expect(tauriAgentEnvironmentAdapter.get(7)).resolves.toEqual(environment);
+  await expect(
+    tauriAgentEnvironmentAdapter.setEnabled(
+      7,
+      "project",
+      { kind: "skill", id: "project://skills/review" },
+      false,
+    ),
+  ).resolves.toEqual(change);
+
+  expect(boundary.invoke.mock.calls).toEqual([
+    ["get_project_agent_environment", { request: { projectId: 7 } }],
+    [
+      "set_agent_resource_enabled",
+      {
+        request: {
+          enabled: false,
+          projectId: 7,
+          resource: { kind: "skill", id: "project://skills/review" },
+          scope: "project",
+        },
+      },
+    ],
   ]);
 });

@@ -23,8 +23,9 @@ interface ModelsResourcesPanelProps {
     enabled: boolean,
     scope: AgentResourcePreferenceScope,
   ) => Promise<void> | void;
-  onRetry: () => Promise<void> | void;
+  onRetry?: () => Promise<void> | void;
   pendingResourceId?: AgentResourceId | null;
+  projectName?: string;
   snapshot: AgentEnvironmentSnapshot | null;
   status?: string | null;
 }
@@ -36,14 +37,14 @@ interface ResourceRowProps {
   pending: boolean;
   resource: AgentResourceId;
   scope: AgentResourcePreferenceScope;
-  source: AgentResourceSource;
+  sourceLabel: string;
   states?: readonly string[];
 }
 
-const SOURCE_LABELS: Record<AgentResourceSource, string> = {
-  piu: "Più",
-  project: "Project",
-};
+function sourceLabel(source: AgentResourceSource, projectName?: string) {
+  if (source === "piu") return "Più";
+  return projectName ? `Project · ${projectName}` : "Project";
+}
 
 function resourceKey(resource: AgentResourceId): string {
   switch (resource.kind) {
@@ -67,7 +68,7 @@ const ResourceRow = memo(function ResourceRow({
   pending,
   resource,
   scope,
-  source,
+  sourceLabel,
   states = [],
 }: ResourceRowProps) {
   return (
@@ -77,7 +78,7 @@ const ResourceRow = memo(function ResourceRow({
           {name}
         </span>
         <span className="models-resources-row__metadata">
-          <span>{SOURCE_LABELS[source]}</span>
+          <span>{sourceLabel}</span>
           {states.map((state) => (
             <span className="models-resources-row__state" key={state}>
               {state}
@@ -147,6 +148,7 @@ function resourceRows(
   resources: readonly AgentResourceSummary[],
   kind: "skill" | "extension",
   pendingResourceId: AgentResourceId | null | undefined,
+  projectName: string | undefined,
   onResourceEnabledChange: ModelsResourcesPanelProps["onResourceEnabledChange"],
 ) {
   const pendingKey = pendingResourceId ? resourceKey(pendingResourceId) : null;
@@ -161,7 +163,7 @@ function resourceRows(
         pending={pendingKey === resourceKey(resource)}
         resource={resource}
         scope={scopeForSource(summary.source)}
-        source={summary.source}
+        sourceLabel={sourceLabel(summary.source, projectName)}
       />
     );
   });
@@ -206,6 +208,7 @@ export const ModelsResourcesPanel = memo(function ModelsResourcesPanel({
   onResourceEnabledChange,
   onRetry,
   pendingResourceId,
+  projectName,
   snapshot,
   status,
 }: ModelsResourcesPanelProps) {
@@ -226,9 +229,11 @@ export const ModelsResourcesPanel = memo(function ModelsResourcesPanel({
       {error ? (
         <div className="models-resources-error" role="alert">
           <p>{error}</p>
-          <Button onClick={() => void onRetry()} type="button" variant="outline">
-            Retry
-          </Button>
+          {onRetry ? (
+            <Button onClick={() => void onRetry()} type="button" variant="outline">
+              Retry
+            </Button>
+          ) : null}
         </div>
       ) : null}
       {generalDiagnostics?.length ? (
@@ -266,7 +271,7 @@ export const ModelsResourcesPanel = memo(function ModelsResourcesPanel({
                     pending={pendingKey === resourceKey(resource)}
                     resource={resource}
                     scope="global"
-                    source="piu"
+                    sourceLabel="Più"
                   />
                 );
               })}
@@ -284,6 +289,7 @@ export const ModelsResourcesPanel = memo(function ModelsResourcesPanel({
                 snapshot.resources.skills,
                 "skill",
                 pendingResourceId,
+                projectName,
                 onResourceEnabledChange,
               )}
             </ul>
@@ -302,6 +308,7 @@ export const ModelsResourcesPanel = memo(function ModelsResourcesPanel({
                 snapshot.resources.extensions,
                 "extension",
                 pendingResourceId,
+                projectName,
                 onResourceEnabledChange,
               )}
             </ul>
@@ -327,7 +334,7 @@ export const ModelsResourcesPanel = memo(function ModelsResourcesPanel({
                     pending={pendingKey === resourceKey(resource)}
                     resource={resource}
                     scope={scopeForSource(summary.source)}
-                    source={summary.source}
+                    sourceLabel={sourceLabel(summary.source, projectName)}
                     states={packageStates(summary)}
                   />
                 );
@@ -342,7 +349,7 @@ export const ModelsResourcesPanel = memo(function ModelsResourcesPanel({
           <h2>Managed local model</h2>
           <span className="models-resources-required">Required</span>
         </header>
-        <ModelResourcePanel context="settings" />
+        <ModelResourcePanel context="settings" embedded />
       </section>
     </div>
   );
