@@ -20,6 +20,9 @@ use crate::{
         PromptAttachment, PromptAttachmentError, image_payloads, prompt_text,
         validate as validate_attachments,
     },
+    runtime_preferences::{
+        ModelRoute as PersistedModelRoute, RuntimePreferences, RuntimePreferencesError,
+    },
 };
 
 const MODEL_PROVIDER: &str = "openai-codex";
@@ -306,6 +309,12 @@ pub enum ChatRuntimeHostError {
     InputNotPending { chat_id: String, request_id: String },
     #[error("the answer does not match the pending extension input")]
     InvalidInputAnswer,
+    #[error("model route {provider}/{model_id} is unavailable")]
+    ModelUnavailable { provider: String, model_id: String },
+    #[error("reasoning effort {effort:?} is unavailable for the selected model")]
+    EffortUnavailable { effort: ReasoningEffort },
+    #[error("Pi did not retain the requested model controls")]
+    InferenceChangeRejected,
     #[error("chat {chat_id} cannot start before setup finishes ({phase:?})")]
     SetupIncomplete {
         chat_id: String,
@@ -327,6 +336,8 @@ pub enum ChatRuntimeHostError {
     Rpc(#[from] PiRpcError),
     #[error(transparent)]
     Attachment(#[from] PromptAttachmentError),
+    #[error(transparent)]
+    Preferences(#[from] RuntimePreferencesError),
     #[error("chat runtime lock is poisoned")]
     Lock,
 }
@@ -412,6 +423,7 @@ impl ConversationProjection {
 struct HostInner {
     inbox: Arc<ProjectInbox>,
     workspaces: Arc<ChatWorkspaces>,
+    preferences: Arc<RuntimePreferences>,
     paths: RuntimePaths,
     slots: Mutex<HashMap<String, Arc<ChatSlot>>>,
     events: broadcast::Sender<ChatRuntimeChangedEvent>,
@@ -467,6 +479,9 @@ impl ChatRuntimeHost {
             inner: Arc::new(HostInner {
                 inbox,
                 workspaces,
+                preferences: Arc::new(RuntimePreferences::open(
+                    &app_data_directory.join("piu.sqlite3"),
+                )?),
                 paths: RuntimePaths {
                     node: resource_directory.join("agent-runtime/node/bin/node"),
                     launcher: resource_directory
@@ -545,11 +560,15 @@ impl ChatRuntimeHost {
             .iter()
             .any(|available| available.id == route)
         {
-            return Err(ChatRuntimeHostError::InvalidSessionState(
-                "the selected model route was not available from Pi".into(),
-            ));
+            return Err(ChatRuntimeHostError::ModelUnavailable {
+                provider: route.provider,
+                model_id: route.model_id,
+            });
         }
-        child
+        let persisted_route = PersistedModelRoute::new(&route.provider, &route.model_id)?;
+        let remembered_effort =
+            remembered_effort(Arc::clone(&self.inner.preferences), persisted_route.clone()).await?;
+        if let Err(error) = child
             .request(
                 serde_json::json!({
                     "type": "set_model",
@@ -558,20 +577,62 @@ impl ChatRuntimeHost {
                 }),
                 CancellationToken::new(),
             )
-            .await?;
-        match model_controls_snapshot(&slot, &child).await {
-            Ok(snapshot) if snapshot.selected_route == route => Ok(snapshot),
+            .await
+        {
+            rollback_model_controls(&child, &previous).await;
+            return Err(error.into());
+        }
+        let mut applied = match model_controls_snapshot(&slot, &child).await {
+            Ok(snapshot) if snapshot.selected_route == route => snapshot,
             Ok(_) => {
                 rollback_model_controls(&child, &previous).await;
-                Err(ChatRuntimeHostError::InvalidSessionState(
-                    "Pi did not apply the selected model route".into(),
-                ))
+                return Err(ChatRuntimeHostError::InferenceChangeRejected);
             }
             Err(error) => {
                 rollback_model_controls(&child, &previous).await;
-                Err(error)
+                return Err(error);
             }
+        };
+        if let Some(remembered_effort) = remembered_effort
+            && applied.efforts.contains(&remembered_effort)
+            && applied.selected_effort != remembered_effort
+        {
+            if let Err(error) = child
+                .request(
+                    serde_json::json!({
+                        "type": "set_thinking_level",
+                        "level": remembered_effort.as_pi(),
+                    }),
+                    CancellationToken::new(),
+                )
+                .await
+            {
+                rollback_model_controls(&child, &previous).await;
+                return Err(error.into());
+            }
+            applied = match model_controls_snapshot(&slot, &child).await {
+                Ok(snapshot) if snapshot.selected_effort == remembered_effort => snapshot,
+                Ok(_) => {
+                    rollback_model_controls(&child, &previous).await;
+                    return Err(ChatRuntimeHostError::InferenceChangeRejected);
+                }
+                Err(error) => {
+                    rollback_model_controls(&child, &previous).await;
+                    return Err(error);
+                }
+            };
         }
+        if let Err(error) = persist_selected_route(
+            Arc::clone(&self.inner.preferences),
+            persisted_route,
+            applied.selected_effort,
+        )
+        .await
+        {
+            rollback_model_controls(&child, &previous).await;
+            return Err(error);
+        }
+        Ok(applied)
     }
 
     pub async fn select_reasoning_effort(
@@ -585,11 +646,9 @@ impl ChatRuntimeHost {
         let child = active_child(&slot, chat_id)?;
         let previous = model_controls_snapshot(&slot, &child).await?;
         if !previous.efforts.contains(&effort) {
-            return Err(ChatRuntimeHostError::InvalidSessionState(
-                "the selected reasoning effort was not available from Pi".into(),
-            ));
+            return Err(ChatRuntimeHostError::EffortUnavailable { effort });
         }
-        child
+        if let Err(error) = child
             .request(
                 serde_json::json!({
                     "type": "set_thinking_level",
@@ -597,14 +656,32 @@ impl ChatRuntimeHost {
                 }),
                 CancellationToken::new(),
             )
-            .await?;
+            .await
+        {
+            rollback_model_controls(&child, &previous).await;
+            return Err(error.into());
+        }
         match model_controls_snapshot(&slot, &child).await {
-            Ok(snapshot) if snapshot.selected_effort == effort => Ok(snapshot),
+            Ok(snapshot) if snapshot.selected_effort == effort => {
+                let route = PersistedModelRoute::new(
+                    &snapshot.selected_route.provider,
+                    &snapshot.selected_route.model_id,
+                )?;
+                if let Err(error) = persist_effort(
+                    Arc::clone(&self.inner.preferences),
+                    route,
+                    snapshot.selected_effort,
+                )
+                .await
+                {
+                    rollback_model_controls(&child, &previous).await;
+                    return Err(error);
+                }
+                Ok(snapshot)
+            }
             Ok(_) => {
                 rollback_model_controls(&child, &previous).await;
-                Err(ChatRuntimeHostError::InvalidSessionState(
-                    "Pi did not apply the selected reasoning effort".into(),
-                ))
+                Err(ChatRuntimeHostError::InferenceChangeRejected)
             }
             Err(error) => {
                 rollback_model_controls(&child, &previous).await;
@@ -1069,11 +1146,12 @@ impl ChatRuntimeHost {
             ));
         }
         let spec = self.process_spec(
+            chat_id,
             &context.worktree_path,
             stored_session
                 .as_ref()
                 .map(|session| session.path.as_path()),
-        );
+        )?;
         let child = Arc::new(PiRpcChild::launch(spec, PiRpcPolicy::default()).await?);
         let opened = self.inspect_opened_session(&child).await;
         let (session, messages) = match opened {
@@ -1460,7 +1538,30 @@ impl ChatRuntimeHost {
         ))
     }
 
-    fn process_spec(&self, worktree: &Path, session_path: Option<&Path>) -> PiRpcProcessSpec {
+    fn process_spec(
+        &self,
+        chat_id: &str,
+        worktree: &Path,
+        session_path: Option<&Path>,
+    ) -> Result<PiRpcProcessSpec, ChatRuntimeHostError> {
+        let initial_selection = self.inner.preferences.initial_chat_selection(chat_id)?;
+        let (model_provider, model_id, thinking_level) = initial_selection
+            .map(|selection| {
+                (
+                    selection.route.provider_id().to_owned(),
+                    selection.route.model_id().to_owned(),
+                    selection
+                        .effort
+                        .unwrap_or_else(|| THINKING_LEVEL.to_owned()),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    MODEL_PROVIDER.to_owned(),
+                    MODEL_ID.to_owned(),
+                    THINKING_LEVEL.to_owned(),
+                )
+            });
         let mut arguments = vec![
             self.inner.paths.launcher.as_os_str().to_owned(),
             flag("--cwd"),
@@ -1476,11 +1577,11 @@ impl ChatRuntimeHost {
                 .as_os_str()
                 .to_owned(),
             flag("--model-provider"),
-            flag(MODEL_PROVIDER),
+            flag(&model_provider),
             flag("--model-id"),
-            flag(MODEL_ID),
+            flag(&model_id),
             flag("--thinking-level"),
-            flag(THINKING_LEVEL),
+            flag(&thinking_level),
         ];
         for skill_directory in [
             self.inner.paths.app_skill_directory.clone(),
@@ -1511,12 +1612,12 @@ impl ChatRuntimeHost {
                 .to_owned(),
         );
         environment.insert(flag("LC_ALL"), flag("C"));
-        PiRpcProcessSpec {
+        Ok(PiRpcProcessSpec {
             executable: self.inner.paths.node.clone(),
             arguments,
             working_directory: worktree.to_path_buf(),
             environment,
-        }
+        })
     }
 
     async fn inspect_opened_session(
@@ -1814,6 +1915,46 @@ async fn rollback_model_controls(child: &PiRpcChild, previous: &ModelControlsSna
             CancellationToken::new(),
         )
         .await;
+}
+
+async fn remembered_effort(
+    preferences: Arc<RuntimePreferences>,
+    route: PersistedModelRoute,
+) -> Result<Option<ReasoningEffort>, ChatRuntimeHostError> {
+    tokio::task::spawn_blocking(move || {
+        preferences
+            .remembered_effort(&route)
+            .map(|effort| effort.as_deref().and_then(ReasoningEffort::from_pi))
+    })
+    .await
+    .map_err(|error| ChatRuntimeHostError::InvalidSessionState(error.to_string()))?
+    .map_err(Into::into)
+}
+
+async fn persist_selected_route(
+    preferences: Arc<RuntimePreferences>,
+    route: PersistedModelRoute,
+    effort: ReasoningEffort,
+) -> Result<(), ChatRuntimeHostError> {
+    tokio::task::spawn_blocking(move || {
+        preferences.remember_effort(&route, effort.as_pi())?;
+        preferences.select_route(&route)?;
+        Ok::<_, RuntimePreferencesError>(())
+    })
+    .await
+    .map_err(|error| ChatRuntimeHostError::InvalidSessionState(error.to_string()))?
+    .map_err(Into::into)
+}
+
+async fn persist_effort(
+    preferences: Arc<RuntimePreferences>,
+    route: PersistedModelRoute,
+    effort: ReasoningEffort,
+) -> Result<(), ChatRuntimeHostError> {
+    tokio::task::spawn_blocking(move || preferences.remember_effort(&route, effort.as_pi()))
+        .await
+        .map_err(|error| ChatRuntimeHostError::InvalidSessionState(error.to_string()))?
+        .map_err(Into::into)
 }
 
 async fn child_accepts_images(child: &PiRpcChild) -> Result<bool, ChatRuntimeHostError> {

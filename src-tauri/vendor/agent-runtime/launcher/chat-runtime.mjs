@@ -50,7 +50,10 @@ export async function createPiuChatRuntime(
   { credentials, createNewSessionManager = createPersistedSessionManager, pi },
 ) {
   validate(config);
-  const modelRuntime = await pi.ModelRuntime.create({ credentials, modelsPath: null });
+  const modelRuntime = await pi.ModelRuntime.create({
+    credentials,
+    modelsPath: join(config.agentDirectory, "models.json"),
+  });
   const initialSessionManager = config.sessionPath
     ? pi.SessionManager.open(config.sessionPath, config.sessionDirectory)
     : await createNewSessionManager({

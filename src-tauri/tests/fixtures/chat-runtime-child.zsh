@@ -113,9 +113,14 @@ while IFS= read -r line; do
       printf '{"id":"%s","type":"response","command":"get_available_models","success":true,"data":{"models":[{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true,"input":["text","image"]},{"provider":"local-mlx","id":"qwen3.8-27b","name":"Qwen 3.8 27B","reasoning":true,"input":["text"]}]}}\n' "$id"
       ;;
     set_model)
-      if [[ "$line" == *'"provider":"local-mlx"'* && "$line" == *'"modelId":"qwen3.8-27b"'* ]]; then
+      if [[ "$mode" == "reject-model" ]]; then
+        printf '{"id":"%s","type":"response","command":"set_model","success":false,"error":"fixture route rejection"}\n' "$id"
+      elif [[ "$line" == *'"provider":"local-mlx"'* && "$line" == *'"modelId":"qwen3.8-27b"'* ]]; then
         model_provider="local-mlx"
         model_id="qwen3.8-27b"
+        if [[ "$thinking_level" != "low" && "$thinking_level" != "medium" && "$thinking_level" != "xhigh" ]]; then
+          thinking_level="xhigh"
+        fi
         printf '{"id":"%s","type":"response","command":"set_model","success":true,"data":{"provider":"local-mlx","id":"qwen3.8-27b","name":"Qwen 3.8 27B","reasoning":true,"input":["text"]}}\n' "$id"
       elif [[ "$line" == *'"provider":"openai-codex"'* && "$line" == *'"modelId":"gpt-5.6-sol"'* ]]; then
         model_provider="openai-codex"
@@ -126,7 +131,9 @@ while IFS= read -r line; do
       fi
       ;;
     get_available_thinking_levels)
-      if [[ "$model_provider" == "local-mlx" ]]; then
+      if [[ "$mode" == "reject-thinking-levels" && "$model_provider" == "local-mlx" ]]; then
+        printf '{"id":"%s","type":"response","command":"get_available_thinking_levels","success":false,"error":"fixture levels rejection"}\n' "$id"
+      elif [[ "$model_provider" == "local-mlx" ]]; then
         printf '{"id":"%s","type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["low","medium","xhigh"]}}\n' "$id"
       else
         printf '{"id":"%s","type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off","minimal","low","medium","high","xhigh","max"]}}\n' "$id"

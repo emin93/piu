@@ -90,6 +90,9 @@ pub enum ChatRuntimeCommandErrorCode {
     ModelMediaUnsupported,
     InputNotPending,
     InvalidInputAnswer,
+    ModelUnavailable,
+    EffortUnavailable,
+    InferenceChangeRejected,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -118,6 +121,18 @@ impl From<ChatRuntimeHostError> for ChatRuntimeCommandError {
             ChatRuntimeHostError::InvalidInputAnswer => Self {
                 code: ChatRuntimeCommandErrorCode::InvalidInputAnswer,
                 message: "Choose one of the answers shown by Pi.".into(),
+            },
+            ChatRuntimeHostError::ModelUnavailable { .. } => Self {
+                code: ChatRuntimeCommandErrorCode::ModelUnavailable,
+                message: "That model is no longer available. Choose another model.".into(),
+            },
+            ChatRuntimeHostError::EffortUnavailable { .. } => Self {
+                code: ChatRuntimeCommandErrorCode::EffortUnavailable,
+                message: "That reasoning effort is unavailable for this model.".into(),
+            },
+            ChatRuntimeHostError::InferenceChangeRejected => Self {
+                code: ChatRuntimeCommandErrorCode::InferenceChangeRejected,
+                message: "Pi couldn’t switch models. The previous model is still selected.".into(),
             },
             ChatRuntimeHostError::SetupIncomplete { .. } => Self {
                 code: ChatRuntimeCommandErrorCode::SetupIncomplete,
@@ -166,6 +181,7 @@ impl From<ChatRuntimeHostError> for ChatRuntimeCommandError {
                         .into(),
             },
             ChatRuntimeHostError::RuntimeStorage(_)
+            | ChatRuntimeHostError::Preferences(_)
             | ChatRuntimeHostError::Inbox(_)
             | ChatRuntimeHostError::Workspace(_)
             | ChatRuntimeHostError::Lock => Self {

@@ -14,6 +14,7 @@ use piu_lib::{
     git_process::GitProcess,
     project_inbox::{ChatSetupPhase, ProjectInbox},
     prompt_attachments::{PromptAttachment, PromptAttachmentError, PromptAttachmentKind},
+    runtime_preferences::RuntimePreferences,
 };
 use support::{TemporaryAppData, TemporaryGitRemote};
 
@@ -93,12 +94,121 @@ async fn model_and_effort_controls_follow_the_native_pi_rpc_contract_without_res
         .await
         .unwrap();
     assert_eq!(adjusted.selected_effort, ReasoningEffort::Medium);
+    fixture
+        .host
+        .select_model_route(
+            &fixture.chat_id,
+            ModelRouteId {
+                provider: "openai-codex".into(),
+                model_id: "gpt-5.6-sol".into(),
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .host
+        .select_reasoning_effort(&fixture.chat_id, ReasoningEffort::High)
+        .await
+        .unwrap();
+    let restored = fixture
+        .host
+        .select_model_route(
+            &fixture.chat_id,
+            ModelRouteId {
+                provider: "local-mlx".into(),
+                model_id: "qwen3.8-27b".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored.selected_effort, ReasoningEffort::Medium);
     assert_eq!(fixture.record("launches").lines().count(), 1);
     let commands = fixture.record("commands");
     assert!(commands.contains("\"type\":\"set_model\""));
     assert!(commands.contains("\"modelId\":\"qwen3.8-27b\""));
     assert!(commands.contains("\"type\":\"set_thinking_level\""));
     assert!(!commands.contains("\"type\":\"abort\""));
+}
+
+#[tokio::test]
+async fn a_partial_model_change_rolls_back_the_previous_route_and_effort() {
+    let fixture = ChatFixture::with_options(true, true, "reject-thinking-levels");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+
+    fixture
+        .host
+        .select_model_route(
+            &fixture.chat_id,
+            ModelRouteId {
+                provider: "local-mlx".into(),
+                model_id: "qwen3.8-27b".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    let commands = fixture.record("commands");
+    let selected = commands
+        .find("\"modelId\":\"qwen3.8-27b\"")
+        .expect("requested route should reach Pi");
+    let restored = commands
+        .rfind("\"modelId\":\"gpt-5.6-sol\"")
+        .expect("the previous route should be restored");
+    assert!(restored > selected);
+    assert!(commands[restored..].contains("\"level\":\"xhigh\""));
+    assert_eq!(fixture.record("launches").lines().count(), 1);
+    assert!(!commands.contains("\"type\":\"abort\""));
+}
+
+#[tokio::test]
+async fn a_new_chat_launches_with_its_captured_route_across_host_relaunch() {
+    let fixture = ChatFixture::new(true);
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture
+        .host
+        .select_model_route(
+            &fixture.chat_id,
+            ModelRouteId {
+                provider: "local-mlx".into(),
+                model_id: "qwen3.8-27b".into(),
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .host
+        .select_reasoning_effort(&fixture.chat_id, ReasoningEffort::Medium)
+        .await
+        .unwrap();
+
+    let captured_chat = fixture.create_chat("Use the remembered local route");
+    fixture
+        .host
+        .select_model_route(
+            &fixture.chat_id,
+            ModelRouteId {
+                provider: "openai-codex".into(),
+                model_id: "gpt-5.6-sol".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let preferences = RuntimePreferences::open(&fixture._app_data.database_path()).unwrap();
+    let captured = preferences
+        .initial_chat_selection(&captured_chat)
+        .unwrap()
+        .expect("new chat should journal its inference selection");
+    assert_eq!(captured.route.provider_id(), "local-mlx");
+    assert_eq!(captured.route.model_id(), "qwen3.8-27b");
+    assert_eq!(captured.effort.as_deref(), Some("medium"));
+
+    let relaunched_host = fixture.fresh_host();
+    relaunched_host.open(&captured_chat).await.unwrap();
+    let arguments = fixture.record("arguments");
+    assert!(arguments.contains("--model-provider\nlocal-mlx\n"));
+    assert!(arguments.contains("--model-id\nqwen3.8-27b\n"));
+    assert!(arguments.contains("--thinking-level\nmedium\n"));
 }
 
 impl ChatFixture {

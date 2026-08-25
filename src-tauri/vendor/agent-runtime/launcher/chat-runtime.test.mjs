@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import test from "node:test";
 
 import { createPiuChatRuntime } from "./chat-runtime.mjs";
@@ -93,7 +94,10 @@ test("a new chat uses the exact app directories and explicit skill paths", async
   assert.deepEqual(result.session, { id: "session" });
   assert.deepEqual(
     calls.find(([kind]) => kind === "modelRuntime"),
-    ["modelRuntime", { credentials, modelsPath: null }],
+    [
+      "modelRuntime",
+      { credentials, modelsPath: join(paths.agentDirectory, "models.json") },
+    ],
   );
   assert.deepEqual(
     calls.find(([kind]) => kind === "createSession"),
