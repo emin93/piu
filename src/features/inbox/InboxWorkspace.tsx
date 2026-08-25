@@ -766,7 +766,12 @@ export function InboxWorkspace({
             setups={setups}
           />
         ) : targetProject ? (
-          <ChatComposer drafts={drafts} onSubmit={onCreateChat} project={targetProject} />
+          <ChatComposer
+            drafts={drafts}
+            key={targetProject.id}
+            onSubmit={onCreateChat}
+            project={targetProject}
+          />
         ) : null}
       </section>
 

@@ -5,6 +5,7 @@ import { expect, test, vi } from "vitest";
 
 import type { InboxSnapshot } from "../../platform/project-inbox";
 import type { ConversationAdapter } from "../../platform/conversations";
+import type { PromptAttachment } from "../../platform/prompt-attachments";
 import { ProjectDraftController } from "./draft-controller";
 import { ChatActivityController } from "./chat-activity-controller";
 import { InboxWorkspace } from "./InboxWorkspace";
@@ -86,11 +87,17 @@ const populatedSnapshot: InboxSnapshot = {
 
 function WorkspaceHarness({
   initialSnapshot = populatedSnapshot,
+  onCreate = vi.fn().mockResolvedValue(undefined),
   onRemove = vi.fn().mockResolvedValue(undefined),
   onRename = vi.fn().mockResolvedValue(undefined),
   onSave,
 }: {
   initialSnapshot?: InboxSnapshot;
+  onCreate?: (
+    projectId: number,
+    prompt: string,
+    attachments: readonly PromptAttachment[],
+  ) => Promise<string | undefined>;
   onRemove?: (projectId: number) => Promise<string | undefined>;
   onRename?: (chatId: string, title: string) => Promise<string | undefined>;
   onSave?: (projectId: number, prompt: string) => Promise<void>;
@@ -130,7 +137,7 @@ function WorkspaceHarness({
       conversationRevision={0}
       drafts={drafts}
       onCancelSetup={vi.fn().mockResolvedValue(undefined)}
-      onCreateChat={vi.fn().mockResolvedValue(undefined)}
+      onCreateChat={onCreate}
       onOpenRepository={vi.fn()}
       onOpenTerminal={vi.fn().mockResolvedValue(undefined)}
       onOpenSettings={vi.fn()}
@@ -253,6 +260,26 @@ test("keeps one controlled draft per project across navigation", async () => {
   expect(screen.getByRole("textbox", { name: "Draft for Atlas" })).toHaveValue(
     "A replacement prompt",
   );
+});
+
+test("scopes a failed chat submission to the project that produced it", async () => {
+  const onCreate = vi
+    .fn()
+    .mockResolvedValueOnce("Più couldn’t fetch a fresh origin/main. Check remote access and try again.")
+    .mockResolvedValue(undefined);
+  const user = userEvent.setup();
+  render(<WorkspaceHarness onCreate={onCreate} />);
+
+  const atlasDraft = screen.getByRole("textbox", { name: "Draft for Atlas" });
+  await user.clear(atlasDraft);
+  await user.type(atlasDraft, "Create the Atlas chat");
+  await user.click(screen.getByRole("button", { name: "Send message" }));
+  expect(await screen.findByText(/couldn’t fetch a fresh origin\/main/)).toBeVisible();
+
+  await user.click(screen.getByRole("button", { name: /Caldera, available, 0 active chats/ }));
+
+  expect(screen.getByRole("textbox", { name: "Draft for Caldera" })).toBeVisible();
+  expect(screen.queryByText(/couldn’t fetch a fresh origin\/main/)).not.toBeInTheDocument();
 });
 
 test("All Projects uses the first available project as the centered composer target", async () => {
