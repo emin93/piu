@@ -38,6 +38,9 @@ request_type() {
 
 agent_dir="$(value_for --agent-dir "$@")"
 session_dir="$(value_for --session-dir "$@")"
+model_provider="$(value_for --model-provider "$@")"
+model_id="$(value_for --model-id "$@")"
+thinking_level="$(value_for --thinking-level "$@")"
 session_path="$(value_for --session-path "$@" 2>/dev/null || true)"
 if [[ -z "$session_path" ]]; then
   session_id="pi-${PWD:t}"
@@ -72,7 +75,11 @@ respond_state() {
   if [[ "$mode" == "text-only" ]]; then
     model_input='["text"]'
   fi
-  printf '{"id":"%s","type":"response","command":"get_state","success":true,"data":{"sessionId":"%s","sessionFile":"%s","model":{"input":%s},"isStreaming":false,"thinkingLevel":"xhigh","messageCount":0,"pendingMessageCount":0}}\n' "$id" "$session_id" "$session_path" "$model_input"
+  local model_name="GPT-5.6 Sol"
+  if [[ "$model_provider" == "local-mlx" ]]; then
+    model_name="Qwen 3.8 27B"
+  fi
+  printf '{"id":"%s","type":"response","command":"get_state","success":true,"data":{"sessionId":"%s","sessionFile":"%s","model":{"provider":"%s","id":"%s","name":"%s","input":%s},"isStreaming":false,"thinkingLevel":"%s","messageCount":0,"pendingMessageCount":0}}\n' "$id" "$session_id" "$session_path" "$model_provider" "$model_id" "$model_name" "$model_input" "$thinking_level"
 }
 
 IFS= read -r readiness
@@ -101,6 +108,38 @@ while IFS= read -r line; do
       else
         printf '{"id":"%s","type":"response","command":"get_messages","success":true,"data":{"messages":[]}}\n' "$id"
       fi
+      ;;
+    get_available_models)
+      printf '{"id":"%s","type":"response","command":"get_available_models","success":true,"data":{"models":[{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true,"input":["text","image"]},{"provider":"local-mlx","id":"qwen3.8-27b","name":"Qwen 3.8 27B","reasoning":true,"input":["text"]}]}}\n' "$id"
+      ;;
+    set_model)
+      if [[ "$line" == *'"provider":"local-mlx"'* && "$line" == *'"modelId":"qwen3.8-27b"'* ]]; then
+        model_provider="local-mlx"
+        model_id="qwen3.8-27b"
+        printf '{"id":"%s","type":"response","command":"set_model","success":true,"data":{"provider":"local-mlx","id":"qwen3.8-27b","name":"Qwen 3.8 27B","reasoning":true,"input":["text"]}}\n' "$id"
+      elif [[ "$line" == *'"provider":"openai-codex"'* && "$line" == *'"modelId":"gpt-5.6-sol"'* ]]; then
+        model_provider="openai-codex"
+        model_id="gpt-5.6-sol"
+        printf '{"id":"%s","type":"response","command":"set_model","success":true,"data":{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true,"input":["text","image"]}}\n' "$id"
+      else
+        printf '{"id":"%s","type":"response","command":"set_model","success":false,"error":"Model not found"}\n' "$id"
+      fi
+      ;;
+    get_available_thinking_levels)
+      if [[ "$model_provider" == "local-mlx" ]]; then
+        printf '{"id":"%s","type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["low","medium","xhigh"]}}\n' "$id"
+      else
+        printf '{"id":"%s","type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off","minimal","low","medium","high","xhigh","max"]}}\n' "$id"
+      fi
+      ;;
+    set_thinking_level)
+      for level in off minimal low medium high xhigh max; do
+        if [[ "$line" == *"\"level\":\"$level\""* ]]; then
+          thinking_level="$level"
+          break
+        fi
+      done
+      printf '{"id":"%s","type":"response","command":"set_thinking_level","success":true}\n' "$id"
       ;;
     prompt)
       (( prompt_count += 1 ))

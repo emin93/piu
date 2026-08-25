@@ -6,7 +6,7 @@ use ts_rs::TS;
 use crate::{
     chat_runtime_host::{
         ChatRuntimeChangedEvent, ChatRuntimeHost, ChatRuntimeHostError, ConversationInputAnswer,
-        ConversationSnapshot,
+        ConversationSnapshot, ModelControlsSnapshot, ModelRouteId, ReasoningEffort,
     },
     chat_workspaces::ChatWorkspaceError,
     pi_rpc::PiRpcError,
@@ -21,6 +21,22 @@ pub const CHAT_RUNTIME_CHANGED_EVENT: &str = "chat-runtime://changed";
 #[ts(export, export_to = "../../src/generated/")]
 pub struct OpenChatRuntimeRequest {
     pub chat_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct SelectModelRouteRequest {
+    pub chat_id: String,
+    pub route: ModelRouteId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct SelectReasoningEffortRequest {
+    pub chat_id: String,
+    pub effort: ReasoningEffort,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -218,6 +234,36 @@ pub async fn open_chat_runtime(
     request: OpenChatRuntimeRequest,
 ) -> Result<ConversationSnapshot, ChatRuntimeCommandError> {
     host.open(&request.chat_id).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn get_model_controls(
+    host: State<'_, ChatRuntimeHost>,
+    request: OpenChatRuntimeRequest,
+) -> Result<ModelControlsSnapshot, ChatRuntimeCommandError> {
+    host.model_controls(&request.chat_id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn select_model_route(
+    host: State<'_, ChatRuntimeHost>,
+    request: SelectModelRouteRequest,
+) -> Result<ModelControlsSnapshot, ChatRuntimeCommandError> {
+    host.select_model_route(&request.chat_id, request.route)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn select_reasoning_effort(
+    host: State<'_, ChatRuntimeHost>,
+    request: SelectReasoningEffortRequest,
+) -> Result<ModelControlsSnapshot, ChatRuntimeCommandError> {
+    host.select_reasoning_effort(&request.chat_id, request.effort)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]

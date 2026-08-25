@@ -8,7 +8,7 @@ use piu_lib::{
     chat_runtime_host::{
         ChatRuntimeChangedEvent, ChatRuntimeHost, ChatRuntimeHostError, ConversationEvent,
         ConversationInputAnswer, ConversationInputKind, ConversationItem, ConversationPhase,
-        ConversationSnapshot, ConversationToolStatus,
+        ConversationSnapshot, ConversationToolStatus, ModelRouteId, ReasoningEffort,
     },
     chat_workspaces::ChatWorkspaces,
     git_process::GitProcess,
@@ -28,6 +28,77 @@ struct ChatFixture {
     resource_directory: std::path::PathBuf,
     chat_id: String,
     worktree: std::path::PathBuf,
+}
+
+#[tokio::test]
+async fn model_and_effort_controls_follow_the_native_pi_rpc_contract_without_restarting() {
+    let fixture = ChatFixture::new(true);
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+
+    let initial = fixture.host.model_controls(&fixture.chat_id).await.unwrap();
+    assert_eq!(
+        initial.selected_route,
+        ModelRouteId {
+            provider: "openai-codex".into(),
+            model_id: "gpt-5.6-sol".into(),
+        }
+    );
+    assert_eq!(initial.selected_effort, ReasoningEffort::ExtraHigh);
+    assert!(initial.applies_after_current_step);
+    assert_eq!(
+        initial
+            .routes
+            .iter()
+            .map(|route| (route.name.as_str(), route.accepts_images))
+            .collect::<Vec<_>>(),
+        vec![("GPT-5.6 Sol", true), ("Qwen 3.8 27B", false)]
+    );
+    assert_eq!(
+        initial.efforts,
+        vec![
+            ReasoningEffort::Off,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::ExtraHigh,
+            ReasoningEffort::Maximum,
+        ]
+    );
+
+    let switched = fixture
+        .host
+        .select_model_route(
+            &fixture.chat_id,
+            ModelRouteId {
+                provider: "local-mlx".into(),
+                model_id: "qwen3.8-27b".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(switched.selected_route.provider, "local-mlx");
+    assert_eq!(
+        switched.efforts,
+        vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::ExtraHigh,
+        ]
+    );
+
+    let adjusted = fixture
+        .host
+        .select_reasoning_effort(&fixture.chat_id, ReasoningEffort::Medium)
+        .await
+        .unwrap();
+    assert_eq!(adjusted.selected_effort, ReasoningEffort::Medium);
+    assert_eq!(fixture.record("launches").lines().count(), 1);
+    let commands = fixture.record("commands");
+    assert!(commands.contains("\"type\":\"set_model\""));
+    assert!(commands.contains("\"modelId\":\"qwen3.8-27b\""));
+    assert!(commands.contains("\"type\":\"set_thinking_level\""));
+    assert!(!commands.contains("\"type\":\"abort\""));
 }
 
 impl ChatFixture {

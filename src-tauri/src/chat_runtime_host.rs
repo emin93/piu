@@ -41,6 +41,78 @@ pub enum ConversationPhase {
     Interrupted,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct ModelRouteId {
+    pub provider: String,
+    pub model_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct ModelRouteSummary {
+    pub id: ModelRouteId,
+    pub name: String,
+    pub accepts_images: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub enum ReasoningEffort {
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh")]
+    #[ts(rename = "xhigh")]
+    ExtraHigh,
+    #[serde(rename = "max")]
+    #[ts(rename = "max")]
+    Maximum,
+}
+
+impl ReasoningEffort {
+    fn from_pi(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::ExtraHigh),
+            "max" => Some(Self::Maximum),
+            _ => None,
+        }
+    }
+
+    fn as_pi(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::ExtraHigh => "xhigh",
+            Self::Maximum => "max",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct ModelControlsSnapshot {
+    pub routes: Vec<ModelRouteSummary>,
+    pub selected_route: ModelRouteId,
+    pub efforts: Vec<ReasoningEffort>,
+    pub selected_effort: ReasoningEffort,
+    pub applies_after_current_step: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../src/generated/")]
@@ -445,6 +517,100 @@ impl ChatRuntimeHost {
             }
         }
         Ok(false)
+    }
+
+    pub async fn model_controls(
+        &self,
+        chat_id: &str,
+    ) -> Result<ModelControlsSnapshot, ChatRuntimeHostError> {
+        self.open_for_send(chat_id).await?;
+        let slot = self.slot(chat_id)?;
+        let _operation = slot.operation.lock().await;
+        let child = active_child(&slot, chat_id)?;
+        model_controls_snapshot(&slot, &child).await
+    }
+
+    pub async fn select_model_route(
+        &self,
+        chat_id: &str,
+        route: ModelRouteId,
+    ) -> Result<ModelControlsSnapshot, ChatRuntimeHostError> {
+        self.open_for_send(chat_id).await?;
+        let slot = self.slot(chat_id)?;
+        let _operation = slot.operation.lock().await;
+        let child = active_child(&slot, chat_id)?;
+        let previous = model_controls_snapshot(&slot, &child).await?;
+        if !previous
+            .routes
+            .iter()
+            .any(|available| available.id == route)
+        {
+            return Err(ChatRuntimeHostError::InvalidSessionState(
+                "the selected model route was not available from Pi".into(),
+            ));
+        }
+        child
+            .request(
+                serde_json::json!({
+                    "type": "set_model",
+                    "provider": &route.provider,
+                    "modelId": &route.model_id,
+                }),
+                CancellationToken::new(),
+            )
+            .await?;
+        match model_controls_snapshot(&slot, &child).await {
+            Ok(snapshot) if snapshot.selected_route == route => Ok(snapshot),
+            Ok(_) => {
+                rollback_model_controls(&child, &previous).await;
+                Err(ChatRuntimeHostError::InvalidSessionState(
+                    "Pi did not apply the selected model route".into(),
+                ))
+            }
+            Err(error) => {
+                rollback_model_controls(&child, &previous).await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn select_reasoning_effort(
+        &self,
+        chat_id: &str,
+        effort: ReasoningEffort,
+    ) -> Result<ModelControlsSnapshot, ChatRuntimeHostError> {
+        self.open_for_send(chat_id).await?;
+        let slot = self.slot(chat_id)?;
+        let _operation = slot.operation.lock().await;
+        let child = active_child(&slot, chat_id)?;
+        let previous = model_controls_snapshot(&slot, &child).await?;
+        if !previous.efforts.contains(&effort) {
+            return Err(ChatRuntimeHostError::InvalidSessionState(
+                "the selected reasoning effort was not available from Pi".into(),
+            ));
+        }
+        child
+            .request(
+                serde_json::json!({
+                    "type": "set_thinking_level",
+                    "level": effort.as_pi(),
+                }),
+                CancellationToken::new(),
+            )
+            .await?;
+        match model_controls_snapshot(&slot, &child).await {
+            Ok(snapshot) if snapshot.selected_effort == effort => Ok(snapshot),
+            Ok(_) => {
+                rollback_model_controls(&child, &previous).await;
+                Err(ChatRuntimeHostError::InvalidSessionState(
+                    "Pi did not apply the selected reasoning effort".into(),
+                ))
+            }
+            Err(error) => {
+                rollback_model_controls(&child, &previous).await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn send(&self, chat_id: &str, text: &str) -> Result<(), ChatRuntimeHostError> {
@@ -1477,6 +1643,177 @@ async fn retire_send_only_child(
         }
     }
     Ok(())
+}
+
+fn active_child(slot: &ChatSlot, chat_id: &str) -> Result<Arc<PiRpcChild>, ChatRuntimeHostError> {
+    slot.active
+        .lock()
+        .map_err(|_| ChatRuntimeHostError::Lock)?
+        .as_ref()
+        .map(|active| Arc::clone(&active.child))
+        .ok_or_else(|| ChatRuntimeHostError::NotActive {
+            chat_id: chat_id.to_owned(),
+        })
+}
+
+async fn model_controls_snapshot(
+    slot: &ChatSlot,
+    child: &PiRpcChild,
+) -> Result<ModelControlsSnapshot, ChatRuntimeHostError> {
+    let routes = child
+        .request(
+            serde_json::json!({ "type": "get_available_models" }),
+            CancellationToken::new(),
+        )
+        .await?
+        .data
+        .and_then(|data| data.get("models").and_then(Value::as_array).cloned())
+        .ok_or_else(|| {
+            ChatRuntimeHostError::InvalidSessionState(
+                "get_available_models omitted the model routes".into(),
+            )
+        })?
+        .into_iter()
+        .map(model_route_summary)
+        .collect::<Result<Vec<_>, _>>()?;
+    let state = child
+        .request(
+            serde_json::json!({ "type": "get_state" }),
+            CancellationToken::new(),
+        )
+        .await?
+        .data
+        .ok_or_else(|| {
+            ChatRuntimeHostError::InvalidSessionState("get_state omitted data".into())
+        })?;
+    let selected_route = state
+        .get("model")
+        .map(model_route_id)
+        .transpose()?
+        .ok_or_else(|| {
+            ChatRuntimeHostError::InvalidSessionState("get_state omitted its model route".into())
+        })?;
+    if !routes.iter().any(|route| route.id == selected_route) {
+        return Err(ChatRuntimeHostError::InvalidSessionState(
+            "the active model route was absent from Pi's available models".into(),
+        ));
+    }
+    let selected_effort = state
+        .get("thinkingLevel")
+        .and_then(Value::as_str)
+        .and_then(ReasoningEffort::from_pi)
+        .ok_or_else(|| {
+            ChatRuntimeHostError::InvalidSessionState(
+                "get_state omitted its effective reasoning effort".into(),
+            )
+        })?;
+    let efforts = child
+        .request(
+            serde_json::json!({ "type": "get_available_thinking_levels" }),
+            CancellationToken::new(),
+        )
+        .await?
+        .data
+        .and_then(|data| data.get("levels").and_then(Value::as_array).cloned())
+        .ok_or_else(|| {
+            ChatRuntimeHostError::InvalidSessionState(
+                "get_available_thinking_levels omitted the effective levels".into(),
+            )
+        })?
+        .into_iter()
+        .map(|level| {
+            level
+                .as_str()
+                .and_then(ReasoningEffort::from_pi)
+                .ok_or_else(|| {
+                    ChatRuntimeHostError::InvalidSessionState(
+                        "Pi returned an unknown reasoning effort".into(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !efforts.contains(&selected_effort) {
+        return Err(ChatRuntimeHostError::InvalidSessionState(
+            "the effective reasoning effort was unavailable for the active model".into(),
+        ));
+    }
+    let applies_after_current_step = slot
+        .projection
+        .lock()
+        .map_err(|_| ChatRuntimeHostError::Lock)?
+        .snapshot
+        .phase
+        == ConversationPhase::Running;
+    Ok(ModelControlsSnapshot {
+        routes,
+        selected_route,
+        efforts,
+        selected_effort,
+        applies_after_current_step,
+    })
+}
+
+fn model_route_summary(model: Value) -> Result<ModelRouteSummary, ChatRuntimeHostError> {
+    let id = model_route_id(&model)?;
+    let name = model
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&id.model_id)
+        .to_owned();
+    let accepts_images = model
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|inputs| inputs.iter().any(|input| input.as_str() == Some("image")));
+    Ok(ModelRouteSummary {
+        id,
+        name,
+        accepts_images,
+    })
+}
+
+fn model_route_id(model: &Value) -> Result<ModelRouteId, ChatRuntimeHostError> {
+    let provider = model
+        .get("provider")
+        .and_then(Value::as_str)
+        .filter(|provider| !provider.is_empty())
+        .ok_or_else(|| {
+            ChatRuntimeHostError::InvalidSessionState("a Pi model omitted its provider".into())
+        })?;
+    let model_id = model
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|model_id| !model_id.is_empty())
+        .ok_or_else(|| {
+            ChatRuntimeHostError::InvalidSessionState("a Pi model omitted its id".into())
+        })?;
+    Ok(ModelRouteId {
+        provider: provider.to_owned(),
+        model_id: model_id.to_owned(),
+    })
+}
+
+async fn rollback_model_controls(child: &PiRpcChild, previous: &ModelControlsSnapshot) {
+    let route = &previous.selected_route;
+    let _ = child
+        .request(
+            serde_json::json!({
+                "type": "set_model",
+                "provider": &route.provider,
+                "modelId": &route.model_id,
+            }),
+            CancellationToken::new(),
+        )
+        .await;
+    let _ = child
+        .request(
+            serde_json::json!({
+                "type": "set_thinking_level",
+                "level": previous.selected_effort.as_pi(),
+            }),
+            CancellationToken::new(),
+        )
+        .await;
 }
 
 async fn child_accepts_images(child: &PiRpcChild) -> Result<bool, ChatRuntimeHostError> {
