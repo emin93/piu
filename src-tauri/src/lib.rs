@@ -16,6 +16,7 @@ pub mod project_commands;
 pub mod project_inbox;
 pub mod prompt_attachments;
 pub mod runtime_lifecycle;
+pub mod runtime_preferences;
 pub mod system_appearance;
 
 const TEST_APP_DATA_DIR_ENV: &str = "PIU_TEST_APP_DATA_DIR";

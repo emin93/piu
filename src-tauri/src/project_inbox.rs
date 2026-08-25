@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ts_rs::TS;
@@ -17,6 +17,7 @@ use crate::{
     prompt_attachments::{
         PromptAttachment, PromptAttachmentError, validate as validate_attachments,
     },
+    runtime_preferences::{ModelRoute, ModelSelection, current_selection},
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -297,6 +298,7 @@ pub(crate) struct ChatCreationReservation {
     pub worktree_git_dir: Option<FilesystemIdentity>,
     pub base_commit: String,
     pub created_at_ms: i64,
+    pub initial_model_selection: Option<ModelSelection>,
     pub worktree_created: bool,
     pub branch_attached: bool,
 }
@@ -603,20 +605,34 @@ impl ProjectInbox {
 
     pub(crate) fn reserve_chat_creation(
         &self,
-        reservation: &ChatCreationReservation,
+        reservation: &mut ChatCreationReservation,
     ) -> Result<(), ProjectInboxError> {
         let attachments_json = encode_attachments(&reservation.attachments)?;
         self.with_database(|database| {
-            database
+            let transaction = database
                 .connection_mut()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(DatabaseError::Query)?;
+            let selection = current_selection(&transaction)?;
+            let provider_id = selection
+                .as_ref()
+                .map(|selection| selection.route.provider_id());
+            let model_id = selection
+                .as_ref()
+                .map(|selection| selection.route.model_id());
+            let effort = selection
+                .as_ref()
+                .and_then(|selection| selection.effort.as_deref());
+            transaction
                 .execute(
                     "INSERT INTO chat_workspace_creations (
                        chat_id, project_id, project_name, prompt, attachments_json, title, branch_name,
                        worktree_path, worktree_root_path, worktree_root_device, worktree_root_inode,
                        base_commit, created_at_ms, worktree_created, branch_attached,
-                       worktree_git_dir_path, worktree_git_dir_device, worktree_git_dir_inode
+                       worktree_git_dir_path, worktree_git_dir_device, worktree_git_dir_inode,
+                       initial_model_provider, initial_model_id, initial_reasoning_effort
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, 0,
-                               NULL, NULL, NULL)",
+                               NULL, NULL, NULL, ?14, ?15, ?16)",
                     params![
                         reservation.chat_id,
                         reservation.project.id,
@@ -631,10 +647,14 @@ impl ProjectInbox {
                         reservation.worktree_root.inode,
                         reservation.base_commit,
                         reservation.created_at_ms,
+                        provider_id,
+                        model_id,
+                        effort,
                     ],
                 )
-                .map_err(DatabaseError::Query)
-                .map_err(ProjectInboxError::Database)?;
+                .map_err(DatabaseError::Query)?;
+            transaction.commit().map_err(DatabaseError::Query)?;
+            reservation.initial_model_selection = selection;
             Ok(())
         })
     }
@@ -722,10 +742,11 @@ impl ProjectInbox {
                        worktree_git_dir_path, worktree_git_dir_device, worktree_git_dir_inode,
                        base_commit, pull_request_number, created_at_ms, merge_state,
                        setup_phase, setup_failure, setup_exit_code, setup_signal,
-                       setup_attempt, setup_log, initial_attachments_json
+                       setup_attempt, setup_log, initial_attachments_json,
+                       initial_model_provider, initial_model_id, initial_reasoning_effort
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                                ?13, NULL, ?14, 'unmerged',
-                               'pending', NULL, NULL, NULL, 0, '', ?15)",
+                               'pending', NULL, NULL, NULL, 0, '', ?15, ?16, ?17, ?18)",
                     params![
                         reservation.chat_id,
                         reservation.project.id,
@@ -742,6 +763,18 @@ impl ProjectInbox {
                         reservation.base_commit,
                         reservation.created_at_ms,
                         attachments_json,
+                        reservation
+                            .initial_model_selection
+                            .as_ref()
+                            .map(|selection| selection.route.provider_id()),
+                        reservation
+                            .initial_model_selection
+                            .as_ref()
+                            .map(|selection| selection.route.model_id()),
+                        reservation
+                            .initial_model_selection
+                            .as_ref()
+                            .and_then(|selection| selection.effort.as_deref()),
                     ],
                 )
                 .map_err(DatabaseError::Query)?;
@@ -794,7 +827,8 @@ impl ProjectInbox {
                             journal.base_commit, journal.created_at_ms, journal.worktree_created,
                             journal.branch_attached, journal.worktree_git_dir_path,
                             journal.worktree_git_dir_device, journal.worktree_git_dir_inode,
-                            journal.attachments_json
+                            journal.attachments_json, journal.initial_model_provider,
+                            journal.initial_model_id, journal.initial_reasoning_effort
                      FROM chat_workspace_creations AS journal
                      JOIN projects ON projects.id = journal.project_id
                      ORDER BY journal.created_at_ms ASC, journal.chat_id ASC",
@@ -810,6 +844,22 @@ impl ProjectInbox {
                     let git_dir_device: Option<String> = row.get(17)?;
                     let git_dir_inode: Option<String> = row.get(18)?;
                     let attachments_json: String = row.get(19)?;
+                    let initial_model_provider: Option<String> = row.get(20)?;
+                    let initial_model_id: Option<String> = row.get(21)?;
+                    let initial_reasoning_effort: Option<String> = row.get(22)?;
+                    let initial_model_selection = match (
+                        initial_model_provider,
+                        initial_model_id,
+                        initial_reasoning_effort,
+                    ) {
+                        (None, None, None) => None,
+                        (Some(provider_id), Some(model_id), effort) => Some(ModelSelection {
+                            route: ModelRoute::new(provider_id, model_id)
+                                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                            effort,
+                        }),
+                        _ => return Err(rusqlite::Error::InvalidQuery),
+                    };
                     let worktree_git_dir = match (git_dir_path, git_dir_device, git_dir_inode) {
                         (Some(path), Some(device), Some(inode)) => Some(FilesystemIdentity {
                             path: PathBuf::from(path),
@@ -841,6 +891,7 @@ impl ProjectInbox {
                         worktree_git_dir,
                         base_commit: row.get(12)?,
                         created_at_ms: row.get(13)?,
+                        initial_model_selection,
                         worktree_created: row.get(14)?,
                         branch_attached: row.get(15)?,
                     })

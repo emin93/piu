@@ -14,6 +14,18 @@ fn empty_database_is_initialized_with_the_current_schema() {
     assert!(database.has_table("chats").unwrap());
     assert!(database.has_table("chat_messages").unwrap());
     assert!(database.has_table("chat_workspace_creations").unwrap());
+    assert!(database.has_table("runtime_model_selection").unwrap());
+    assert!(database.has_table("model_route_efforts").unwrap());
+    assert!(
+        database
+            .has_table("global_resource_enable_overrides")
+            .unwrap()
+    );
+    assert!(
+        database
+            .has_table("project_resource_enable_overrides")
+            .unwrap()
+    );
     assert!(!database.has_table("schema_migrations").unwrap());
     drop(database);
 
@@ -28,6 +40,17 @@ fn empty_database_is_initialized_with_the_current_schema() {
         .expect("chat columns should decode");
     assert!(columns.iter().any(|column| column == "pi_session_id"));
     assert!(columns.iter().any(|column| column == "pi_session_path"));
+    assert!(
+        columns
+            .iter()
+            .any(|column| column == "initial_model_provider")
+    );
+    assert!(columns.iter().any(|column| column == "initial_model_id"));
+    assert!(
+        columns
+            .iter()
+            .any(|column| column == "initial_reasoning_effort")
+    );
 }
 
 #[test]
@@ -43,4 +66,16 @@ fn current_database_can_be_opened_repeatedly() {
     assert!(reopened.has_table("chats").unwrap());
     assert!(reopened.has_table("chat_messages").unwrap());
     assert!(reopened.has_table("chat_workspace_creations").unwrap());
+    assert!(reopened.has_table("runtime_model_selection").unwrap());
+    assert!(reopened.has_table("model_route_efforts").unwrap());
+    assert!(
+        reopened
+            .has_table("global_resource_enable_overrides")
+            .unwrap()
+    );
+    assert!(
+        reopened
+            .has_table("project_resource_enable_overrides")
+            .unwrap()
+    );
 }

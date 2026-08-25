@@ -234,11 +234,12 @@ impl ChatWorkspaces {
             branch_name,
             base_commit,
             created_at_ms,
+            initial_model_selection: None,
             worktree_created: false,
             branch_attached: false,
         };
 
-        if let Err(error) = self.inbox.reserve_chat_creation(&reservation) {
+        if let Err(error) = self.inbox.reserve_chat_creation(&mut reservation) {
             let _ = fs::remove_dir(&reservation.worktree_path);
             return Err(error.into());
         }
@@ -1062,7 +1063,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{project_inbox::ProjectInbox, prompt_attachments::PromptAttachmentKind};
+    use crate::{
+        project_inbox::ProjectInbox,
+        prompt_attachments::PromptAttachmentKind,
+        runtime_preferences::{ModelRoute, RuntimePreferences},
+    };
 
     struct RemoteFixture {
         _root: TempDir,
@@ -1304,6 +1309,27 @@ mod tests {
         assert_eq!(
             ownership.worktree_git_dir,
             filesystem_identity(&managed.git_dir).unwrap()
+        );
+    }
+
+    #[test]
+    fn creation_captures_the_selected_route_and_its_remembered_effort() {
+        let fixture = WorkspaceFixture::new(RemoteFixture::new());
+        let preferences =
+            RuntimePreferences::open(&fixture._app_data.path().join("piu.sqlite3")).unwrap();
+        let original = ModelRoute::new("openai-codex", "gpt-5.4").unwrap();
+        preferences.remember_effort(&original, "high").unwrap();
+        preferences.select_route(&original).unwrap();
+
+        let created = fixture.create("Preserve the initial inference route");
+        let replacement = ModelRoute::new("anthropic", "claude-sonnet-4-6").unwrap();
+        preferences.select_route(&replacement).unwrap();
+
+        assert_eq!(
+            preferences
+                .initial_chat_selection(&created.chat.id)
+                .unwrap(),
+            Some(original.selection(Some("high")))
         );
     }
 
