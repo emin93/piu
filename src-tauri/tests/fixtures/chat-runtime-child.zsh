@@ -67,7 +67,9 @@ print -r -- "$GIT_EXEC_PATH" > "$record_dir/git-exec-path"
 print -r -- "$GIT_TEMPLATE_DIR" > "$record_dir/git-template-dir"
 print -r -- "$0" > "$record_dir/launcher"
 printf '%s\n' "$@" > "$record_dir/arguments"
+printf '%s\n' "$@" > "$record_dir/arguments-$session_id"
 print -r -- "launch" >> "$record_dir/launches"
+print -r -- "launch" >> "$record_dir/launches-$session_id"
 
 respond_state() {
   local id="$1"
@@ -186,6 +188,19 @@ while IFS= read -r line; do
           '{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"I should inspect."},{"type":"text","text":"Done."},{"type":"toolCall","id":"call-1","name":"read","arguments":{"path":"README.md"}}],"usage":{"input":12,"output":7,"cacheRead":3,"cacheWrite":0,"totalTokens":22,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":200}}' \
           '{"type":"agent_end","messages":[],"willRetry":false}'
         printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+      elif [[ "$mode" == "controlled-completion" ]]; then
+        printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+        printf '%s\n' \
+          '{"type":"agent_start"}' \
+          '{"type":"message_start","message":{"role":"user","content":"Inspect the runtime","timestamp":100}}' \
+          '{"type":"message_end","message":{"role":"user","content":"Inspect the runtime","timestamp":100}}' \
+          '{"type":"message_start","message":{"role":"assistant","content":[],"usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"pending","timestamp":200}}'
+        while [[ ! -f "$record_dir/complete-$session_id" ]]; do
+          sleep 0.01
+        done
+        printf '%s\n' \
+          '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Done."}],"usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":200}}' \
+          '{"type":"agent_end","messages":[],"willRetry":false}'
       elif [[ "$mode" == "repeated-events" ]]; then
         printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
         printf '%s\n' \

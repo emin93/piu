@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use ts_rs::TS;
@@ -7,7 +9,7 @@ use crate::{
         AgentEnvironment, AgentEnvironmentError, AgentEnvironmentSnapshot, AgentResourceId,
         AgentResourcePreferenceChange, AgentResourcePreferenceScope,
     },
-    chat_runtime_host::{ModelControlsSnapshot, ModelRouteId, ReasoningEffort},
+    chat_runtime_host::{ChatRuntimeHost, ModelControlsSnapshot, ModelRouteId, ReasoningEffort},
     project_inbox::ProjectInboxError,
 };
 
@@ -116,7 +118,7 @@ impl From<AgentEnvironmentError> for AgentEnvironmentCommandError {
 
 #[tauri::command]
 pub async fn get_project_agent_environment(
-    environment: State<'_, AgentEnvironment>,
+    environment: State<'_, Arc<AgentEnvironment>>,
     request: ProjectAgentEnvironmentRequest,
 ) -> Result<AgentEnvironmentSnapshot, AgentEnvironmentCommandError> {
     environment
@@ -127,7 +129,7 @@ pub async fn get_project_agent_environment(
 
 #[tauri::command]
 pub async fn get_project_model_controls(
-    environment: State<'_, AgentEnvironment>,
+    environment: State<'_, Arc<AgentEnvironment>>,
     request: ProjectAgentEnvironmentRequest,
 ) -> Result<ModelControlsSnapshot, AgentEnvironmentCommandError> {
     environment
@@ -138,7 +140,7 @@ pub async fn get_project_model_controls(
 
 #[tauri::command]
 pub async fn select_project_model_route(
-    environment: State<'_, AgentEnvironment>,
+    environment: State<'_, Arc<AgentEnvironment>>,
     request: SelectProjectModelRouteRequest,
 ) -> Result<ModelControlsSnapshot, AgentEnvironmentCommandError> {
     environment
@@ -149,7 +151,7 @@ pub async fn select_project_model_route(
 
 #[tauri::command]
 pub async fn select_project_reasoning_effort(
-    environment: State<'_, AgentEnvironment>,
+    environment: State<'_, Arc<AgentEnvironment>>,
     request: SelectProjectReasoningEffortRequest,
 ) -> Result<ModelControlsSnapshot, AgentEnvironmentCommandError> {
     environment
@@ -160,18 +162,22 @@ pub async fn select_project_reasoning_effort(
 
 #[tauri::command]
 pub async fn set_agent_resource_enabled(
-    environment: State<'_, AgentEnvironment>,
+    environment: State<'_, Arc<AgentEnvironment>>,
+    chat_runtime: State<'_, ChatRuntimeHost>,
     request: SetAgentResourceEnabledRequest,
 ) -> Result<AgentResourcePreferenceChange, AgentEnvironmentCommandError> {
-    environment
-        .set_resource_enabled(
-            request.project_id,
-            request.scope,
-            request.resource,
-            request.enabled,
-        )
+    let project_id = request.project_id;
+    let change = environment
+        .set_resource_enabled(project_id, request.scope, request.resource, request.enabled)
         .await
-        .map_err(Into::into)
+        .map_err(AgentEnvironmentCommandError::from)?;
+    chat_runtime
+        .refresh_resources(project_id, change)
+        .await
+        .map_err(|_| AgentEnvironmentCommandError {
+            code: AgentEnvironmentCommandErrorCode::InspectionFailed,
+            message: "Più couldn’t refresh the affected chats. Try again.".into(),
+        })
 }
 
 #[cfg(test)]

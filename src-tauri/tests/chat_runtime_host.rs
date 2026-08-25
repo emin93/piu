@@ -4,6 +4,10 @@ mod support;
 use std::{fs, os::unix::fs::symlink, sync::Arc};
 
 use piu_lib::{
+    agent_environment::{
+        AgentEnvironment, AgentEnvironmentPolicy, AgentEnvironmentProcessSpec, AgentResourceId,
+        AgentResourcePreferenceScope, AgentResourceRefreshStatus,
+    },
     chat_runtime_commands::{ConversationPromptRequest, ConversationStreamingBehavior},
     chat_runtime_host::{
         ChatRuntimeChangedEvent, ChatRuntimeHost, ChatRuntimeHostError, ConversationEvent,
@@ -20,15 +24,310 @@ use support::{TemporaryAppData, TemporaryGitRemote};
 
 const FIXTURE_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+fn project_skill() -> AgentResourceId {
+    AgentResourceId::Skill {
+        id: "project://skills/check".into(),
+    }
+}
+
 struct ChatFixture {
     _app_data: TemporaryAppData,
     _remote: TemporaryGitRemote,
     host: ChatRuntimeHost,
+    environment: Arc<AgentEnvironment>,
     inbox: Arc<ProjectInbox>,
     workspaces: Arc<ChatWorkspaces>,
     resource_directory: std::path::PathBuf,
     chat_id: String,
     worktree: std::path::PathBuf,
+}
+
+#[tokio::test]
+async fn an_idle_affected_child_restarts_on_the_exact_session_and_worktree() {
+    let fixture = ChatFixture::with_options(true, true, "streaming");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(0).await;
+    fixture.host.model_controls(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(1).await;
+    let session = fixture
+        .inbox
+        .chat_session(&fixture.chat_id)
+        .unwrap()
+        .expect("completed chat should keep its Pi session");
+    let project_id = fixture
+        .inbox
+        .snapshot()
+        .unwrap()
+        .chats
+        .iter()
+        .find(|chat| chat.id == fixture.chat_id)
+        .and_then(|chat| chat.project_id)
+        .unwrap();
+    let launches_before = fixture.session_launch_count(&fixture.chat_id);
+
+    let change = fixture
+        .environment
+        .set_resource_enabled(
+            project_id,
+            AgentResourcePreferenceScope::Project,
+            project_skill(),
+            false,
+        )
+        .await
+        .unwrap();
+    let applied = fixture
+        .host
+        .refresh_resources(project_id, change)
+        .await
+        .unwrap();
+
+    assert_eq!(applied.status, AgentResourceRefreshStatus::Applied);
+    assert_eq!(applied.deferred_chat_count, 0);
+    assert_eq!(
+        fixture.session_launch_count(&fixture.chat_id),
+        launches_before + 1
+    );
+    assert_eq!(
+        fixture.inbox.chat_session(&fixture.chat_id).unwrap(),
+        Some(session)
+    );
+    assert_eq!(fixture.live_children(), 1);
+    let arguments = fixture.record(&format!(
+        "arguments-{}",
+        fixture.session_id(&fixture.chat_id)
+    ));
+    assert_eq!(arguments.matches("--skill").count(), 1);
+    assert!(
+        arguments.contains(
+            fixture
+                .resource_directory
+                .join("agent-runtime/skills")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    assert!(!arguments.contains(".pi/skills/check/SKILL.md"));
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn an_active_affected_child_keeps_running_and_reports_the_deferred_refresh() {
+    let fixture = ChatFixture::new(true);
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(1).await;
+    let project_id = fixture
+        .inbox
+        .snapshot()
+        .unwrap()
+        .chats
+        .iter()
+        .find(|chat| chat.id == fixture.chat_id)
+        .and_then(|chat| chat.project_id)
+        .unwrap();
+    let launches_before = fixture.session_launch_count(&fixture.chat_id);
+    let session = fixture
+        .inbox
+        .chat_session(&fixture.chat_id)
+        .unwrap()
+        .expect("active chat should already be bound");
+
+    let change = fixture
+        .environment
+        .set_resource_enabled(
+            project_id,
+            AgentResourcePreferenceScope::Project,
+            project_skill(),
+            false,
+        )
+        .await
+        .unwrap();
+    let applied = fixture
+        .host
+        .refresh_resources(project_id, change)
+        .await
+        .unwrap();
+
+    assert_eq!(applied.status, AgentResourceRefreshStatus::Deferred);
+    assert_eq!(applied.deferred_chat_count, 1);
+    assert_eq!(
+        fixture.session_launch_count(&fixture.chat_id),
+        launches_before
+    );
+    assert_eq!(fixture.live_children(), 1);
+    assert_eq!(
+        fixture.inbox.chat_session(&fixture.chat_id).unwrap(),
+        Some(session)
+    );
+    assert_eq!(
+        fixture.host.snapshot(&fixture.chat_id).unwrap().phase,
+        ConversationPhase::Running
+    );
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_deferred_resource_refresh_reopens_the_exact_session_at_turn_completion() {
+    let fixture = ChatFixture::with_options(true, true, "controlled-completion");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(1).await;
+    let project_id = fixture
+        .inbox
+        .snapshot()
+        .unwrap()
+        .chats
+        .iter()
+        .find(|chat| chat.id == fixture.chat_id)
+        .and_then(|chat| chat.project_id)
+        .unwrap();
+    let session = fixture
+        .inbox
+        .chat_session(&fixture.chat_id)
+        .unwrap()
+        .expect("active chat should already be bound");
+    let launches_before = fixture.session_launch_count(&fixture.chat_id);
+    let change = fixture
+        .environment
+        .set_resource_enabled(
+            project_id,
+            AgentResourcePreferenceScope::Project,
+            project_skill(),
+            false,
+        )
+        .await
+        .unwrap();
+    let applied = fixture
+        .host
+        .refresh_resources(project_id, change)
+        .await
+        .unwrap();
+    assert_eq!(applied.status, AgentResourceRefreshStatus::Deferred);
+    assert_eq!(fixture.live_children(), 1);
+
+    fs::write(
+        fixture
+            ._app_data
+            .path()
+            .join("host-fixture")
+            .join(format!("complete-{}", fixture.session_id(&fixture.chat_id))),
+        "complete\n",
+    )
+    .unwrap();
+    tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+        while fixture.session_launch_count(&fixture.chat_id) != launches_before + 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the exact session should reopen after the safe turn boundary");
+
+    assert_eq!(fixture.live_children(), 1);
+    assert_eq!(
+        fixture.inbox.chat_session(&fixture.chat_id).unwrap(),
+        Some(session)
+    );
+    let arguments = fixture.record(&format!(
+        "arguments-{}",
+        fixture.session_id(&fixture.chat_id)
+    ));
+    assert!(!arguments.contains(".pi/skills/check/SKILL.md"));
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_resource_refresh_does_not_restart_a_project_with_an_effective_override() {
+    let fixture = ChatFixture::with_options(true, true, "streaming");
+    let second_remote = TemporaryGitRemote::new();
+    fs::write(second_remote.working_path().join("README.md"), "second\n").unwrap();
+    fs::create_dir_all(second_remote.working_path().join(".pi/skills/check")).unwrap();
+    fs::write(
+        second_remote
+            .working_path()
+            .join(".pi/skills/check/SKILL.md"),
+        "# Check\n",
+    )
+    .unwrap();
+    fs::create_dir_all(second_remote.working_path().join(".pi/extensions")).unwrap();
+    fs::write(
+        second_remote
+            .working_path()
+            .join(".pi/extensions/review.mjs"),
+        "export default function review() {}\n",
+    )
+    .unwrap();
+    second_remote.git(["add", "."]);
+    second_remote.git(["commit", "-m", "second fixture"]);
+    second_remote.git(["push", "-u", "origin", "main"]);
+    let second_project = fixture
+        .inbox
+        .open_repository(second_remote.working_path())
+        .unwrap()
+        .project;
+    let second_chat = fixture
+        .workspaces
+        .create_chat(second_project.id, "Inspect the runtime", &[])
+        .unwrap()
+        .chat;
+    fixture
+        .workspaces
+        .start_setup(&second_chat.id, Arc::new(|_| {}))
+        .unwrap();
+    let first_project_id = fixture
+        .inbox
+        .snapshot()
+        .unwrap()
+        .chats
+        .iter()
+        .find(|chat| chat.id == fixture.chat_id)
+        .and_then(|chat| chat.project_id)
+        .unwrap();
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture.host.open(&second_chat.id).await.unwrap();
+    fixture.wait_for_live_children(0).await;
+    fixture.host.model_controls(&fixture.chat_id).await.unwrap();
+    fixture.host.model_controls(&second_chat.id).await.unwrap();
+    fixture.wait_for_live_children(2).await;
+    let first_launches = fixture.session_launch_count(&fixture.chat_id);
+    let second_launches = fixture.session_launch_count(&second_chat.id);
+
+    fixture
+        .environment
+        .set_resource_enabled(
+            second_project.id,
+            AgentResourcePreferenceScope::Project,
+            project_skill(),
+            true,
+        )
+        .await
+        .unwrap();
+    let change = fixture
+        .environment
+        .set_resource_enabled(
+            first_project_id,
+            AgentResourcePreferenceScope::Global,
+            project_skill(),
+            false,
+        )
+        .await
+        .unwrap();
+    let applied = fixture
+        .host
+        .refresh_resources(first_project_id, change)
+        .await
+        .unwrap();
+
+    assert_eq!(applied.status, AgentResourceRefreshStatus::Applied);
+    assert_eq!(applied.deferred_chat_count, 0);
+    assert_eq!(
+        fixture.session_launch_count(&fixture.chat_id),
+        first_launches + 1
+    );
+    assert_eq!(
+        fixture.session_launch_count(&second_chat.id),
+        second_launches,
+        "the second project's effective override should leave its idle child untouched"
+    );
+    assert_eq!(fixture.live_children(), 2);
+    fixture.host.shutdown_all().await;
 }
 
 #[tokio::test]
@@ -224,7 +523,21 @@ impl ChatFixture {
         let app_data = TemporaryAppData::new();
         let remote = TemporaryGitRemote::new();
         fs::write(remote.working_path().join("README.md"), "fixture\n").unwrap();
-        remote.git(["add", "README.md"]);
+        if install_skills {
+            fs::create_dir_all(remote.working_path().join(".pi/skills/check")).unwrap();
+            fs::write(
+                remote.working_path().join(".pi/skills/check/SKILL.md"),
+                "# Check\n",
+            )
+            .unwrap();
+            fs::create_dir_all(remote.working_path().join(".pi/extensions")).unwrap();
+            fs::write(
+                remote.working_path().join(".pi/extensions/review.mjs"),
+                "export default function review() {}\n",
+            )
+            .unwrap();
+        }
+        remote.git(["add", "."]);
         remote.git(["commit", "-m", "fixture"]);
         remote.git(["push", "-u", "origin", "main"]);
 
@@ -273,9 +586,47 @@ impl ChatFixture {
         }
         let home = app_data.path().join("real-home");
         fs::create_dir(&home).unwrap();
+        let mut environment_variables = std::collections::BTreeMap::new();
+        environment_variables.insert(
+            std::ffi::OsString::from("HOME"),
+            home.as_os_str().to_owned(),
+        );
+        environment_variables.insert(
+            std::ffi::OsString::from("PATH"),
+            std::ffi::OsString::from("/usr/bin:/bin"),
+        );
+        environment_variables.insert(
+            std::ffi::OsString::from("PIU_ENVIRONMENT_FIXTURE_MODE"),
+            std::ffi::OsString::from("chat-runtime"),
+        );
+        environment_variables.insert(
+            std::ffi::OsString::from("PIU_ENVIRONMENT_FIXTURE_RECORD_DIR"),
+            app_data.path().join("environment-fixture").into_os_string(),
+        );
+        let environment = Arc::new(
+            AgentEnvironment::new(
+                Arc::clone(&inbox),
+                Arc::new(RuntimePreferences::open(&app_data.database_path()).unwrap()),
+                AgentEnvironmentProcessSpec {
+                    executable: std::path::PathBuf::from("/bin/zsh"),
+                    launcher: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/agent-environment-child.zsh"),
+                    agent_directory: app_data.path().join("agent"),
+                    credential_lock_directory: app_data.path().join("credential-locks"),
+                    environment: environment_variables,
+                },
+                AgentEnvironmentPolicy {
+                    inspection_timeout: std::time::Duration::from_secs(2),
+                    maximum_stdout_bytes: 64 * 1024,
+                    maximum_stderr_bytes: 16 * 1024,
+                },
+            )
+            .unwrap(),
+        );
         let host = ChatRuntimeHost::new(
             Arc::clone(&inbox),
             Arc::clone(&workspaces),
+            Arc::clone(&environment),
             app_data.path(),
             &resource_directory,
             &home,
@@ -285,6 +636,7 @@ impl ChatFixture {
             _app_data: app_data,
             _remote: remote,
             host,
+            environment,
             inbox,
             workspaces,
             resource_directory,
@@ -324,11 +676,27 @@ impl ChatFixture {
         ChatRuntimeHost::new(
             Arc::clone(&self.inbox),
             Arc::clone(&self.workspaces),
+            Arc::clone(&self.environment),
             self._app_data.path(),
             &self.resource_directory,
             &self._app_data.path().join("real-home"),
         )
         .expect("create fresh runtime host")
+    }
+
+    fn session_id(&self, chat_id: &str) -> String {
+        format!("pi-{chat_id}")
+    }
+
+    fn session_launch_count(&self, chat_id: &str) -> usize {
+        fs::read_to_string(
+            self._app_data
+                .path()
+                .join("host-fixture")
+                .join(format!("launches-{}", self.session_id(chat_id))),
+        )
+        .map(|launches| launches.lines().count())
+        .unwrap_or_default()
     }
 
     fn live_children(&self) -> usize {
@@ -1597,11 +1965,27 @@ async fn chat_launch_waits_for_setup_and_owns_one_exact_isolated_child() {
         fixture
             .resource_directory
             .join("agent-runtime/skills")
+            .canonicalize()
+            .unwrap()
             .display()
     )));
     assert!(arguments.contains(&format!(
         "--skill\n{}\n",
-        fixture.worktree.join(".pi/skills").display()
+        fixture
+            .worktree
+            .join(".pi/skills/check/SKILL.md")
+            .canonicalize()
+            .unwrap()
+            .display()
+    )));
+    assert!(arguments.contains(&format!(
+        "--extension\n{}\n",
+        fixture
+            .worktree
+            .join(".pi/extensions/review.mjs")
+            .canonicalize()
+            .unwrap()
+            .display()
     )));
 
     let session = fixture

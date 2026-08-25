@@ -172,6 +172,7 @@ impl From<ChatRuntimeHostError> for ChatRuntimeCommandError {
                 }
             }
             ChatRuntimeHostError::Rpc(_)
+            | ChatRuntimeHostError::Environment(_)
             | ChatRuntimeHostError::InvalidSessionState(_)
             | ChatRuntimeHostError::NonAbsolutePath
             | ChatRuntimeHostError::InvalidHome => Self {

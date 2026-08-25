@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::{OsStr, OsString},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
@@ -13,6 +13,10 @@ use tokio_util::sync::CancellationToken;
 use ts_rs::TS;
 
 use crate::{
+    agent_environment::{
+        AgentEnvironment, AgentEnvironmentError, AgentLaunchResources,
+        AgentResourcePreferenceChange, AgentResourcePreferenceScope, AgentResourceRefreshStatus,
+    },
     chat_workspaces::{ChatWorkspaceError, ChatWorkspaces},
     pi_rpc::{PiRpcChild, PiRpcError, PiRpcExtensionUiResponse, PiRpcPolicy, PiRpcProcessSpec},
     project_inbox::{ChatSessionReference, ChatSetupPhase, ProjectInbox, ProjectInboxError},
@@ -338,6 +342,8 @@ pub enum ChatRuntimeHostError {
     Attachment(#[from] PromptAttachmentError),
     #[error(transparent)]
     Preferences(#[from] RuntimePreferencesError),
+    #[error(transparent)]
+    Environment(#[from] AgentEnvironmentError),
     #[error("chat runtime lock is poisoned")]
     Lock,
 }
@@ -358,6 +364,7 @@ struct RuntimePaths {
 struct ChatSlot {
     operation: AsyncMutex<()>,
     active: Mutex<Option<ActiveChat>>,
+    pending_resource_refresh: Mutex<bool>,
     projection: Mutex<ConversationProjection>,
 }
 
@@ -366,6 +373,7 @@ impl ChatSlot {
         Self {
             operation: AsyncMutex::new(()),
             active: Mutex::new(None),
+            pending_resource_refresh: Mutex::new(false),
             projection: Mutex::new(ConversationProjection::new(
                 ConversationSnapshot::stopped(),
                 0,
@@ -378,6 +386,7 @@ impl ChatSlot {
 struct ActiveChat {
     child: Arc<PiRpcChild>,
     command_generation: u64,
+    launch_resources: AgentLaunchResources,
     send_only: bool,
     stop_events: CancellationToken,
 }
@@ -423,6 +432,7 @@ impl ConversationProjection {
 struct HostInner {
     inbox: Arc<ProjectInbox>,
     workspaces: Arc<ChatWorkspaces>,
+    environment: Arc<AgentEnvironment>,
     preferences: Arc<RuntimePreferences>,
     paths: RuntimePaths,
     slots: Mutex<HashMap<String, Arc<ChatSlot>>>,
@@ -438,6 +448,7 @@ impl ChatRuntimeHost {
     pub fn production(
         inbox: Arc<ProjectInbox>,
         workspaces: Arc<ChatWorkspaces>,
+        environment: Arc<AgentEnvironment>,
         app_data_directory: &Path,
         resource_directory: &Path,
     ) -> Result<Self, ChatRuntimeHostError> {
@@ -448,6 +459,7 @@ impl ChatRuntimeHost {
         Self::new(
             inbox,
             workspaces,
+            environment,
             app_data_directory,
             resource_directory,
             &home,
@@ -457,6 +469,7 @@ impl ChatRuntimeHost {
     pub fn new(
         inbox: Arc<ProjectInbox>,
         workspaces: Arc<ChatWorkspaces>,
+        environment: Arc<AgentEnvironment>,
         app_data_directory: &Path,
         resource_directory: &Path,
         home: &Path,
@@ -479,6 +492,7 @@ impl ChatRuntimeHost {
             inner: Arc::new(HostInner {
                 inbox,
                 workspaces,
+                environment,
                 preferences: Arc::new(RuntimePreferences::open(
                     &app_data_directory.join("piu.sqlite3"),
                 )?),
@@ -532,6 +546,99 @@ impl ChatRuntimeHost {
             }
         }
         Ok(false)
+    }
+
+    pub async fn refresh_resources(
+        &self,
+        changed_project_id: i64,
+        mut change: AgentResourcePreferenceChange,
+    ) -> Result<AgentResourcePreferenceChange, ChatRuntimeHostError> {
+        let slots = self
+            .inner
+            .slots
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)?
+            .iter()
+            .map(|(chat_id, slot)| (chat_id.clone(), Arc::clone(slot)))
+            .collect::<Vec<_>>();
+        let mut restart = Vec::new();
+        let mut deferred_chat_count = 0_u32;
+        for (chat_id, slot) in slots {
+            let operation = slot.operation.lock().await;
+            let launched_resources = slot
+                .active
+                .lock()
+                .map_err(|_| ChatRuntimeHostError::Lock)?
+                .as_ref()
+                .map(|active| active.launch_resources.clone());
+            let Some(launched_resources) = launched_resources else {
+                continue;
+            };
+            let owned_chat_id = chat_id.clone();
+            let workspaces = Arc::clone(&self.inner.workspaces);
+            let context = tokio::task::spawn_blocking(move || {
+                workspaces.agent_launch_context(&owned_chat_id)
+            })
+            .await
+            .map_err(|error| ChatRuntimeHostError::InvalidSessionState(error.to_string()))??;
+            if change.scope == AgentResourcePreferenceScope::Project
+                && context.project_id != changed_project_id
+            {
+                continue;
+            }
+            let effective_resources = self
+                .inner
+                .environment
+                .launch_resources_for_worktree(context.project_id, &context.worktree_path)
+                .await?;
+            if effective_resources == launched_resources {
+                *slot
+                    .pending_resource_refresh
+                    .lock()
+                    .map_err(|_| ChatRuntimeHostError::Lock)? = false;
+                continue;
+            }
+            let running = slot
+                .projection
+                .lock()
+                .map_err(|_| ChatRuntimeHostError::Lock)?
+                .snapshot
+                .phase
+                == ConversationPhase::Running;
+            if running {
+                *slot
+                    .pending_resource_refresh
+                    .lock()
+                    .map_err(|_| ChatRuntimeHostError::Lock)? = true;
+                deferred_chat_count = deferred_chat_count.saturating_add(1);
+                continue;
+            }
+            *slot
+                .pending_resource_refresh
+                .lock()
+                .map_err(|_| ChatRuntimeHostError::Lock)? = false;
+            let active = slot
+                .active
+                .lock()
+                .map_err(|_| ChatRuntimeHostError::Lock)?
+                .take();
+            if let Some(active) = active {
+                active.stop_events.cancel();
+                active.child.shutdown().await?;
+                restart.push(chat_id);
+            }
+            drop(operation);
+        }
+        for chat_id in restart {
+            self.open_for_send(&chat_id).await?;
+        }
+        change.deferred_chat_count = deferred_chat_count;
+        change.status = if deferred_chat_count == 0 {
+            AgentResourceRefreshStatus::Applied
+        } else {
+            AgentResourceRefreshStatus::Deferred
+        };
+        Ok(change)
     }
 
     pub async fn model_controls(
@@ -1145,12 +1252,18 @@ impl ChatRuntimeHost {
                 "the stored Pi session path was outside application storage".into(),
             ));
         }
+        let launch_resources = self
+            .inner
+            .environment
+            .launch_resources_for_worktree(context.project_id, &context.worktree_path)
+            .await?;
         let spec = self.process_spec(
             chat_id,
             &context.worktree_path,
             stored_session
                 .as_ref()
                 .map(|session| session.path.as_path()),
+            &launch_resources,
         )?;
         let child = Arc::new(PiRpcChild::launch(spec, PiRpcPolicy::default()).await?);
         let opened = self.inspect_opened_session(&child).await;
@@ -1265,6 +1378,7 @@ impl ChatRuntimeHost {
         *slot.active.lock().map_err(|_| ChatRuntimeHostError::Lock)? = Some(ActiveChat {
             child: Arc::clone(&child),
             command_generation: 0,
+            launch_resources,
             send_only: keep_stopped_runtime && !should_start,
             stop_events: stop_events.clone(),
         });
@@ -1407,7 +1521,7 @@ impl ChatRuntimeHost {
                             };
                             active.command_generation
                         };
-                        let _operation = slot.operation.lock().await;
+                        let operation = slot.operation.lock().await;
                         let projected = {
                             let Ok(mut active) = slot.active.lock() else {
                                 return;
@@ -1443,6 +1557,24 @@ impl ChatRuntimeHost {
                                 event,
                                 revision,
                             });
+                        }
+                        let refresh_resources = slot
+                            .pending_resource_refresh
+                            .lock()
+                            .map(|mut pending| std::mem::take(&mut *pending))
+                            .unwrap_or(false);
+                        drop(operation);
+                        if refresh_resources {
+                            let host = ChatRuntimeHost {
+                                inner: Arc::clone(&inner),
+                            };
+                            if let Err(error) = host.open_for_send(&chat_id).await {
+                                tracing::warn!(
+                                    %error,
+                                    %chat_id,
+                                    "could not resume chat after applying its deferred resources"
+                                );
+                            }
                         }
                         return;
                     }
@@ -1543,6 +1675,7 @@ impl ChatRuntimeHost {
         chat_id: &str,
         worktree: &Path,
         session_path: Option<&Path>,
+        launch_resources: &AgentLaunchResources,
     ) -> Result<PiRpcProcessSpec, ChatRuntimeHostError> {
         let initial_selection = self.inner.preferences.initial_chat_selection(chat_id)?;
         let (model_provider, model_id, thinking_level) = initial_selection
@@ -1583,13 +1716,30 @@ impl ChatRuntimeHost {
             flag("--thinking-level"),
             flag(&thinking_level),
         ];
-        for skill_directory in [
-            self.inner.paths.app_skill_directory.clone(),
-            worktree.join(".pi/skills"),
-        ] {
-            if skill_directory.is_dir() {
+        let mut added_extensions = HashSet::new();
+        for extension_path in &launch_resources.extension_paths {
+            if added_extensions.insert(extension_path.clone()) {
+                arguments.push(flag("--extension"));
+                arguments.push(extension_path.as_os_str().to_owned());
+            }
+        }
+        let mut added_skills = HashSet::new();
+        if self.inner.paths.app_skill_directory.is_dir() {
+            let app_skill_directory = self
+                .inner
+                .paths
+                .app_skill_directory
+                .canonicalize()
+                .map_err(ChatRuntimeHostError::RuntimeStorage)?;
+            if added_skills.insert(app_skill_directory.clone()) {
                 arguments.push(flag("--skill"));
-                arguments.push(skill_directory.into_os_string());
+                arguments.push(app_skill_directory.into_os_string());
+            }
+        }
+        for skill_path in &launch_resources.skill_paths {
+            if added_skills.insert(skill_path.clone()) {
+                arguments.push(flag("--skill"));
+                arguments.push(skill_path.as_os_str().to_owned());
             }
         }
         if let Some(session_path) = session_path {

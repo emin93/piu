@@ -14,7 +14,9 @@ use piu_lib::{
         AgentEnvironmentProcessSpec, AgentResourceId, AgentResourcePreferenceScope,
         AgentResourceSource,
     },
+    chat_runtime_host::ChatRuntimeHost,
     chat_runtime_host::{ModelRouteId, ReasoningEffort},
+    chat_workspaces::ChatWorkspaces,
     git_process::GitProcess,
     project_inbox::ProjectInbox,
     runtime_preferences::RuntimePreferences,
@@ -42,6 +44,7 @@ fn make_repository(path: &Path) {
 struct Fixture {
     _root: TempDir,
     app_data: PathBuf,
+    inbox: Arc<ProjectInbox>,
     project_id: i64,
     repository: PathBuf,
     environment: AgentEnvironment,
@@ -84,10 +87,12 @@ impl Fixture {
             credential_lock_directory: app_data.join("credential-locks"),
             environment,
         };
-        let environment = AgentEnvironment::new(inbox, preferences, process, policy).unwrap();
+        let environment =
+            AgentEnvironment::new(Arc::clone(&inbox), preferences, process, policy).unwrap();
         Self {
             _root: root,
             app_data,
+            inbox,
             project_id,
             repository,
             environment,
@@ -455,13 +460,34 @@ async fn inspector_output_and_duration_are_bounded_and_children_are_reaped() {
 fn snapshot_and_resource_preference_cross_the_typed_tauri_boundary() {
     let Fixture {
         _root,
+        app_data,
+        inbox,
         project_id,
         environment,
         ..
     } = Fixture::new("snapshot", test_policy());
-    let app = piu_lib::configure_builder(test::mock_builder().manage(environment))
-        .build(test::mock_context(test::noop_assets()))
-        .unwrap();
+    let environment = Arc::new(environment);
+    let workspaces = Arc::new(ChatWorkspaces::new(
+        Arc::clone(&inbox),
+        GitProcess::with_executable("/usr/bin/git".into()),
+        app_data.join("worktrees"),
+    ));
+    let chat_runtime = ChatRuntimeHost::new(
+        inbox,
+        workspaces,
+        Arc::clone(&environment),
+        &app_data,
+        &_root.path().join("resources"),
+        Path::new("/Users/piu-test"),
+    )
+    .unwrap();
+    let app = piu_lib::configure_builder(
+        test::mock_builder()
+            .manage(environment)
+            .manage(chat_runtime),
+    )
+    .build(test::mock_context(test::noop_assets()))
+    .unwrap();
     let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
         .build()
         .unwrap();

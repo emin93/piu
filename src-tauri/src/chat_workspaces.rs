@@ -61,6 +61,7 @@ pub struct ChatTerminalRequest {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ChatAgentLaunchContext {
+    pub project_id: i64,
     pub worktree_path: PathBuf,
     pub setup: ChatSetupSummary,
 }
@@ -428,6 +429,7 @@ impl ChatWorkspaces {
     ) -> Result<ChatAgentLaunchContext, ChatWorkspaceError> {
         let (ownership, _) = self.validate_chat_workspace(chat_id)?;
         Ok(ChatAgentLaunchContext {
+            project_id: ownership.project_id,
             worktree_path: ownership.worktree_path,
             setup: self.inbox.chat_setup(chat_id)?,
         })

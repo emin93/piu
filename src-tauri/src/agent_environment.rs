@@ -217,6 +217,14 @@ pub enum AgentResourcePreferenceScope {
     Project,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub enum AgentResourceRefreshStatus {
+    Applied,
+    Deferred,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../src/generated/")]
@@ -224,6 +232,8 @@ pub struct AgentResourcePreferenceChange {
     pub scope: AgentResourcePreferenceScope,
     pub resource: AgentResourceId,
     pub enabled: bool,
+    pub status: AgentResourceRefreshStatus,
+    pub deferred_chat_count: u32,
 }
 
 #[derive(Debug, Error)]
@@ -354,6 +364,57 @@ impl AgentEnvironment {
         })
     }
 
+    pub async fn launch_resources_for_worktree(
+        &self,
+        project_id: i64,
+        worktree: &Path,
+    ) -> Result<AgentLaunchResources, AgentEnvironmentError> {
+        if !worktree.is_absolute() {
+            return Err(AgentEnvironmentError::InvalidSnapshot);
+        }
+        let project = self.projects.project_location(project_id)?;
+        let canonical_worktree = tokio::fs::canonicalize(worktree)
+            .await
+            .map_err(|_| AgentEnvironmentError::InvalidSnapshot)?;
+        let discovered = self.discover(project_id).await?;
+        let mut extension_paths = Vec::new();
+        for resource in &discovered.resources.extensions {
+            if let Some(path) =
+                self.discovered_resource_enabled(project_id, resource, ResourceKind::Extension)?
+            {
+                extension_paths.push(
+                    canonical_launch_path(
+                        path,
+                        resource.scope,
+                        &project.canonical_path,
+                        &canonical_worktree,
+                    )
+                    .await?,
+                );
+            }
+        }
+        let mut skill_paths = Vec::new();
+        for resource in &discovered.resources.skills {
+            if let Some(path) =
+                self.discovered_resource_enabled(project_id, resource, ResourceKind::Skill)?
+            {
+                skill_paths.push(
+                    canonical_launch_path(
+                        path,
+                        resource.scope,
+                        &project.canonical_path,
+                        &canonical_worktree,
+                    )
+                    .await?,
+                );
+            }
+        }
+        Ok(AgentLaunchResources {
+            extension_paths,
+            skill_paths,
+        })
+    }
+
     pub async fn select_model_route(
         &self,
         project_id: i64,
@@ -471,6 +532,8 @@ impl AgentEnvironment {
                 scope,
                 resource,
                 enabled,
+                status: AgentResourceRefreshStatus::Applied,
+                deferred_chat_count: 0,
             });
         }
         let persisted_resource = persisted_resource(&resource)?;
@@ -480,6 +543,8 @@ impl AgentEnvironment {
             scope,
             resource,
             enabled,
+            status: AgentResourceRefreshStatus::Applied,
+            deferred_chat_count: 0,
         })
     }
 
@@ -714,6 +779,30 @@ impl AgentEnvironment {
             }
         }
     }
+}
+
+async fn canonical_launch_path(
+    discovered_path: PathBuf,
+    scope: DiscoveredScope,
+    project_root: &Path,
+    worktree: &Path,
+) -> Result<PathBuf, AgentEnvironmentError> {
+    let candidate = match scope {
+        DiscoveredScope::User => discovered_path,
+        DiscoveredScope::Project => {
+            let relative = discovered_path
+                .strip_prefix(project_root)
+                .map_err(|_| AgentEnvironmentError::InvalidSnapshot)?;
+            worktree.join(relative)
+        }
+    };
+    let canonical = tokio::fs::canonicalize(candidate)
+        .await
+        .map_err(|_| AgentEnvironmentError::InvalidSnapshot)?;
+    if scope == DiscoveredScope::Project && !canonical.starts_with(worktree) {
+        return Err(AgentEnvironmentError::InvalidSnapshot);
+    }
+    Ok(canonical)
 }
 
 #[derive(Clone, Copy)]

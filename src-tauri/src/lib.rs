@@ -72,7 +72,7 @@ pub fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
 }
 
 pub fn run() {
-    use std::{env, path::PathBuf};
+    use std::{env, path::PathBuf, sync::Arc};
 
     use tauri::Manager;
     use tracing_subscriber::EnvFilter;
@@ -97,16 +97,17 @@ pub fn run() {
             let git = git_process::GitProcess::from_bundled_runtime(&resource_dir.join("git"));
             let database_path = app_data.join("piu.sqlite3");
             let core = application::ApplicationCore::deferred(database_path.clone(), git);
-            let agent_environment = agent_environment::AgentEnvironment::production(
+            let agent_environment = Arc::new(agent_environment::AgentEnvironment::production(
                 core.project_inbox(),
                 &database_path,
                 &app_data,
                 &resource_dir,
                 &real_home,
-            )?;
+            )?);
             let chat_runtime = chat_runtime_host::ChatRuntimeHost::production(
                 core.project_inbox(),
                 core.chat_workspaces(),
+                Arc::clone(&agent_environment),
                 &app_data,
                 &resource_dir,
             )?;
