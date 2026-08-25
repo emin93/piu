@@ -1,5 +1,7 @@
 import { lazy, Suspense } from "react";
 
+import type { ProjectSummary } from "@/platform/project-inbox";
+
 export type DeferredSurfaceName = "conversation" | "diff" | "files" | "terminal" | "settings";
 
 const ConversationSurface = lazy(() => import("./surfaces/ConversationSurface"));
@@ -20,15 +22,17 @@ const surfaces = {
 
 export function DeferredSurface({
   onClose,
+  project,
   surface,
 }: {
   onClose?: () => void;
+  project?: ProjectSummary;
   surface: DeferredSurfaceName;
 }) {
   if (surface === "settings") {
     return (
       <Suspense fallback={<div className="surface-loading">Loading Settings</div>}>
-        <SettingsSurface onClose={onClose} />
+        <SettingsSurface key={project?.id ?? "no-project"} onClose={onClose} project={project} />
       </Suspense>
     );
   }

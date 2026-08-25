@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { parseAuthLauncherArguments, parseChatLauncherArguments } from "./launcher-arguments.mjs";
+import {
+  MAX_ENVIRONMENT_PREFERENCES_BYTES,
+  parseAuthLauncherArguments,
+  parseChatLauncherArguments,
+  parseEnvironmentLauncherArguments,
+} from "./launcher-arguments.mjs";
 
 test("parses the fixed internal chat launcher contract", () => {
   assert.deepEqual(
@@ -26,6 +31,8 @@ test("parses the fixed internal chat launcher contract", () => {
       "/Applications/Più.app/Contents/Resources/skills",
       "--skill",
       "/private/tmp/chat/.pi/skills",
+      "--extension",
+      "/private/tmp/chat/.pi/extensions/review.mjs",
     ]),
     {
       cwd: "/private/tmp/chat",
@@ -36,6 +43,7 @@ test("parses the fixed internal chat launcher contract", () => {
       modelProvider: "openai-codex",
       modelId: "gpt-5.6-sol",
       thinkingLevel: "xhigh",
+      extensionPaths: ["/private/tmp/chat/.pi/extensions/review.mjs"],
       skillPaths: [
         "/Applications/Più.app/Contents/Resources/skills",
         "/private/tmp/chat/.pi/skills",
@@ -73,4 +81,75 @@ test("authentication arguments reject omitted duplicate and unrelated flags", ()
     /duplicate flag/,
   );
   assert.throws(() => parseAuthLauncherArguments(["--cwd", "/tmp"]), /unknown flag/);
+});
+
+test("parses the fixed one-shot environment launcher contract", () => {
+  assert.deepEqual(
+    parseEnvironmentLauncherArguments([
+      "--cwd",
+      "/private/tmp/project",
+      "--agent-dir",
+      "/private/tmp/app/agent",
+      "--credential-lock-dir",
+      "/private/tmp/app/credential-locks",
+      "--resource-preferences",
+      '{"global":[{"kind":"package","id":"npm:@piu/models@1","enabled":false}],"project":[]}',
+    ]),
+    {
+      cwd: "/private/tmp/project",
+      agentDirectory: "/private/tmp/app/agent",
+      credentialLockDirectory: "/private/tmp/app/credential-locks",
+      resourcePreferences: {
+        global: [{ kind: "package", id: "npm:@piu/models@1", enabled: false }],
+        project: [],
+      },
+    },
+  );
+});
+
+test("environment arguments reject omitted duplicate and unrelated flags", () => {
+  assert.throws(() => parseEnvironmentLauncherArguments([]), /missing required flag/);
+  assert.throws(
+    () =>
+      parseEnvironmentLauncherArguments([
+        "--cwd",
+        "/one",
+        "--cwd",
+        "/two",
+        "--agent-dir",
+        "/agent",
+        "--credential-lock-dir",
+        "/locks",
+      ]),
+    /duplicate flag/,
+  );
+  assert.throws(() => parseEnvironmentLauncherArguments(["--session-dir", "/tmp"]), /unknown flag/);
+  assert.throws(
+    () =>
+      parseEnvironmentLauncherArguments([
+        "--cwd",
+        "/one",
+        "--agent-dir",
+        "/agent",
+        "--credential-lock-dir",
+        "/locks",
+        "--resource-preferences",
+        '{"global":[],"project":[{"kind":"extension","id":"x","enabled":"no"}]}',
+      ]),
+    /invalid shape/,
+  );
+  assert.throws(
+    () =>
+      parseEnvironmentLauncherArguments([
+        "--cwd",
+        "/one",
+        "--agent-dir",
+        "/agent",
+        "--credential-lock-dir",
+        "/locks",
+        "--resource-preferences",
+        "x".repeat(MAX_ENVIRONMENT_PREFERENCES_BYTES + 1),
+      ]),
+    /exceed the input limit/,
+  );
 });

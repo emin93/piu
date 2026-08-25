@@ -38,6 +38,9 @@ request_type() {
 
 agent_dir="$(value_for --agent-dir "$@")"
 session_dir="$(value_for --session-dir "$@")"
+model_provider="$(value_for --model-provider "$@")"
+model_id="$(value_for --model-id "$@")"
+thinking_level="$(value_for --thinking-level "$@")"
 session_path="$(value_for --session-path "$@" 2>/dev/null || true)"
 if [[ -z "$session_path" ]]; then
   session_id="pi-${PWD:t}"
@@ -64,7 +67,9 @@ print -r -- "$GIT_EXEC_PATH" > "$record_dir/git-exec-path"
 print -r -- "$GIT_TEMPLATE_DIR" > "$record_dir/git-template-dir"
 print -r -- "$0" > "$record_dir/launcher"
 printf '%s\n' "$@" > "$record_dir/arguments"
+printf '%s\n' "$@" > "$record_dir/arguments-$session_id"
 print -r -- "launch" >> "$record_dir/launches"
+print -r -- "launch" >> "$record_dir/launches-$session_id"
 
 respond_state() {
   local id="$1"
@@ -72,7 +77,11 @@ respond_state() {
   if [[ "$mode" == "text-only" ]]; then
     model_input='["text"]'
   fi
-  printf '{"id":"%s","type":"response","command":"get_state","success":true,"data":{"sessionId":"%s","sessionFile":"%s","model":{"input":%s},"isStreaming":false,"thinkingLevel":"xhigh","messageCount":0,"pendingMessageCount":0}}\n' "$id" "$session_id" "$session_path" "$model_input"
+  local model_name="GPT-5.6 Sol"
+  if [[ "$model_provider" == "local-mlx" ]]; then
+    model_name="Qwen 3.8 27B"
+  fi
+  printf '{"id":"%s","type":"response","command":"get_state","success":true,"data":{"sessionId":"%s","sessionFile":"%s","model":{"provider":"%s","id":"%s","name":"%s","input":%s},"isStreaming":false,"thinkingLevel":"%s","messageCount":0,"pendingMessageCount":0}}\n' "$id" "$session_id" "$session_path" "$model_provider" "$model_id" "$model_name" "$model_input" "$thinking_level"
 }
 
 IFS= read -r readiness
@@ -101,6 +110,45 @@ while IFS= read -r line; do
       else
         printf '{"id":"%s","type":"response","command":"get_messages","success":true,"data":{"messages":[]}}\n' "$id"
       fi
+      ;;
+    get_available_models)
+      printf '{"id":"%s","type":"response","command":"get_available_models","success":true,"data":{"models":[{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true,"input":["text","image"]},{"provider":"local-mlx","id":"qwen3.8-27b","name":"Qwen 3.8 27B","reasoning":true,"input":["text"]}]}}\n' "$id"
+      ;;
+    set_model)
+      if [[ "$mode" == "reject-model" ]]; then
+        printf '{"id":"%s","type":"response","command":"set_model","success":false,"error":"fixture route rejection"}\n' "$id"
+      elif [[ "$line" == *'"provider":"local-mlx"'* && "$line" == *'"modelId":"qwen3.8-27b"'* ]]; then
+        model_provider="local-mlx"
+        model_id="qwen3.8-27b"
+        if [[ "$thinking_level" != "low" && "$thinking_level" != "medium" && "$thinking_level" != "xhigh" ]]; then
+          thinking_level="xhigh"
+        fi
+        printf '{"id":"%s","type":"response","command":"set_model","success":true,"data":{"provider":"local-mlx","id":"qwen3.8-27b","name":"Qwen 3.8 27B","reasoning":true,"input":["text"]}}\n' "$id"
+      elif [[ "$line" == *'"provider":"openai-codex"'* && "$line" == *'"modelId":"gpt-5.6-sol"'* ]]; then
+        model_provider="openai-codex"
+        model_id="gpt-5.6-sol"
+        printf '{"id":"%s","type":"response","command":"set_model","success":true,"data":{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT-5.6 Sol","reasoning":true,"input":["text","image"]}}\n' "$id"
+      else
+        printf '{"id":"%s","type":"response","command":"set_model","success":false,"error":"Model not found"}\n' "$id"
+      fi
+      ;;
+    get_available_thinking_levels)
+      if [[ "$mode" == "reject-thinking-levels" && "$model_provider" == "local-mlx" ]]; then
+        printf '{"id":"%s","type":"response","command":"get_available_thinking_levels","success":false,"error":"fixture levels rejection"}\n' "$id"
+      elif [[ "$model_provider" == "local-mlx" ]]; then
+        printf '{"id":"%s","type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["low","medium","xhigh"]}}\n' "$id"
+      else
+        printf '{"id":"%s","type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off","minimal","low","medium","high","xhigh","max"]}}\n' "$id"
+      fi
+      ;;
+    set_thinking_level)
+      for level in off minimal low medium high xhigh max; do
+        if [[ "$line" == *"\"level\":\"$level\""* ]]; then
+          thinking_level="$level"
+          break
+        fi
+      done
+      printf '{"id":"%s","type":"response","command":"set_thinking_level","success":true}\n' "$id"
       ;;
     prompt)
       (( prompt_count += 1 ))
@@ -140,6 +188,19 @@ while IFS= read -r line; do
           '{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"I should inspect."},{"type":"text","text":"Done."},{"type":"toolCall","id":"call-1","name":"read","arguments":{"path":"README.md"}}],"usage":{"input":12,"output":7,"cacheRead":3,"cacheWrite":0,"totalTokens":22,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":200}}' \
           '{"type":"agent_end","messages":[],"willRetry":false}'
         printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+      elif [[ "$mode" == "controlled-completion" ]]; then
+        printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+        printf '%s\n' \
+          '{"type":"agent_start"}' \
+          '{"type":"message_start","message":{"role":"user","content":"Inspect the runtime","timestamp":100}}' \
+          '{"type":"message_end","message":{"role":"user","content":"Inspect the runtime","timestamp":100}}' \
+          '{"type":"message_start","message":{"role":"assistant","content":[],"usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"pending","timestamp":200}}'
+        while [[ ! -f "$record_dir/complete-$session_id" ]]; do
+          sleep 0.01
+        done
+        printf '%s\n' \
+          '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Done."}],"usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":200}}' \
+          '{"type":"agent_end","messages":[],"willRetry":false}'
       elif [[ "$mode" == "repeated-events" ]]; then
         printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
         printf '%s\n' \

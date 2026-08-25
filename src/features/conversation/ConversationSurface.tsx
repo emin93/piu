@@ -53,6 +53,11 @@ import {
 } from "@/platform/conversations";
 import type { PromptAttachment } from "@/platform/prompt-attachments";
 
+import { ComposerInferenceControls } from "../model-controls/ComposerInferenceControls";
+import {
+  type ModelControlsController,
+  type ModelControlsStoreSnapshot,
+} from "../model-controls/model-controls-controller";
 import { ConversationStore } from "./conversation-store";
 import { ConversationInputDialog } from "./ConversationInputDialog";
 import "./conversation.css";
@@ -78,6 +83,7 @@ interface ConversationSurfaceProps {
   onSend?: (text: string, attachments: readonly PromptAttachment[]) => Promise<void>;
   onStop?: () => Promise<void>;
   onTranscriptStateChange?: (state: TranscriptViewState) => void;
+  modelControls?: ModelControlsController;
   recovery?: {
     message: string;
     onRequestCodexSignIn?: () => void;
@@ -92,6 +98,14 @@ const EMPTY_CONVERSATION = new ConversationStore({
   items: [],
   phase: "stopped",
 });
+const EMPTY_MODEL_CONTROLS_SNAPSHOT: ModelControlsStoreSnapshot = {
+  controls: null,
+  error: null,
+  pending: null,
+  phase: "loading",
+};
+const emptyModelControlsSnapshot = () => EMPTY_MODEL_CONTROLS_SNAPSHOT;
+const subscribeToNoModelControls = () => () => undefined;
 const TRANSCRIPT_ITEM_LAYOUT_SIGNATURES = new WeakMap<ConversationItem, string>();
 
 function hashLayoutText(value: string) {
@@ -478,6 +492,7 @@ function ConversationComposer({
   active,
   attachments,
   draft,
+  modelControls,
   onAttachmentsChange,
   onDraftChange,
   onRequestCodexSignIn,
@@ -487,6 +502,7 @@ function ConversationComposer({
   active: boolean;
   attachments: readonly PromptAttachment[];
   draft: string;
+  modelControls?: ModelControlsController;
   onAttachmentsChange: (attachments: PromptAttachment[]) => void;
   onDraftChange: (value: string) => void;
   onRequestCodexSignIn?: () => void;
@@ -495,6 +511,15 @@ function ConversationComposer({
 }) {
   const [error, setError] = useState<{ authenticationRecovery: boolean; message: string }>();
   const [pendingAction, setPendingAction] = useState<"send" | "stop">();
+  const modelControlsSnapshot = useSyncExternalStore(
+    modelControls?.subscribe ?? subscribeToNoModelControls,
+    modelControls?.getSnapshot ?? emptyModelControlsSnapshot,
+    modelControls?.getSnapshot ?? emptyModelControlsSnapshot,
+  );
+
+  useEffect(() => {
+    if (!active) modelControls?.markCurrentStepApplied();
+  }, [active, modelControls]);
 
   const send = useCallback(async () => {
     const text = draft.trim();
@@ -542,6 +567,9 @@ function ConversationComposer({
     }
   }, [onStop, pendingAction]);
 
+  const showAuthenticationRecovery = Boolean(error?.authenticationRecovery && onRequestCodexSignIn);
+  const showModelControlsRetry = Boolean(modelControlsSnapshot.error && modelControls);
+
   return (
     <ProductComposer
       attachments={
@@ -583,36 +611,72 @@ function ConversationComposer({
       }
       ariaLabel="Message Più"
       error={
-        error
+        error || modelControlsSnapshot.error
           ? {
               action:
-                error.authenticationRecovery && onRequestCodexSignIn ? (
-                  <Button onClick={onRequestCodexSignIn} size="sm" type="button" variant="outline">
-                    <KeyRoundIcon aria-hidden="true" />
-                    Sign in to Codex
-                  </Button>
+                showAuthenticationRecovery || showModelControlsRetry ? (
+                  <div className="conversation-composer-error-actions">
+                    {showAuthenticationRecovery ? (
+                      <Button
+                        onClick={onRequestCodexSignIn}
+                        size="sm"
+                        type="button"
+                        variant="outline"
+                      >
+                        <KeyRoundIcon aria-hidden="true" />
+                        Sign in to Codex
+                      </Button>
+                    ) : null}
+                    {showModelControlsRetry ? (
+                      <Button
+                        onClick={() => void modelControls?.retry()}
+                        size="sm"
+                        type="button"
+                        variant="outline"
+                      >
+                        Try again
+                      </Button>
+                    ) : null}
+                  </div>
                 ) : undefined,
-              message: error.message,
+              message: (
+                <>
+                  {error ? <span>{error.message}</span> : null}
+                  {modelControlsSnapshot.error ? <span>{modelControlsSnapshot.error}</span> : null}
+                </>
+              ),
             }
           : undefined
       }
       layout="docked"
       inputReadOnly={pendingAction === "send"}
       leadingActions={
-        <PromptAttachmentButton
-          attachments={attachments}
-          disabled={!onSend || Boolean(pendingAction)}
-          onChange={onAttachmentsChange}
-          onError={(message) =>
-            setError(message ? { authenticationRecovery: false, message } : undefined)
-          }
-        />
+        <>
+          <PromptAttachmentButton
+            attachments={attachments}
+            disabled={!onSend || Boolean(pendingAction)}
+            onChange={onAttachmentsChange}
+            onError={(message) =>
+              setError(message ? { authenticationRecovery: false, message } : undefined)
+            }
+          />
+          {modelControls ? (
+            <ComposerInferenceControls
+              disabled={Boolean(pendingAction)}
+              onSelectEffort={modelControls.selectEffort}
+              onSelectRoute={modelControls.selectRoute}
+              snapshot={modelControlsSnapshot}
+            />
+          ) : null}
+        </>
       }
       onSubmit={() => void send()}
       onValueChange={onDraftChange}
       placeholder={active ? "Steer the active turn" : "Continue the conversation"}
       status={
-        active ? (
+        active && modelControlsSnapshot.controls?.appliesAfterCurrentStep ? (
+          <span aria-live="polite">Switches after the current step</span>
+        ) : active ? (
           <span>Steers at the next safe point</span>
         ) : !onSend ? (
           <span>Reconnect to send</span>
@@ -628,6 +692,7 @@ export function ConversationSurface({
   attachments: controlledAttachments,
   draft: controlledDraft,
   initialTranscriptState,
+  modelControls,
   onAnswerInput,
   onAttachmentsChange,
   onDraftChange,
@@ -867,6 +932,7 @@ export function ConversationSurface({
           active={snapshot.phase === "running"}
           attachments={attachments}
           draft={draft}
+          modelControls={modelControls}
           onAttachmentsChange={updateAttachments}
           onDraftChange={updateDraft}
           onRequestCodexSignIn={onRequestCodexSignIn}

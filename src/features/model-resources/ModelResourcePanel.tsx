@@ -31,6 +31,7 @@ import {
   startModelDownload,
   subscribeToModelAssetStatus,
 } from "@/platform/model-assets";
+import "./model-resource-panel.css";
 
 const phaseLabels: Record<ModelAssetStatus["phase"], string> = {
   initializing: "Checking",
@@ -68,6 +69,7 @@ function statusVariant(phase: ModelAssetStatus["phase"]): "destructive" | "outli
 
 interface ModelResourcePanelProps {
   context: "onboarding" | "settings";
+  embedded?: boolean;
   /** Deterministic build-time QA input; production Settings never supplies it. */
   statusOverride?: ModelAssetStatus;
   dialogOpenForQa?: boolean;
@@ -77,6 +79,7 @@ export function ModelResourcePanel({
   context,
   statusOverride,
   dialogOpenForQa = false,
+  embedded = false,
 }: ModelResourcePanelProps) {
   const headingId = useId();
   const tokenId = useId();
@@ -139,7 +142,10 @@ export function ModelResourcePanel({
 
   if (initialization === "failed") {
     return (
-      <section aria-label="Models & resources" className="model-resource-panel">
+      <section
+        aria-label={embedded ? "Managed local model controls" : "Models & resources"}
+        className="model-resource-panel"
+      >
         <Empty className="model-resource-empty">
           <EmptyHeader>
             <EmptyTitle>Model resources unavailable</EmptyTitle>
@@ -174,7 +180,7 @@ export function ModelResourcePanel({
     return (
       <section
         aria-busy="true"
-        aria-label="Models & resources"
+        aria-label={embedded ? "Managed local model controls" : "Models & resources"}
         className="model-resource-panel model-resource-panel--loading"
         role="status"
       >
@@ -201,30 +207,42 @@ export function ModelResourcePanel({
   const qaMode = statusOverride !== undefined;
   const progressValue = progress(currentStatus);
   const statusMessage = mismatch ? REVISION_MISMATCH_MESSAGE : currentStatus.message;
+  const statusBadge = (
+    <Badge
+      aria-atomic="true"
+      aria-live="polite"
+      className={`resource-status resource-status--${currentStatus.phase}`}
+      role="status"
+      variant={statusVariant(currentStatus.phase)}
+    >
+      {phaseLabels[currentStatus.phase]}
+    </Badge>
+  );
 
   return (
-    <section aria-labelledby={headingId} className="model-resource-panel">
-      <header className="model-resource-header">
-        <div>
-          <p className="settings-eyebrow">
-            {context === "onboarding" ? "Required resource" : "Models & resources"}
-          </p>
-          <h2 id={headingId}>Local model</h2>
-        </div>
-        <Badge
-          aria-atomic="true"
-          aria-live="polite"
-          className={`resource-status resource-status--${currentStatus.phase}`}
-          role="status"
-          variant={statusVariant(currentStatus.phase)}
-        >
-          {phaseLabels[currentStatus.phase]}
-        </Badge>
-      </header>
+    <section
+      aria-label={embedded ? "Managed local model controls" : undefined}
+      aria-labelledby={embedded ? undefined : headingId}
+      className="model-resource-panel"
+    >
+      {embedded ? null : (
+        <header className="model-resource-header">
+          <div>
+            <p className="settings-eyebrow">
+              {context === "onboarding" ? "Required resource" : "Models & resources"}
+            </p>
+            <h2 id={headingId}>Local model</h2>
+          </div>
+          {statusBadge}
+        </header>
+      )}
 
-      <div className="model-resource-identity">
-        <strong>Qwen 3.8 27B · 4-bit</strong>
-        <span>MTP drafter</span>
+      <div className="model-resource-identity-row">
+        <div className="model-resource-identity">
+          <strong>Qwen 3.8 27B · 4-bit</strong>
+          <span>MTP drafter</span>
+        </div>
+        {embedded ? statusBadge : null}
       </div>
       <p className="model-resource-copy">
         Più installs and verifies this exact model in managed application storage. It loads only

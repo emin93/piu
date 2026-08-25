@@ -5,7 +5,9 @@ use tauri::{AppHandle, Emitter, Runtime, State};
 use ts_rs::TS;
 
 use crate::{
+    agent_environment::AgentEnvironment,
     application::ApplicationCore,
+    chat_runtime_host::{ModelRouteId, ReasoningEffort},
     chat_workspaces::{
         ChatSetupChangedEvent, ChatTerminalRequest, ChatWorkspaceError, CreatedChat,
     },
@@ -62,6 +64,8 @@ pub struct CreateChatRequest {
     pub prompt: String,
     #[serde(default)]
     pub attachments: Vec<PromptAttachment>,
+    pub route: ModelRouteId,
+    pub effort: ReasoningEffort,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -131,6 +135,7 @@ pub enum ChatWorkspaceCommandErrorCode {
     CreationFailed,
     StorageUnavailable,
     InvalidAttachment,
+    InferenceUnavailable,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -333,12 +338,25 @@ pub async fn rename_chat<R: Runtime>(
 pub async fn create_chat<R: Runtime>(
     app: AppHandle<R>,
     core: State<'_, ApplicationCore>,
+    environment: State<'_, Arc<AgentEnvironment>>,
     request: CreateChatRequest,
 ) -> Result<CreateChatResponse, ChatWorkspaceCommandError> {
+    let selection = environment
+        .validate_model_selection(request.project_id, request.route, request.effort)
+        .await
+        .map_err(|_| ChatWorkspaceCommandError {
+            code: ChatWorkspaceCommandErrorCode::InferenceUnavailable,
+            message: "That model or reasoning effort is no longer available. Choose again.".into(),
+        })?;
     let workspaces = core.chat_workspaces();
     let setup_workspaces = Arc::clone(&workspaces);
     let CreatedChat { chat, snapshot } = blocking_chat_operation(move || {
-        workspaces.create_chat(request.project_id, &request.prompt, &request.attachments)
+        workspaces.create_chat(
+            request.project_id,
+            &request.prompt,
+            &request.attachments,
+            selection,
+        )
     })
     .await?;
     let chat_id = chat.id.clone();
@@ -438,13 +456,24 @@ async fn load_project_inbox_from(
         if let Some(workspaces) = workspaces {
             workspaces
                 .reconcile_once()
+                .inspect_err(|error| {
+                    tracing::error!(
+                        error = ?error,
+                        "chat workspace reconciliation failed while loading the inbox"
+                    );
+                })
                 .map_err(ChatWorkspaceCommandError::from)
                 .map_err(|error| ProjectCommandError {
                     code: ProjectCommandErrorCode::StorageUnavailable,
                     message: error.message,
                 })?;
         }
-        inbox.snapshot().map_err(Into::into)
+        inbox
+            .snapshot()
+            .inspect_err(|error| {
+                tracing::error!(error = ?error, "project inbox snapshot failed during startup");
+            })
+            .map_err(Into::into)
     })
     .await
     .map_err(|_| ProjectCommandError {

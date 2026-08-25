@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import test from "node:test";
 
 import { createPiuChatRuntime } from "./chat-runtime.mjs";
@@ -38,7 +39,24 @@ function createPiContract() {
     SettingsManager: {
       create(cwd, agentDirectory, options) {
         calls.push(["settings", cwd, agentDirectory, options]);
-        return { cwd, agentDirectory, options };
+        return {
+          getGlobalSettings() {
+            return { npmCommand: ["configured-global-npm"], steeringMode: "all" };
+          },
+          getProjectSettings() {
+            return { followUpMode: "one-at-a-time", npmCommand: ["configured-project-npm"] };
+          },
+        };
+      },
+      fromStorage(storage, options) {
+        const settings = {};
+        for (const scope of ["global", "project"]) {
+          storage.withLock(scope, (current) => {
+            settings[scope] = JSON.parse(current);
+          });
+        }
+        calls.push(["runtimeSettings", settings, options]);
+        return { options, settings };
       },
     },
     async createAgentSessionServices(options) {
@@ -65,13 +83,14 @@ const paths = {
   cwd: "/private/tmp/piu/worktrees/chat-1",
   agentDirectory: "/Users/test/Library/Application Support/ch.emin.piu/agent",
   sessionDirectory: "/Users/test/Library/Application Support/ch.emin.piu/sessions",
+  extensionPaths: ["/private/tmp/piu/worktrees/chat-1/.pi/extensions/review.mjs"],
   skillPaths: [
     "/Applications/Più.app/Contents/Resources/agent-runtime/skills",
     "/private/tmp/piu/worktrees/chat-1/.pi/skills",
   ],
 };
 
-test("a new chat uses the exact app directories and explicit skill paths", async () => {
+test("a new chat uses the exact app directories and explicit resource paths", async () => {
   const { calls, model, pi } = createPiContract();
   const credentials = { read: async () => undefined };
   const createNewSessionManager = async ({ cwd, sessionDirectory, SessionManager }) => {
@@ -93,7 +112,7 @@ test("a new chat uses the exact app directories and explicit skill paths", async
   assert.deepEqual(result.session, { id: "session" });
   assert.deepEqual(
     calls.find(([kind]) => kind === "modelRuntime"),
-    ["modelRuntime", { credentials, modelsPath: null }],
+    ["modelRuntime", { credentials, modelsPath: join(paths.agentDirectory, "models.json") }],
   );
   assert.deepEqual(
     calls.find(([kind]) => kind === "createSession"),
@@ -103,10 +122,21 @@ test("a new chat uses the exact app directories and explicit skill paths", async
   assert.equal(serviceOptions.cwd, paths.cwd);
   assert.equal(serviceOptions.agentDir, paths.agentDirectory);
   assert.deepEqual(serviceOptions.resourceLoaderOptions, {
+    additionalExtensionPaths: paths.extensionPaths,
     additionalSkillPaths: paths.skillPaths,
+    noExtensions: true,
     noSkills: true,
   });
   assert.deepEqual(serviceOptions.settingsManager.options, { projectTrusted: true });
+  const runtimeSettings = calls.find(([kind]) => kind === "runtimeSettings")[1];
+  assert.equal(runtimeSettings.global.steeringMode, "all");
+  assert.equal(runtimeSettings.project.followUpMode, "one-at-a-time");
+  assert.deepEqual(runtimeSettings.global.npmCommand, runtimeSettings.project.npmCommand);
+  const npmCommand = runtimeSettings.global.npmCommand;
+  assert.equal(npmCommand[0], process.execPath);
+  assert.match(npmCommand[1], /isolated-npm-root\.mjs$/);
+  assert.equal(npmCommand[2], join(paths.agentDirectory, ".piu-empty-global-npm"));
+  assert.equal(npmCommand[3], "--");
   const sessionOptions = calls.find(([kind]) => kind === "session")[1];
   assert.equal(sessionOptions.model, model);
   assert.equal(sessionOptions.thinkingLevel, "medium");

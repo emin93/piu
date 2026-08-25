@@ -60,6 +60,9 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import type { ChatSummary, InboxSnapshot, ProjectSummary } from "@/platform/project-inbox";
 import type { ConversationAdapter } from "@/platform/conversations";
 import type { PromptAttachment } from "@/platform/prompt-attachments";
+import type { ModelControlsAdapter } from "@/platform/model-controls";
+import type { ModelRouteId } from "@/generated/ModelRouteId";
+import type { ReasoningEffort } from "@/generated/ReasoningEffort";
 
 import { ChatComposer } from "./ChatComposer";
 import type { TranscriptViewState } from "../conversation/ConversationSurface";
@@ -74,14 +77,18 @@ import { SidebarResizeHandle } from "./SidebarResizeHandle";
 interface InboxWorkspaceProps {
   actionError: string | undefined;
   activities: ChatActivityController;
+  chatModelControlsAdapter?: ModelControlsAdapter;
   conversationAdapter: ConversationAdapter;
   conversationRevision: number;
   drafts: ProjectDraftController;
+  modelControlsAdapter?: ModelControlsAdapter<number>;
   onCancelSetup: (chatId: string) => Promise<string | undefined>;
   onCreateChat: (
     projectId: number,
     prompt: string,
     attachments: readonly PromptAttachment[],
+    route: ModelRouteId,
+    effort: ReasoningEffort,
   ) => Promise<string | undefined>;
   onOpenRepository: () => void;
   onOpenTerminal: (chatId: string) => Promise<string | undefined>;
@@ -204,6 +211,7 @@ class TranscriptStateCache {
 
 function SelectedChatStage({
   chat,
+  chatModelControlsAdapter,
   conversationAdapter,
   conversationRevision,
   initialTranscriptState,
@@ -215,6 +223,7 @@ function SelectedChatStage({
   setups,
 }: {
   chat: ChatSummary;
+  chatModelControlsAdapter?: ModelControlsAdapter;
   conversationAdapter: ConversationAdapter;
   conversationRevision: number;
   initialTranscriptState?: TranscriptViewState;
@@ -262,6 +271,7 @@ function SelectedChatStage({
         chatId={chat.id}
         initialTranscriptState={initialTranscriptState}
         key={chat.id}
+        modelControlsAdapter={chatModelControlsAdapter}
         onRequestCodexSignIn={onRequestCodexSignIn}
         onTranscriptStateChange={saveTranscriptState}
         revision={conversationRevision}
@@ -475,9 +485,11 @@ function SearchStage({ count }: { count: number }) {
 export function InboxWorkspace({
   actionError,
   activities,
+  chatModelControlsAdapter,
   conversationAdapter,
   conversationRevision,
   drafts,
+  modelControlsAdapter,
   onCancelSetup,
   onCreateChat,
   onOpenRepository,
@@ -755,6 +767,7 @@ export function InboxWorkspace({
         ) : selectedChat ? (
           <SelectedChatStage
             chat={selectedChat}
+            chatModelControlsAdapter={chatModelControlsAdapter}
             conversationAdapter={conversationAdapter}
             conversationRevision={conversationRevision}
             initialTranscriptState={transcriptStates.get(selectedChat.id)}
@@ -766,7 +779,13 @@ export function InboxWorkspace({
             setups={setups}
           />
         ) : targetProject ? (
-          <ChatComposer drafts={drafts} onSubmit={onCreateChat} project={targetProject} />
+          <ChatComposer
+            drafts={drafts}
+            key={targetProject.id}
+            modelControlsAdapter={modelControlsAdapter}
+            onSubmit={onCreateChat}
+            project={targetProject}
+          />
         ) : null}
       </section>
 

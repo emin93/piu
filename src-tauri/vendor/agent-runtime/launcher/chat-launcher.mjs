@@ -4,6 +4,7 @@ import { createRuntimeCredentials } from "./runtime-credentials.mjs";
 
 process.env.PI_SKIP_VERSION_CHECK = "1";
 process.env.PI_TELEMETRY = "0";
+process.env.PI_OFFLINE = "1";
 
 async function main() {
   const [pi, locking] = await Promise.all([

@@ -320,6 +320,18 @@ test("command failures expose only recognized host messages", () => {
   );
 });
 
+test("a failed inference rollback preserves its typed recovery message", () => {
+  expect(
+    conversationErrorMessage(
+      {
+        code: "inferenceRollbackFailed",
+        message: "Pi couldn’t safely restore the previous model. Reopen the chat and try again.",
+      },
+      "The model could not be changed.",
+    ),
+  ).toBe("Pi couldn’t safely restore the previous model. Reopen the chat and try again.");
+});
+
 test("only the typed authentication boundary offers Codex sign-in", () => {
   expect(
     conversationRequiresCodexSignIn({

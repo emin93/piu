@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Runtime, State};
+use tauri::{Emitter, Runtime, State, WebviewWindow};
 use ts_rs::TS;
 
 use crate::application::ApplicationCore;
@@ -30,7 +30,7 @@ pub struct HostRoundTripResponse {
 
 #[tauri::command]
 pub async fn host_round_trip<R: Runtime>(
-    app: AppHandle<R>,
+    window: WebviewWindow<R>,
     core: State<'_, ApplicationCore>,
     request: HostRoundTripRequest,
 ) -> Result<HostRoundTripResponse, String> {
@@ -50,7 +50,8 @@ pub async fn host_round_trip<R: Runtime>(
         sent_at_ms: request.sent_at_ms,
         received_at_ms,
     };
-    app.emit(HOST_ROUND_TRIP_EVENT, &response)
+    window
+        .emit_to(window.label(), HOST_ROUND_TRIP_EVENT, &response)
         .map_err(|error| format!("could not emit host round-trip event: {error}"))?;
     tracing::info!(target: "piu::startup", "piu_shell_ready");
     Ok(response)

@@ -47,6 +47,11 @@ const conversationRuntime = vi.hoisted(() => ({
 const promptAttachments = vi.hoisted(() => ({
   select: vi.fn(),
 }));
+const projectModelControls = vi.hoisted(() => ({
+  get: vi.fn(),
+  selectEffort: vi.fn(),
+  selectRoute: vi.fn(),
+}));
 
 vi.mock("./platform/host-boundary", () => ({ verifyHostBoundary: boundary.verify }));
 vi.mock("./platform/repository-picker", () => ({
@@ -95,6 +100,10 @@ vi.mock("./platform/prompt-attachments", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./platform/prompt-attachments")>()),
   selectPromptAttachments: promptAttachments.select,
 }));
+vi.mock("./platform/agent-environment", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./platform/agent-environment")>()),
+  tauriProjectModelControlsAdapter: projectModelControls,
+}));
 vi.mock("./features/auth/CodexSignInDialog", () => ({
   default: ({ onComplete, open }: { onComplete: () => void; open: boolean }) =>
     open ? (
@@ -105,6 +114,14 @@ vi.mock("./features/auth/CodexSignInDialog", () => ({
 }));
 
 const emptySnapshot = { projects: [], drafts: [], chats: [] };
+const selectedRoute = { modelId: "qwen3.8-27b", provider: "local-mlx" };
+const readyModelControls = {
+  appliesAfterCurrentStep: false,
+  efforts: ["low", "medium", "xhigh"] as const,
+  routes: [{ acceptsImages: false, id: selectedRoute, name: "Qwen 3.8 27B" }],
+  selectedEffort: "medium" as const,
+  selectedRoute,
+};
 const missingModel = {
   phase: "missing" as const,
   repository: "orcarouter/Qwen3.8-27B-Uncensored-MLX",
@@ -187,6 +204,12 @@ beforeEach(() => {
   conversationRuntime.prompt.mockResolvedValue(undefined);
   conversationRuntime.stop.mockReset();
   promptAttachments.select.mockReset();
+  projectModelControls.get.mockReset();
+  projectModelControls.get.mockResolvedValue(readyModelControls);
+  projectModelControls.selectEffort.mockReset();
+  projectModelControls.selectEffort.mockResolvedValue(readyModelControls);
+  projectModelControls.selectRoute.mockReset();
+  projectModelControls.selectRoute.mockResolvedValue(readyModelControls);
   promptAttachments.select.mockResolvedValue({ outcome: "cancelled" });
   conversationRuntime.stop.mockResolvedValue(undefined);
   windowLifecycle.resolveRequest = undefined;
@@ -452,7 +475,13 @@ test("first send creates a durable chat and moves into streamed setup", async ()
 
   await user.click(screen.getByRole("button", { name: "Send message" }));
 
-  expect(chatWorkspaces.create).toHaveBeenCalledWith(1, "Repair the parser", []);
+  expect(chatWorkspaces.create).toHaveBeenCalledWith(
+    1,
+    "Repair the parser",
+    [],
+    selectedRoute,
+    "medium",
+  );
   expect(await screen.findByRole("heading", { name: "Setting up worktree" })).toBeVisible();
   expect(screen.getByLabelText("Setup output")).toHaveTextContent("Installing dependencies");
   expect(screen.queryByRole("textbox", { name: "Draft for Atlas" })).not.toBeInTheDocument();
@@ -515,7 +544,13 @@ test("a selected attachment is previewed, persisted, and included in chat creati
 
   await user.type(screen.getByRole("textbox", { name: "Draft for Atlas" }), "Use the notes");
   await user.click(screen.getByRole("button", { name: "Send message" }));
-  expect(chatWorkspaces.create).toHaveBeenCalledWith(1, "Use the notes", [attachment]);
+  expect(chatWorkspaces.create).toHaveBeenCalledWith(
+    1,
+    "Use the notes",
+    [attachment],
+    selectedRoute,
+    "medium",
+  );
 });
 
 test("Settings preserves the selected project and its draft when returning to Inbox", async () => {
@@ -534,10 +569,10 @@ test("Settings preserves the selected project and its draft when returning to In
   await user.type(draft, " while away");
   await user.click(screen.getByRole("button", { name: "Settings" }));
 
-  expect(await screen.findByRole("heading", { name: "Settings" })).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "Models & Resources" })).toBeVisible();
   const backToInbox = screen.getByRole("button", { name: "Back to Inbox" });
   await waitFor(() => expect(backToInbox).toHaveFocus());
-  expect(screen.getByText("Settings", { selector: ".titlebar-context" })).toBeVisible();
+  expect(screen.getByText("Models & Resources", { selector: ".titlebar-context" })).toBeVisible();
   expect(projectInbox.saveDraft).toHaveBeenCalledWith(1, "Keep this draft while away", []);
 
   await user.click(backToInbox);
@@ -775,7 +810,7 @@ test("a failed draft save never claims the draft is saved", async () => {
   await user.click(await screen.findByRole("button", { name: /Atlas, available/ }));
   await user.type(screen.getByRole("textbox", { name: "Draft for Atlas" }), "Keep me");
 
-  expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't save this draft");
+  expect(await screen.findByText(/Couldn't save this draft/)).toBeVisible();
   expect(screen.queryByText("Saved locally")).not.toBeInTheDocument();
   await expect(windowLifecycle.resolveRequest?.()).rejects.toThrow("could not be saved");
 });

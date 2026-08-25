@@ -6,8 +6,10 @@ import {
   conversationErrorMessage,
   conversationRequiresCodexSignIn,
 } from "@/platform/conversations";
+import { type ModelControlsAdapter, tauriModelControlsAdapter } from "@/platform/model-controls";
 import type { PromptAttachment } from "@/platform/prompt-attachments";
 
+import { ModelControlsController } from "../model-controls/model-controls-controller";
 import { ConversationSurface, type TranscriptViewState } from "./ConversationSurface";
 import { ConversationController } from "./conversation-controller";
 
@@ -15,6 +17,7 @@ interface ChatConversationPanelProps {
   adapter: ConversationAdapter;
   chatId: string;
   initialTranscriptState?: TranscriptViewState;
+  modelControlsAdapter?: ModelControlsAdapter;
   onRequestCodexSignIn: () => void;
   onTranscriptStateChange?: (state: TranscriptViewState) => void;
   revision?: number;
@@ -35,11 +38,16 @@ function ConnectedChatConversationPanel({
   adapter,
   chatId,
   initialTranscriptState,
+  modelControlsAdapter = tauriModelControlsAdapter,
   onRequestCodexSignIn,
   onTranscriptStateChange,
   revision = 0,
 }: ChatConversationPanelProps) {
   const controller = useMemo(() => new ConversationController(chatId, adapter), [adapter, chatId]);
+  const modelControls = useMemo(
+    () => new ModelControlsController(chatId, modelControlsAdapter),
+    [chatId, modelControlsAdapter],
+  );
   const [connection, setConnection] = useState<ConnectionState>(() => ({
     controller,
     phase: "connecting",
@@ -65,6 +73,12 @@ function ConnectedChatConversationPanel({
       controller.dispose();
     };
   }, [attempt, controller, revision]);
+
+  useEffect(() => {
+    void modelControls.load();
+  }, [attempt, modelControls, revision]);
+
+  useEffect(() => () => modelControls.dispose(), [modelControls]);
 
   const send = useCallback(
     (text: string, selectedAttachments: readonly PromptAttachment[]) =>
@@ -95,6 +109,7 @@ function ConnectedChatConversationPanel({
         onSend={send}
         onStop={stop}
         onTranscriptStateChange={onTranscriptStateChange}
+        modelControls={modelControls}
         store={controller.store}
       />
     );

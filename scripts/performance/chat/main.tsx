@@ -7,7 +7,9 @@ import { ProjectDraftController } from "@/features/inbox/draft-controller";
 import { ChatActivityController } from "@/features/inbox/chat-activity-controller";
 import { InboxWorkspace } from "@/features/inbox/InboxWorkspace";
 import { ChatSetupController } from "@/features/inbox/setup-controller";
+import type { ModelControlsSnapshot } from "@/generated/ModelControlsSnapshot";
 import type { ConversationAdapter, ConversationEvent } from "@/platform/conversations";
+import type { ModelControlsAdapter } from "@/platform/model-controls";
 import type { InboxSnapshot } from "@/platform/project-inbox";
 import "@/styles.css";
 import "./harness.css";
@@ -31,6 +33,19 @@ interface Summary {
 interface FrameSummary extends Summary {
   framesOver20ms: number;
   observedFps: number;
+}
+
+class RenderCounter {
+  #count = 0;
+
+  get count() {
+    return this.#count;
+  }
+
+  record<T>(value: T) {
+    this.#count += 1;
+    return value;
+  }
 }
 
 const readySetup = {
@@ -65,6 +80,25 @@ const snapshot: InboxSnapshot = {
   })),
   drafts: [],
   projects: [{ availability: "available", id: 1, name: "Atlas", unmergedChatCount: 24 }],
+};
+
+const performanceModelControls: ModelControlsSnapshot = {
+  appliesAfterCurrentStep: false,
+  efforts: ["low", "medium", "xhigh"],
+  routes: [
+    {
+      acceptsImages: true,
+      id: { modelId: "qwen3.8-27b", provider: "piu-local" },
+      name: "Qwen 3.8 27B",
+    },
+    {
+      acceptsImages: true,
+      id: { modelId: "gpt-5.6-sol", provider: "openai-codex" },
+      name: "GPT-5.6 Sol",
+    },
+  ],
+  selectedEffort: "medium",
+  selectedRoute: { modelId: "qwen3.8-27b", provider: "piu-local" },
 };
 
 function conversationItems(chatId: string) {
@@ -153,6 +187,7 @@ function PerformanceReview() {
     scrolling: [],
     streaming: [],
   });
+  const inferenceControlRenders = useMemo(() => new RenderCounter(), []);
   const eventReceivers = useRef(new Map<string, (event: ConversationEvent) => void>());
   const drafts = useMemo(() => {
     const controller = new ProjectDraftController(() => Promise.resolve(undefined));
@@ -191,6 +226,23 @@ function PerformanceReview() {
     }),
     [],
   );
+  const chatModelControlsAdapter = useMemo<ModelControlsAdapter>(() => {
+    const trackedControls = Object.defineProperty(
+      { ...performanceModelControls },
+      "selectedEffort",
+      {
+        enumerable: true,
+        get() {
+          return inferenceControlRenders.record(performanceModelControls.selectedEffort);
+        },
+      },
+    );
+    return {
+      get: () => Promise.resolve(trackedControls),
+      selectEffort: () => Promise.resolve(trackedControls),
+      selectRoute: () => Promise.resolve(trackedControls),
+    };
+  }, [inferenceControlRenders]);
 
   const profile = useCallback(
     (_id: string, _phase: "mount" | "update" | "nested-update", actualDuration: number) => {
@@ -207,6 +259,10 @@ function PerformanceReview() {
       await waitFor(
         () => visibleText("Conversation marker performance-chat-0"),
         "the initial transcript",
+      );
+      await waitFor(
+        () => Boolean(document.querySelector('[aria-label="Model: Qwen 3.8 27B"]')),
+        "the inference controls",
       );
 
       await waitFor(
@@ -324,6 +380,7 @@ function PerformanceReview() {
       const receive = eventReceivers.current.get("performance-chat-0");
       if (!receive) throw new Error("Conversation event receiver is unavailable");
       const streamFrames: number[] = [];
+      const inferenceControlRendersBeforeStreaming = inferenceControlRenders.count;
       currentScenario.current = "streaming";
       for (let index = 0; index < FRAME_SAMPLES; index += 1) {
         const timestamp = await nextFrame();
@@ -332,11 +389,19 @@ function PerformanceReview() {
       }
       currentScenario.current = undefined;
       await afterPaint();
+      const inferenceControlRendersDuringStreaming =
+        inferenceControlRenders.count - inferenceControlRendersBeforeStreaming;
+      if (inferenceControlRendersDuringStreaming !== 0) {
+        throw new Error(
+          `Inference controls rendered ${String(inferenceControlRendersDuringStreaming)} times during transcript streaming`,
+        );
+      }
 
       const report = {
         browser: navigator.userAgent,
         chatSwitchVisibleNextFrameMs: summarize(chatSwitchSamples),
         composerInputNextFrameMs: summarize(inputSamples),
+        inferenceControlRendersDuringStreaming,
         method: "packaged WKWebView, production bundle with react-dom/profiling",
         navigationVisibleNextFrameMs: summarize(navigationSamples),
         reactCommitMs: Object.fromEntries(
@@ -356,7 +421,7 @@ function PerformanceReview() {
       await writeText(`${RESULT_PREFIX}${JSON.stringify({ error: message })}`);
       setStatus(`Performance review failed: ${message}`);
     }
-  }, [drafts]);
+  }, [drafts, inferenceControlRenders]);
 
   return (
     <TooltipProvider>
@@ -364,6 +429,7 @@ function PerformanceReview() {
         <InboxWorkspace
           activities={activities}
           actionError={undefined}
+          chatModelControlsAdapter={chatModelControlsAdapter}
           conversationAdapter={adapter}
           conversationRevision={0}
           drafts={drafts}

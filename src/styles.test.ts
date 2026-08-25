@@ -3,6 +3,7 @@ import { expect, test } from "vitest";
 import alertDialogSource from "./components/ui/alert-dialog.tsx?raw";
 import dialogSource from "./components/ui/dialog.tsx?raw";
 import modelResourceSource from "./features/model-resources/ModelResourcePanel.tsx?raw";
+import modelResourceStyles from "./features/model-resources/model-resource-panel.css?raw";
 import stylesheet from "./styles.css?raw";
 
 test("the interface uses two local Latin Geist variable faces", () => {
@@ -90,5 +91,5 @@ test("model resources compose the shared controls without a second custom contro
   expect(modelResourceSource).toContain("<Badge");
   expect(modelResourceSource).toContain("<AlertDialog");
   expect(modelResourceSource).toContain("<Skeleton");
-  expect(stylesheet).toMatch(/\.model-resource-panel\s*\{[\s\S]*?gap: 16px/);
+  expect(modelResourceStyles).toMatch(/\.model-resource-panel\s*\{[\s\S]*?gap: 16px/);
 });

@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { mkdir, open, unlink } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
+import { createChatSettingsManager } from "./isolated-package-resolution.mjs";
+
 function requireAbsolute(name, value) {
   if (typeof value !== "string" || !isAbsolute(value)) {
     throw new Error(`${name} must be an absolute path`);
@@ -13,6 +15,10 @@ function validate(config) {
   requireAbsolute("agent directory", config.agentDirectory);
   requireAbsolute("session directory", config.sessionDirectory);
   if (config.sessionPath !== undefined) requireAbsolute("session path", config.sessionPath);
+  if (!Array.isArray(config.extensionPaths)) throw new Error("extension paths must be an array");
+  for (const extensionPath of config.extensionPaths) {
+    requireAbsolute("extension path", extensionPath);
+  }
   if (!Array.isArray(config.skillPaths)) throw new Error("skill paths must be an array");
   for (const skillPath of config.skillPaths) requireAbsolute("skill path", skillPath);
   if (!config.modelProvider || !config.modelId) throw new Error("model route is required");
@@ -50,7 +56,10 @@ export async function createPiuChatRuntime(
   { credentials, createNewSessionManager = createPersistedSessionManager, pi },
 ) {
   validate(config);
-  const modelRuntime = await pi.ModelRuntime.create({ credentials, modelsPath: null });
+  const modelRuntime = await pi.ModelRuntime.create({
+    credentials,
+    modelsPath: join(config.agentDirectory, "models.json"),
+  });
   const initialSessionManager = config.sessionPath
     ? pi.SessionManager.open(config.sessionPath, config.sessionDirectory)
     : await createNewSessionManager({
@@ -60,8 +69,10 @@ export async function createPiuChatRuntime(
       });
 
   const createRuntime = async ({ cwd, agentDir, sessionManager, sessionStartEvent }) => {
-    const settingsManager = pi.SettingsManager.create(cwd, agentDir, {
-      projectTrusted: true,
+    const settingsManager = createChatSettingsManager({
+      agentDirectory: agentDir,
+      cwd,
+      SettingsManager: pi.SettingsManager,
     });
     const services = await pi.createAgentSessionServices({
       cwd,
@@ -69,7 +80,9 @@ export async function createPiuChatRuntime(
       settingsManager,
       modelRuntime,
       resourceLoaderOptions: {
+        additionalExtensionPaths: config.extensionPaths,
         additionalSkillPaths: config.skillPaths,
+        noExtensions: true,
         noSkills: true,
       },
     });

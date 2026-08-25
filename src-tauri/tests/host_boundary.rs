@@ -25,7 +25,7 @@ fn typed_round_trip_crosses_the_command_and_event_boundary() {
         .build()
         .expect("mock main webview");
     let (event_sender, event_receiver) = mpsc::channel();
-    app.listen(HOST_ROUND_TRIP_EVENT, move |event| {
+    webview.listen(HOST_ROUND_TRIP_EVENT, move |event| {
         let response =
             serde_json::from_str::<HostRoundTripResponse>(event.payload()).expect("typed event");
         event_sender.send(response).expect("send observed event");

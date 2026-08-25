@@ -3,12 +3,13 @@ import { expect, test } from "vitest";
 import defaultCapability from "../src-tauri/capabilities/default.json";
 import tauriConfig from "../src-tauri/tauri.conf.json";
 
-test("the native traffic lights use the centerline of Più's 52-pixel titlebar", () => {
+test("the native traffic lights use Tauri's decorated overlay titlebar", () => {
   expect(tauriConfig.app.windows[0]).toMatchObject({
+    decorations: true,
     hiddenTitle: true,
     titleBarStyle: "Overlay",
-    trafficLightPosition: { x: 14, y: 26 },
   });
+  expect(tauriConfig.app.windows[0]).not.toHaveProperty("trafficLightPosition");
 });
 
 test("the main window is allowed to invoke Tauri's native drag command", () => {

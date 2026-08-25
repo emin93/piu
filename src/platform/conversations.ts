@@ -27,6 +27,10 @@ const CHAT_RUNTIME_ERROR_CODES = new Set<ChatRuntimeCommandErrorCode>([
   "modelMediaUnsupported",
   "inputNotPending",
   "invalidInputAnswer",
+  "modelUnavailable",
+  "effortUnavailable",
+  "inferenceChangeRejected",
+  "inferenceRollbackFailed",
 ]);
 
 export interface ConversationMessage {

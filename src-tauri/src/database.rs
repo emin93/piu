@@ -16,6 +16,48 @@ const CURRENT_SCHEMA: &str = r#"
         created_at_ms INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS runtime_model_selection (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        provider_id TEXT NOT NULL CHECK (length(provider_id) > 0),
+        model_id TEXT NOT NULL CHECK (length(model_id) > 0)
+    );
+
+    CREATE TABLE IF NOT EXISTS model_route_efforts (
+        provider_id TEXT NOT NULL CHECK (length(provider_id) > 0),
+        model_id TEXT NOT NULL CHECK (length(model_id) > 0),
+        effort TEXT NOT NULL CHECK (length(effort) > 0),
+        PRIMARY KEY (provider_id, model_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS global_resource_enable_overrides (
+        resource_kind TEXT NOT NULL CHECK (
+            resource_kind IN ('model_route', 'skill', 'extension', 'package')
+        ),
+        provider_id TEXT NOT NULL,
+        resource_id TEXT NOT NULL CHECK (length(resource_id) > 0),
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        PRIMARY KEY (resource_kind, provider_id, resource_id),
+        CHECK (
+            (resource_kind = 'model_route' AND length(provider_id) > 0)
+            OR (resource_kind != 'model_route' AND provider_id = '')
+        )
+    );
+
+    CREATE TABLE IF NOT EXISTS project_resource_enable_overrides (
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        resource_kind TEXT NOT NULL CHECK (
+            resource_kind IN ('model_route', 'skill', 'extension', 'package')
+        ),
+        provider_id TEXT NOT NULL,
+        resource_id TEXT NOT NULL CHECK (length(resource_id) > 0),
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        PRIMARY KEY (project_id, resource_kind, provider_id, resource_id),
+        CHECK (
+            (resource_kind = 'model_route' AND length(provider_id) > 0)
+            OR (resource_kind != 'model_route' AND provider_id = '')
+        )
+    );
+
     CREATE TABLE IF NOT EXISTS chat_drafts (
         project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
         prompt TEXT NOT NULL,
@@ -53,8 +95,18 @@ const CURRENT_SCHEMA: &str = r#"
         setup_attempt INTEGER NOT NULL,
         setup_log TEXT NOT NULL,
         initial_attachments_json TEXT NOT NULL,
+        initial_model_provider TEXT,
+        initial_model_id TEXT,
+        initial_reasoning_effort TEXT,
         pi_session_id TEXT UNIQUE,
         pi_session_path TEXT UNIQUE,
+        CHECK (
+            (initial_model_provider IS NULL AND initial_model_id IS NULL
+                AND initial_reasoning_effort IS NULL)
+            OR (initial_model_provider IS NOT NULL AND initial_model_id IS NOT NULL
+                AND length(initial_model_provider) > 0 AND length(initial_model_id) > 0
+                AND (initial_reasoning_effort IS NULL OR length(initial_reasoning_effort) > 0))
+        ),
         CHECK (
             (pi_session_id IS NULL AND pi_session_path IS NULL)
             OR (pi_session_id IS NOT NULL AND pi_session_path IS NOT NULL)
@@ -89,6 +141,16 @@ const CURRENT_SCHEMA: &str = r#"
         worktree_git_dir_path TEXT,
         worktree_git_dir_device TEXT,
         worktree_git_dir_inode TEXT,
+        initial_model_provider TEXT,
+        initial_model_id TEXT,
+        initial_reasoning_effort TEXT,
+        CHECK (
+            (initial_model_provider IS NULL AND initial_model_id IS NULL
+                AND initial_reasoning_effort IS NULL)
+            OR (initial_model_provider IS NOT NULL AND initial_model_id IS NOT NULL
+                AND length(initial_model_provider) > 0 AND length(initial_model_id) > 0
+                AND (initial_reasoning_effort IS NULL OR length(initial_reasoning_effort) > 0))
+        ),
         CHECK (
             (worktree_created = 0 AND worktree_git_dir_path IS NULL
                 AND worktree_git_dir_device IS NULL AND worktree_git_dir_inode IS NULL)

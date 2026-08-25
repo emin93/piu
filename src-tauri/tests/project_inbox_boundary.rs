@@ -2,15 +2,19 @@
 mod support;
 
 use std::{
+    collections::BTreeMap,
+    ffi::OsString,
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
 use piu_lib::{
+    agent_environment::{AgentEnvironment, AgentEnvironmentPolicy, AgentEnvironmentProcessSpec},
     application::ApplicationCore,
+    chat_runtime_host::{ModelRouteId, ReasoningEffort},
     git_process::GitProcess,
     host_boundary::{HostRoundTripRequest, HostRoundTripResponse},
     project_commands::{
@@ -23,6 +27,7 @@ use piu_lib::{
         DraftSummary, ProjectInbox, RepositoryIdentity, RepositoryInspectionError,
         RepositoryInspector,
     },
+    runtime_preferences::RuntimePreferences,
 };
 use support::TemporaryGitRemote;
 use tauri::{
@@ -31,6 +36,44 @@ use tauri::{
     test,
     webview::InvokeRequest,
 };
+
+fn fixture_agent_environment(
+    database_path: &Path,
+    inbox: Arc<ProjectInbox>,
+    fixture_root: &Path,
+) -> Arc<AgentEnvironment> {
+    let mut environment = BTreeMap::new();
+    environment.insert(OsString::from("HOME"), OsString::from("/Users/piu-test"));
+    environment.insert(OsString::from("PATH"), OsString::from("/usr/bin:/bin"));
+    environment.insert(
+        OsString::from("PIU_ENVIRONMENT_FIXTURE_MODE"),
+        OsString::from("snapshot"),
+    );
+    environment.insert(
+        OsString::from("PIU_ENVIRONMENT_FIXTURE_RECORD_DIR"),
+        fixture_root.join("environment-fixture").into_os_string(),
+    );
+    Arc::new(
+        AgentEnvironment::new(
+            inbox,
+            Arc::new(RuntimePreferences::open(database_path).unwrap()),
+            AgentEnvironmentProcessSpec {
+                executable: PathBuf::from("/bin/zsh"),
+                launcher: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/agent-environment-child.zsh"),
+                agent_directory: fixture_root.join("agent"),
+                credential_lock_directory: fixture_root.join("credential-locks"),
+                environment,
+            },
+            AgentEnvironmentPolicy {
+                inspection_timeout: Duration::from_secs(2),
+                maximum_stdout_bytes: 64 * 1024,
+                maximum_stderr_bytes: 16 * 1024,
+            },
+        )
+        .unwrap(),
+    )
+}
 
 #[test]
 fn opening_a_repository_crosses_the_typed_boundary_and_emits_one_coarse_change() {
@@ -45,8 +88,9 @@ fn opening_a_repository_crosses_the_typed_boundary_and_emits_one_coarse_change()
             .expect("git should create the fixture")
             .success()
     );
+    let database_path = fixture.path().join("piu.sqlite3");
     let core = ApplicationCore::open(
-        &fixture.path().join("piu.sqlite3"),
+        &database_path,
         GitProcess::with_executable("/usr/bin/git".into()),
     )
     .expect("application core should open");
@@ -242,8 +286,9 @@ fn first_send_crosses_the_typed_boundary_and_publishes_setup_and_terminal_action
     repository.git(["add", "README.md"]);
     repository.git(["commit", "-m", "fixture"]);
     repository.git(["push", "-u", "origin", "main"]);
+    let database_path = fixture.path().join("piu.sqlite3");
     let core = ApplicationCore::open(
-        &fixture.path().join("piu.sqlite3"),
+        &database_path,
         GitProcess::with_executable("/usr/bin/git".into()),
     )
     .unwrap();
@@ -253,7 +298,9 @@ fn first_send_crosses_the_typed_boundary_and_publishes_setup_and_terminal_action
         .unwrap()
         .project
         .id;
-    let app = piu_lib::configure_builder(test::mock_builder().manage(core))
+    let environment =
+        fixture_agent_environment(&database_path, core.project_inbox(), fixture.path());
+    let app = piu_lib::configure_builder(test::mock_builder().manage(core).manage(environment))
         .build(test::mock_context(test::noop_assets()))
         .unwrap();
     let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
@@ -296,6 +343,11 @@ fn first_send_crosses_the_typed_boundary_and_publishes_setup_and_terminal_action
                     project_id,
                     prompt: "Build the parser boundary".into(),
                     attachments: vec![],
+                    route: ModelRouteId {
+                        provider: "openai-codex".into(),
+                        model_id: "gpt-5.6-sol".into(),
+                    },
+                    effort: ReasoningEffort::High,
                 }
             })),
             headers: Default::default(),

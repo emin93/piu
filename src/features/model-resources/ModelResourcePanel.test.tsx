@@ -84,6 +84,15 @@ test("settings explains the pinned target, disk requirement, and manual download
   expect(assets.start).toHaveBeenCalledOnce();
 });
 
+test("embedded settings controls do not repeat their parent group heading", () => {
+  render(<ModelResourcePanel context="settings" embedded statusOverride={missing} />);
+
+  expect(screen.getByRole("region", { name: "Managed local model controls" })).toBeVisible();
+  expect(screen.queryByRole("heading", { name: "Local model" })).not.toBeInTheDocument();
+  expect(screen.queryByText("Models & resources")).not.toBeInTheDocument();
+  expect(screen.getByText("Qwen 3.8 27B · 4-bit")).toBeVisible();
+});
+
 test("authentication is graphical and the token disappears after Keychain handoff", async () => {
   assets.status.mockResolvedValue({
     ...missing,

@@ -6,7 +6,7 @@ use ts_rs::TS;
 use crate::{
     chat_runtime_host::{
         ChatRuntimeChangedEvent, ChatRuntimeHost, ChatRuntimeHostError, ConversationInputAnswer,
-        ConversationSnapshot,
+        ConversationSnapshot, ModelControlsSnapshot, ModelRouteId, ReasoningEffort,
     },
     chat_workspaces::ChatWorkspaceError,
     pi_rpc::PiRpcError,
@@ -21,6 +21,22 @@ pub const CHAT_RUNTIME_CHANGED_EVENT: &str = "chat-runtime://changed";
 #[ts(export, export_to = "../../src/generated/")]
 pub struct OpenChatRuntimeRequest {
     pub chat_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct SelectModelRouteRequest {
+    pub chat_id: String,
+    pub route: ModelRouteId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../src/generated/")]
+pub struct SelectReasoningEffortRequest {
+    pub chat_id: String,
+    pub effort: ReasoningEffort,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -74,6 +90,10 @@ pub enum ChatRuntimeCommandErrorCode {
     ModelMediaUnsupported,
     InputNotPending,
     InvalidInputAnswer,
+    ModelUnavailable,
+    EffortUnavailable,
+    InferenceChangeRejected,
+    InferenceRollbackFailed,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -102,6 +122,24 @@ impl From<ChatRuntimeHostError> for ChatRuntimeCommandError {
             ChatRuntimeHostError::InvalidInputAnswer => Self {
                 code: ChatRuntimeCommandErrorCode::InvalidInputAnswer,
                 message: "Choose one of the answers shown by Pi.".into(),
+            },
+            ChatRuntimeHostError::ModelUnavailable { .. } => Self {
+                code: ChatRuntimeCommandErrorCode::ModelUnavailable,
+                message: "That model is no longer available. Choose another model.".into(),
+            },
+            ChatRuntimeHostError::EffortUnavailable { .. } => Self {
+                code: ChatRuntimeCommandErrorCode::EffortUnavailable,
+                message: "That reasoning effort is unavailable for this model.".into(),
+            },
+            ChatRuntimeHostError::InferenceChangeRejected => Self {
+                code: ChatRuntimeCommandErrorCode::InferenceChangeRejected,
+                message: "Pi couldn’t switch models. The previous model is still selected.".into(),
+            },
+            ChatRuntimeHostError::InferenceRollbackFailed => Self {
+                code: ChatRuntimeCommandErrorCode::InferenceRollbackFailed,
+                message:
+                    "Pi couldn’t safely restore the previous model. Reopen the chat and try again."
+                        .into(),
             },
             ChatRuntimeHostError::SetupIncomplete { .. } => Self {
                 code: ChatRuntimeCommandErrorCode::SetupIncomplete,
@@ -141,6 +179,7 @@ impl From<ChatRuntimeHostError> for ChatRuntimeCommandError {
                 }
             }
             ChatRuntimeHostError::Rpc(_)
+            | ChatRuntimeHostError::Environment(_)
             | ChatRuntimeHostError::InvalidSessionState(_)
             | ChatRuntimeHostError::NonAbsolutePath
             | ChatRuntimeHostError::InvalidHome => Self {
@@ -150,6 +189,7 @@ impl From<ChatRuntimeHostError> for ChatRuntimeCommandError {
                         .into(),
             },
             ChatRuntimeHostError::RuntimeStorage(_)
+            | ChatRuntimeHostError::Preferences(_)
             | ChatRuntimeHostError::Inbox(_)
             | ChatRuntimeHostError::Workspace(_)
             | ChatRuntimeHostError::Lock => Self {
@@ -210,6 +250,18 @@ mod tests {
             assert_eq!(error.code, ChatRuntimeCommandErrorCode::ConversationFailed);
         }
     }
+
+    #[test]
+    fn failed_inference_rollback_has_distinct_recovery_copy() {
+        let error = ChatRuntimeCommandError::from(ChatRuntimeHostError::InferenceRollbackFailed);
+
+        assert_eq!(
+            error.code,
+            ChatRuntimeCommandErrorCode::InferenceRollbackFailed
+        );
+        assert!(error.message.contains("Reopen the chat"));
+        assert!(!error.message.contains("previous model is still selected"));
+    }
 }
 
 #[tauri::command]
@@ -218,6 +270,36 @@ pub async fn open_chat_runtime(
     request: OpenChatRuntimeRequest,
 ) -> Result<ConversationSnapshot, ChatRuntimeCommandError> {
     host.open(&request.chat_id).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn get_model_controls(
+    host: State<'_, ChatRuntimeHost>,
+    request: OpenChatRuntimeRequest,
+) -> Result<ModelControlsSnapshot, ChatRuntimeCommandError> {
+    host.model_controls(&request.chat_id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn select_model_route(
+    host: State<'_, ChatRuntimeHost>,
+    request: SelectModelRouteRequest,
+) -> Result<ModelControlsSnapshot, ChatRuntimeCommandError> {
+    host.select_model_route(&request.chat_id, request.route)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn select_reasoning_effort(
+    host: State<'_, ChatRuntimeHost>,
+    request: SelectReasoningEffortRequest,
+) -> Result<ModelControlsSnapshot, ChatRuntimeCommandError> {
+    host.select_reasoning_effort(&request.chat_id, request.effort)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]

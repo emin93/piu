@@ -13,6 +13,7 @@ function startChat({
   agentDirectory,
   credentialLockDirectory,
   cwd,
+  extensionPaths = [],
   home,
   modelId = "gpt-5.6-sol",
   modelProvider = "openai-codex",
@@ -38,6 +39,7 @@ function startChat({
     "--thinking-level",
     thinkingLevel,
   ];
+  for (const extensionPath of extensionPaths) arguments_.push("--extension", extensionPath);
   for (const skillPath of skillPaths) arguments_.push("--skill", skillPath);
   if (sessionPath) arguments_.push("--session-path", sessionPath);
   const child = spawn(nodeExecutable, arguments_, {
@@ -187,6 +189,7 @@ test("the real pinned Pi process exposes the rich event contract without externa
     thinkingLevel: "high",
   };
   const projectExtensionDirectory = join(paths.cwd, ".pi", "extensions");
+  paths.extensionPaths = [join(projectExtensionDirectory, "piu-event-contract.js")];
   let chat;
 
   try {
@@ -210,10 +213,14 @@ test("the real pinned Pi process exposes the rich event contract without externa
 export default function (pi) {
   const provider = fauxProvider({
     provider: "piu-contract",
-    models: [{ id: "event-matrix", name: "Più event matrix", reasoning: true }],
+    models: [
+      { id: "event-matrix", name: "Più event matrix", reasoning: true },
+      { id: "plain", name: "Più plain model", reasoning: false },
+    ],
     tokenSize: { min: 100, max: 100 },
     tokensPerSecond: 5000,
   });
+  provider.models[0].thinkingLevelMap = { xhigh: "xhigh", max: "max" };
   provider.setResponses([
     fauxAssistantMessage([
       fauxThinking("contract reasoning"),
@@ -269,6 +276,33 @@ export default function (pi) {
     const state = (await chat.request({ type: "get_state" })).data;
     assert.equal(state.model.provider, "piu-contract");
     assert.equal(state.model.id, "event-matrix");
+    assert.deepEqual((await chat.request({ type: "get_available_thinking_levels" })).data.levels, [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    await chat.request({ type: "set_thinking_level", level: "max" });
+    assert.equal((await chat.request({ type: "get_state" })).data.thinkingLevel, "max");
+    const availableModels = (await chat.request({ type: "get_available_models" })).data.models;
+    assert.equal(
+      availableModels.some(({ provider, id }) => provider === "piu-contract" && id === "plain"),
+      true,
+    );
+    await chat.request({ type: "set_model", provider: "piu-contract", modelId: "plain" });
+    assert.deepEqual((await chat.request({ type: "get_available_thinking_levels" })).data.levels, [
+      "off",
+    ]);
+    assert.equal((await chat.request({ type: "get_state" })).data.thinkingLevel, "off");
+    await chat.request({
+      type: "set_model",
+      provider: "piu-contract",
+      modelId: "event-matrix",
+    });
+    await chat.request({ type: "set_thinking_level", level: "high" });
     const commands = (await chat.request({ type: "get_commands" })).data.commands;
     assert.equal(
       commands.some((command) => command.name === "piu-contract-input"),
@@ -402,6 +436,82 @@ export default function (pi) {
   }
 });
 
+test("chat startup skips missing packages without mutating package state", async () => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "piu-package-startup-contract-"));
+  const paths = {
+    agentDirectory: join(fixtureRoot, "app", "agent"),
+    credentialLockDirectory: join(fixtureRoot, "app", "credential-locks"),
+    cwd: join(fixtureRoot, "worktree"),
+    extensionPaths: [],
+    home: join(fixtureRoot, "home"),
+    modelId: "present-model",
+    modelProvider: "piu-present-package",
+    sessionDirectory: join(fixtureRoot, "app", "sessions"),
+    skillPaths: [],
+    thinkingLevel: "off",
+  };
+  const presentPackage = join(paths.agentDirectory, "packages", "present");
+  const presentExtension = join(presentPackage, "extensions", "provider.js");
+  const npmInvocationMarker = join(fixtureRoot, "npm-was-invoked");
+  const npmSentinel = join(fixtureRoot, "npm-sentinel.mjs");
+  const settingsPath = join(paths.agentDirectory, "settings.json");
+  paths.extensionPaths = [presentExtension];
+  let chat;
+
+  try {
+    await Promise.all([
+      mkdir(paths.agentDirectory, { recursive: true }),
+      mkdir(paths.credentialLockDirectory, { recursive: true }),
+      mkdir(paths.cwd, { recursive: true }),
+      mkdir(paths.home, { recursive: true }),
+      mkdir(paths.sessionDirectory, { recursive: true }),
+      mkdir(join(presentPackage, "extensions"), { recursive: true }),
+    ]);
+    const settings = JSON.stringify(
+      {
+        npmCommand: [nodeExecutable, npmSentinel],
+        packages: [presentPackage, "npm:@piu-contract/missing-package@0.0.0"],
+      },
+      null,
+      2,
+    );
+    await Promise.all([
+      writeFile(
+        presentExtension,
+        `import { fauxProvider } from "@earendil-works/pi-ai";
+
+export default function (pi) {
+  pi.registerProvider(fauxProvider({
+    provider: "piu-present-package",
+    models: [{ id: "present-model", name: "Present package model", reasoning: false }],
+  }).provider);
+}
+`,
+      ),
+      writeFile(
+        npmSentinel,
+        `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(npmInvocationMarker)}, "invoked");
+process.exitCode = 77;
+`,
+      ),
+      writeFile(settingsPath, settings),
+    ]);
+
+    chat = startChat(paths);
+    const state = (await chat.request({ type: "get_state" })).data;
+
+    assert.equal(state.model.provider, "piu-present-package");
+    assert.equal(state.model.id, "present-model");
+    assert.equal(await readFile(settingsPath, "utf8"), settings);
+    await assert.rejects(access(npmInvocationMarker), { code: "ENOENT" });
+    await assert.rejects(access(join(paths.agentDirectory, "npm")), { code: "ENOENT" });
+  } finally {
+    if (chat) await chat.stop().catch(() => {});
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("the pinned launcher creates and resumes one exact isolated Pi session", async () => {
   await access(nodeExecutable);
   await access(launcher);
@@ -419,6 +529,7 @@ test("the pinned launcher creates and resumes one exact isolated Pi session", as
   const piHomeSkill = join(paths.home, ".pi", "agent", "skills", "piu-home-pi");
   const piHomeExtensionDirectory = join(paths.home, ".pi", "agent", "extensions");
   const projectExtensionDirectory = join(paths.cwd, ".pi", "extensions");
+  paths.extensionPaths = [join(projectExtensionDirectory, "piu-contract.js")];
   const projectContextMarker = "PIU_TRUSTED_PROJECT_CONTEXT_9ad61f";
   let chat;
 
@@ -548,7 +659,11 @@ test("the pinned launcher creates and resumes one exact isolated Pi session", as
     assert.equal(resumed.messageCount, beforeResume.messageCount);
     assert.equal(resumed.pendingMessageCount, 0);
     const resumedMessages = (await chat.request({ type: "get_messages" })).data.messages;
-    assert.deepEqual(resumedMessages, messages);
+    const withoutTimestamp = ({ timestamp, ...message }) => {
+      assert.equal(typeof timestamp, "number");
+      return message;
+    };
+    assert.deepEqual(resumedMessages.map(withoutTimestamp), messages.map(withoutTimestamp));
     await chat.stop();
     chat = undefined;
   } finally {
