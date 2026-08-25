@@ -1,3 +1,5 @@
+pub mod agent_environment;
+pub mod agent_environment_commands;
 pub mod application;
 pub mod attachment_commands;
 pub mod chat_runtime_commands;
@@ -39,6 +41,11 @@ pub fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri
             model_asset_boundary::remove_model_assets,
             model_asset_boundary::retry_model_asset_recovery,
             attachment_commands::prepare_prompt_attachments,
+            agent_environment_commands::get_project_agent_environment,
+            agent_environment_commands::get_project_model_controls,
+            agent_environment_commands::select_project_model_route,
+            agent_environment_commands::select_project_reasoning_effort,
+            agent_environment_commands::set_agent_resource_enabled,
             project_commands::load_project_inbox,
             project_commands::open_repository,
             project_commands::save_project_draft,
@@ -88,7 +95,15 @@ pub fn run() {
                 .map(PathBuf::from)
                 .ok_or("Più requires the user's HOME directory")?;
             let git = git_process::GitProcess::from_bundled_runtime(&resource_dir.join("git"));
-            let core = application::ApplicationCore::deferred(app_data.join("piu.sqlite3"), git);
+            let database_path = app_data.join("piu.sqlite3");
+            let core = application::ApplicationCore::deferred(database_path.clone(), git);
+            let agent_environment = agent_environment::AgentEnvironment::production(
+                core.project_inbox(),
+                &database_path,
+                &app_data,
+                &resource_dir,
+                &real_home,
+            )?;
             let chat_runtime = chat_runtime_host::ChatRuntimeHost::production(
                 core.project_inbox(),
                 core.chat_workspaces(),
@@ -97,6 +112,7 @@ pub fn run() {
             )?;
             chat_runtime_commands::forward_chat_runtime_events(app.handle().clone(), &chat_runtime);
             app.manage(core);
+            app.manage(agent_environment);
             app.manage(chat_runtime);
             let model_assets =
                 model_assets::ModelAssetManager::production_or_unavailable(&app_data);

@@ -52,6 +52,41 @@ fn route_and_effective_effort_are_persisted_as_one_selection() {
 }
 
 #[test]
+fn disabling_a_selected_model_and_choosing_its_fallback_share_one_transaction() {
+    let app_data = TempDir::new().expect("temporary application data");
+    let database_path = app_data.path().join("piu.sqlite3");
+    let preferences = RuntimePreferences::open(&database_path).unwrap();
+    let selected = ModelRoute::new("openai-codex", "gpt-5.6-sol").unwrap();
+    let fallback = ModelRoute::new("local", "qwen").unwrap();
+    preferences
+        .select_route_with_effort(&selected, "high")
+        .unwrap();
+
+    preferences
+        .set_model_route_enabled(
+            ResourceScope::Global,
+            &selected,
+            false,
+            Some(&fallback.selection(Some("low"))),
+        )
+        .unwrap();
+
+    assert_eq!(
+        preferences
+            .resource_enabled(
+                ResourceScope::Global,
+                &RuntimeResource::model_route(selected)
+            )
+            .unwrap(),
+        Some(false)
+    );
+    assert_eq!(
+        preferences.current_selection().unwrap(),
+        Some(fallback.selection(Some("low")))
+    );
+}
+
+#[test]
 fn resource_overrides_are_isolated_by_kind_source_and_scope() {
     let app_data = TempDir::new().expect("temporary application data");
     let database_path = app_data.path().join("piu.sqlite3");

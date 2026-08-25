@@ -294,6 +294,85 @@ impl RuntimePreferences {
         })
     }
 
+    pub fn set_model_route_enabled(
+        &self,
+        scope: ResourceScope,
+        route: &ModelRoute,
+        enabled: bool,
+        fallback: Option<&ModelSelection>,
+    ) -> Result<(), RuntimePreferencesError> {
+        route.validate()?;
+        let fallback = fallback
+            .map(|selection| {
+                selection.route.validate()?;
+                let effort = selection
+                    .effort
+                    .as_deref()
+                    .filter(|effort| !effort.is_empty())
+                    .ok_or(RuntimePreferencesError::InvalidEffort)?;
+                Ok::<(&ModelRoute, &str), RuntimePreferencesError>((&selection.route, effort))
+            })
+            .transpose()?;
+        let resource = RuntimeResource::model_route(route.clone());
+        let (kind, provider_id, resource_id) = resource.storage_identity()?;
+        let mut database = self
+            .database
+            .lock()
+            .map_err(|_| RuntimePreferencesError::LockPoisoned)?;
+        let transaction = database
+            .connection_mut()
+            .transaction()
+            .map_err(DatabaseError::Query)?;
+        match scope {
+            ResourceScope::Global => transaction.execute(
+                "INSERT INTO global_resource_enable_overrides (
+                   resource_kind, provider_id, resource_id, enabled
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(resource_kind, provider_id, resource_id)
+                 DO UPDATE SET enabled = excluded.enabled",
+                params![kind, provider_id, resource_id, enabled],
+            ),
+            ResourceScope::Project(project_id) => {
+                validate_project_id(project_id)?;
+                transaction.execute(
+                    "INSERT INTO project_resource_enable_overrides (
+                       project_id, resource_kind, provider_id, resource_id, enabled
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(project_id, resource_kind, provider_id, resource_id)
+                     DO UPDATE SET enabled = excluded.enabled",
+                    params![project_id, kind, provider_id, resource_id, enabled],
+                )
+            }
+        }
+        .map_err(DatabaseError::Query)?;
+        if let Some((fallback_route, effort)) = fallback {
+            transaction
+                .execute(
+                    "INSERT INTO model_route_efforts (provider_id, model_id, effort)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(provider_id, model_id) DO UPDATE SET effort = excluded.effort",
+                    params![
+                        fallback_route.provider_id(),
+                        fallback_route.model_id(),
+                        effort
+                    ],
+                )
+                .map_err(DatabaseError::Query)?;
+            transaction
+                .execute(
+                    "INSERT INTO runtime_model_selection (singleton, provider_id, model_id)
+                     VALUES (1, ?1, ?2)
+                     ON CONFLICT(singleton) DO UPDATE SET
+                        provider_id = excluded.provider_id,
+                        model_id = excluded.model_id",
+                    params![fallback_route.provider_id(), fallback_route.model_id()],
+                )
+                .map_err(DatabaseError::Query)?;
+        }
+        transaction.commit().map_err(DatabaseError::Query)?;
+        Ok(())
+    }
+
     pub fn resource_enabled(
         &self,
         scope: ResourceScope,
