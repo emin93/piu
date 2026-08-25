@@ -66,13 +66,14 @@ const paths = {
   cwd: "/private/tmp/piu/worktrees/chat-1",
   agentDirectory: "/Users/test/Library/Application Support/ch.emin.piu/agent",
   sessionDirectory: "/Users/test/Library/Application Support/ch.emin.piu/sessions",
+  extensionPaths: ["/private/tmp/piu/worktrees/chat-1/.pi/extensions/review.mjs"],
   skillPaths: [
     "/Applications/Più.app/Contents/Resources/agent-runtime/skills",
     "/private/tmp/piu/worktrees/chat-1/.pi/skills",
   ],
 };
 
-test("a new chat uses the exact app directories and explicit skill paths", async () => {
+test("a new chat uses the exact app directories and explicit resource paths", async () => {
   const { calls, model, pi } = createPiContract();
   const credentials = { read: async () => undefined };
   const createNewSessionManager = async ({ cwd, sessionDirectory, SessionManager }) => {
@@ -107,7 +108,9 @@ test("a new chat uses the exact app directories and explicit skill paths", async
   assert.equal(serviceOptions.cwd, paths.cwd);
   assert.equal(serviceOptions.agentDir, paths.agentDirectory);
   assert.deepEqual(serviceOptions.resourceLoaderOptions, {
+    additionalExtensionPaths: paths.extensionPaths,
     additionalSkillPaths: paths.skillPaths,
+    noExtensions: true,
     noSkills: true,
   });
   assert.deepEqual(serviceOptions.settingsManager.options, { projectTrusted: true });

@@ -30,6 +30,8 @@ test("parses the fixed internal chat launcher contract", () => {
       "/Applications/Più.app/Contents/Resources/skills",
       "--skill",
       "/private/tmp/chat/.pi/skills",
+      "--extension",
+      "/private/tmp/chat/.pi/extensions/review.mjs",
     ]),
     {
       cwd: "/private/tmp/chat",
@@ -40,6 +42,7 @@ test("parses the fixed internal chat launcher contract", () => {
       modelProvider: "openai-codex",
       modelId: "gpt-5.6-sol",
       thinkingLevel: "xhigh",
+      extensionPaths: ["/private/tmp/chat/.pi/extensions/review.mjs"],
       skillPaths: [
         "/Applications/Più.app/Contents/Resources/skills",
         "/private/tmp/chat/.pi/skills",

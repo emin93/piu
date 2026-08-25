@@ -28,7 +28,7 @@ function takeValue(arguments_, index, flag) {
 }
 
 export function parseChatLauncherArguments(arguments_) {
-  const result = { skillPaths: [] };
+  const result = { extensionPaths: [], skillPaths: [] };
   const seen = new Set();
 
   for (let index = 0; index < arguments_.length; index += 2) {
@@ -37,6 +37,10 @@ export function parseChatLauncherArguments(arguments_) {
 
     if (flag === "--skill") {
       result.skillPaths.push(value);
+      continue;
+    }
+    if (flag === "--extension") {
+      result.extensionPaths.push(value);
       continue;
     }
 

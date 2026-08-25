@@ -13,6 +13,7 @@ function startChat({
   agentDirectory,
   credentialLockDirectory,
   cwd,
+  extensionPaths = [],
   home,
   modelId = "gpt-5.6-sol",
   modelProvider = "openai-codex",
@@ -38,6 +39,7 @@ function startChat({
     "--thinking-level",
     thinkingLevel,
   ];
+  for (const extensionPath of extensionPaths) arguments_.push("--extension", extensionPath);
   for (const skillPath of skillPaths) arguments_.push("--skill", skillPath);
   if (sessionPath) arguments_.push("--session-path", sessionPath);
   const child = spawn(nodeExecutable, arguments_, {
@@ -187,6 +189,7 @@ test("the real pinned Pi process exposes the rich event contract without externa
     thinkingLevel: "high",
   };
   const projectExtensionDirectory = join(paths.cwd, ".pi", "extensions");
+  paths.extensionPaths = [join(projectExtensionDirectory, "piu-event-contract.js")];
   let chat;
 
   try {
@@ -448,6 +451,7 @@ test("the pinned launcher creates and resumes one exact isolated Pi session", as
   const piHomeSkill = join(paths.home, ".pi", "agent", "skills", "piu-home-pi");
   const piHomeExtensionDirectory = join(paths.home, ".pi", "agent", "extensions");
   const projectExtensionDirectory = join(paths.cwd, ".pi", "extensions");
+  paths.extensionPaths = [join(projectExtensionDirectory, "piu-contract.js")];
   const projectContextMarker = "PIU_TRUSTED_PROJECT_CONTEXT_9ad61f";
   let chat;
 

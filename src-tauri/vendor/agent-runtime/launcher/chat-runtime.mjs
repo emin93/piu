@@ -13,6 +13,10 @@ function validate(config) {
   requireAbsolute("agent directory", config.agentDirectory);
   requireAbsolute("session directory", config.sessionDirectory);
   if (config.sessionPath !== undefined) requireAbsolute("session path", config.sessionPath);
+  if (!Array.isArray(config.extensionPaths)) throw new Error("extension paths must be an array");
+  for (const extensionPath of config.extensionPaths) {
+    requireAbsolute("extension path", extensionPath);
+  }
   if (!Array.isArray(config.skillPaths)) throw new Error("skill paths must be an array");
   for (const skillPath of config.skillPaths) requireAbsolute("skill path", skillPath);
   if (!config.modelProvider || !config.modelId) throw new Error("model route is required");
@@ -72,7 +76,9 @@ export async function createPiuChatRuntime(
       settingsManager,
       modelRuntime,
       resourceLoaderOptions: {
+        additionalExtensionPaths: config.extensionPaths,
         additionalSkillPaths: config.skillPaths,
+        noExtensions: true,
         noSkills: true,
       },
     });
