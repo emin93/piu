@@ -28,6 +28,8 @@ const arguments_ = [
   "/private/tmp/app/agent",
   "--credential-lock-dir",
   "/private/tmp/app/locks",
+  "--resource-preferences",
+  '{"global":[],"project":[]}',
 ];
 
 test("wires the public SDK stores and emits exactly one bounded JSON snapshot", async () => {
@@ -48,6 +50,7 @@ test("wires the public SDK stores and emits exactly one bounded JSON snapshot", 
     cwd: "/private/tmp/project",
     agentDirectory: "/private/tmp/app/agent",
     credentialLockDirectory: "/private/tmp/app/locks",
+    resourcePreferences: { global: [], project: [] },
   });
   assert.equal(inspected.sdk.modelsStore.constructor.name, "InMemoryModelsStore");
   assert.deepEqual(inspected.sdk.getSupportedThinkingLevels(), ["off", "high"]);

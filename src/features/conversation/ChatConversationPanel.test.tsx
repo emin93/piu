@@ -436,6 +436,78 @@ test("an active chat switches inference without disturbing its streaming transcr
   expect(screen.queryByText("Switches after the current step")).not.toBeInTheDocument();
 });
 
+test("transcript streaming does not render the route and effort controls again", async () => {
+  let receive: ((event: ConversationEvent) => void) | undefined;
+  let effortReads = 0;
+  let routeReads = 0;
+  const trackedModelControls = Object.defineProperties(
+    { ...modelControls },
+    {
+      efforts: {
+        enumerable: true,
+        get() {
+          effortReads += 1;
+          return modelControls.efforts;
+        },
+      },
+      routes: {
+        enumerable: true,
+        get() {
+          routeReads += 1;
+          return modelControls.routes;
+        },
+      },
+    },
+  );
+  const adapter: ConversationAdapter = {
+    answerInput: vi.fn().mockResolvedValue(undefined),
+    connect: vi.fn<ConversationAdapter["connect"]>((_chatId, onEvent) => {
+      receive = onEvent;
+      return Promise.resolve({
+        disconnect: vi.fn(),
+        snapshot: {
+          failure: null,
+          inputRequest: null,
+          items: [
+            {
+              id: "stream-with-controls",
+              kind: "message",
+              queued: false,
+              role: "assistant",
+              text: "Checking",
+            },
+          ],
+          phase: "running",
+        },
+      });
+    }),
+    prompt: vi.fn().mockResolvedValue(undefined),
+    stop: vi.fn().mockResolvedValue(undefined),
+  };
+
+  render(
+    <ChatConversationPanel
+      adapter={adapter}
+      chatId="streaming-controls-chat"
+      modelControlsAdapter={modelAdapter({
+        get: vi.fn().mockResolvedValue(trackedModelControls),
+      })}
+      onRequestCodexSignIn={vi.fn()}
+    />,
+  );
+
+  expect(await screen.findByRole("button", { name: "Model: Qwen 3.8 27B" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Reasoning effort: Medium" })).toBeVisible();
+  const readsBeforeStreaming = { effortReads, routeReads };
+
+  act(() => {
+    receive?.({ delta: " the bundle", itemId: "stream-with-controls", type: "text-delta" });
+  });
+
+  expect(screen.getByText("Checking the bundle")).toBeVisible();
+  expect({ effortReads, routeReads }).toEqual(readsBeforeStreaming);
+});
+
 test("a failed route change retains the working route and offers retry", async () => {
   const user = userEvent.setup();
   const selectRoute = vi

@@ -30,6 +30,7 @@ use crate::{
         ProjectInboxError, ProjectLocation,
     },
     prompt_attachments::{PromptAttachment, validate as validate_attachments},
+    runtime_preferences::ModelSelection,
 };
 
 const SETUP_SCRIPT: &str = ".piu/setup.sh";
@@ -186,6 +187,7 @@ impl ChatWorkspaces {
         project_id: i64,
         prompt: &str,
         attachments: &[PromptAttachment],
+        initial_model_selection: ModelSelection,
     ) -> Result<CreatedChat, ChatWorkspaceError> {
         let prompt = prompt.trim();
         if prompt.is_empty() && attachments.is_empty() {
@@ -235,12 +237,12 @@ impl ChatWorkspaces {
             branch_name,
             base_commit,
             created_at_ms,
-            initial_model_selection: None,
+            initial_model_selection: Some(initial_model_selection),
             worktree_created: false,
             branch_attached: false,
         };
 
-        if let Err(error) = self.inbox.reserve_chat_creation(&mut reservation) {
+        if let Err(error) = self.inbox.reserve_chat_creation(&reservation) {
             let _ = fs::remove_dir(&reservation.worktree_path);
             return Err(error.into());
         }
@@ -1071,6 +1073,12 @@ mod tests {
         runtime_preferences::{ModelRoute, RuntimePreferences},
     };
 
+    fn test_model_selection() -> ModelSelection {
+        ModelRoute::new("openai-codex", "gpt-5.6-sol")
+            .unwrap()
+            .selection(Some("xhigh"))
+    }
+
     struct RemoteFixture {
         _root: TempDir,
         working: PathBuf,
@@ -1204,8 +1212,12 @@ mod tests {
         }
 
         fn create(&self, prompt: &str) -> CreatedChat {
+            self.create_with_selection(prompt, test_model_selection())
+        }
+
+        fn create_with_selection(&self, prompt: &str, selection: ModelSelection) -> CreatedChat {
             self.manager
-                .create_chat(self.project_id, prompt, &[])
+                .create_chat(self.project_id, prompt, &[], selection)
                 .expect("chat should be created")
         }
 
@@ -1323,7 +1335,10 @@ mod tests {
         preferences.remember_effort(&original, "high").unwrap();
         preferences.select_route(&original).unwrap();
 
-        let created = fixture.create("Preserve the initial inference route");
+        let created = fixture.create_with_selection(
+            "Preserve the initial inference route",
+            original.selection(Some("high")),
+        );
         let replacement = ModelRoute::new("anthropic", "claude-sonnet-4-6").unwrap();
         preferences.select_route(&replacement).unwrap();
 
@@ -1400,7 +1415,12 @@ mod tests {
 
         let created = fixture
             .manager
-            .create_chat(fixture.project_id, "", &[attachment])
+            .create_chat(
+                fixture.project_id,
+                "",
+                &[attachment],
+                test_model_selection(),
+            )
             .unwrap();
 
         assert_eq!(created.chat.title, "Review checkout-wireframe.png");
@@ -1435,7 +1455,12 @@ mod tests {
 
         let error = fixture
             .manager
-            .create_chat(fixture.project_id, "Do not use cached state", &[])
+            .create_chat(
+                fixture.project_id,
+                "Do not use cached state",
+                &[],
+                test_model_selection(),
+            )
             .expect_err("fresh fetch should be mandatory");
 
         assert!(matches!(error, ChatWorkspaceError::FreshMain(_)));
@@ -1459,6 +1484,7 @@ mod tests {
                 fixture.project_id,
                 "Never mutate a replacement repository",
                 &[],
+                test_model_selection(),
             )
             .expect_err("the stored repository identity must be revalidated");
 
@@ -1475,12 +1501,24 @@ mod tests {
         let fixture = WorkspaceFixture::new(RemoteFixture::new());
         let manager = Arc::clone(&fixture.manager);
         let first_project = fixture.project_id;
-        let first =
-            thread::spawn(move || manager.create_chat(first_project, "First parser fix", &[]));
+        let first = thread::spawn(move || {
+            manager.create_chat(
+                first_project,
+                "First parser fix",
+                &[],
+                test_model_selection(),
+            )
+        });
         let manager = Arc::clone(&fixture.manager);
         let second_project = fixture.project_id;
-        let second =
-            thread::spawn(move || manager.create_chat(second_project, "Second parser fix", &[]));
+        let second = thread::spawn(move || {
+            manager.create_chat(
+                second_project,
+                "Second parser fix",
+                &[],
+                test_model_selection(),
+            )
+        });
         let first = first.join().unwrap().unwrap().chat;
         let second = second.join().unwrap().unwrap().chat;
 
@@ -1522,7 +1560,7 @@ mod tests {
             Arc::new(FailAt { checkpoint }),
         );
         crashing
-            .create_chat(fixture.project_id, prompt, &[])
+            .create_chat(fixture.project_id, prompt, &[], test_model_selection())
             .expect_err("checkpoint should simulate a crash");
         fixture.inbox.pending_chat_creations().unwrap().remove(0)
     }
@@ -1542,7 +1580,12 @@ mod tests {
                 Arc::new(FailAt { checkpoint }),
             );
             crashing
-                .create_chat(fixture.project_id, "Recover owned state", &[])
+                .create_chat(
+                    fixture.project_id,
+                    "Recover owned state",
+                    &[],
+                    test_model_selection(),
+                )
                 .expect_err("checkpoint should simulate a crash");
             let reservation = fixture.inbox.pending_chat_creations().unwrap().remove(0);
 
@@ -1820,7 +1863,12 @@ mod tests {
             }),
         );
         crashing
-            .create_chat(fixture.project_id, "Keep committed chat", &[])
+            .create_chat(
+                fixture.project_id,
+                "Keep committed chat",
+                &[],
+                test_model_selection(),
+            )
             .expect_err("checkpoint should simulate a crash");
 
         let relaunched = ChatWorkspaces::new(
@@ -1854,7 +1902,12 @@ mod tests {
             }),
         );
         crashing
-            .create_chat(fixture.project_id, "Protect user branch", &[])
+            .create_chat(
+                fixture.project_id,
+                "Protect user branch",
+                &[],
+                test_model_selection(),
+            )
             .expect_err("checkpoint should leave a reservation");
         let reservation = fixture.inbox.pending_chat_creations().unwrap().remove(0);
         fixture
@@ -1887,7 +1940,12 @@ mod tests {
             }),
         );
         crashing
-            .create_chat(fixture.project_id, "Keep replacement data", &[])
+            .create_chat(
+                fixture.project_id,
+                "Keep replacement data",
+                &[],
+                test_model_selection(),
+            )
             .expect_err("checkpoint should leave a worktree");
         let reservation = fixture.inbox.pending_chat_creations().unwrap().remove(0);
         let moved_owned_worktree = fixture.worktrees.join("interrupted-owned-worktree");
@@ -1924,7 +1982,12 @@ mod tests {
             }),
         );
         crashing
-            .create_chat(fixture.project_id, "Protect untracked recovery data", &[])
+            .create_chat(
+                fixture.project_id,
+                "Protect untracked recovery data",
+                &[],
+                test_model_selection(),
+            )
             .expect_err("checkpoint should leave an owned worktree");
         let reservation = fixture.inbox.pending_chat_creations().unwrap().remove(0);
         fs::write(
@@ -1958,7 +2021,12 @@ mod tests {
             }),
         );
         crashing
-            .create_chat(fixture.project_id, "Protect tracked recovery changes", &[])
+            .create_chat(
+                fixture.project_id,
+                "Protect tracked recovery changes",
+                &[],
+                test_model_selection(),
+            )
             .expect_err("checkpoint should leave an owned worktree");
         let reservation = fixture.inbox.pending_chat_creations().unwrap().remove(0);
         fs::write(
@@ -1992,7 +2060,12 @@ mod tests {
             }),
         );
         crashing
-            .create_chat(fixture.project_id, "Protect exact worktree ownership", &[])
+            .create_chat(
+                fixture.project_id,
+                "Protect exact worktree ownership",
+                &[],
+                test_model_selection(),
+            )
             .expect_err("checkpoint should leave an owned worktree");
         let reservation = fixture.inbox.pending_chat_creations().unwrap().remove(0);
         let replacement = fixture.worktrees.join("same-repository-replacement");

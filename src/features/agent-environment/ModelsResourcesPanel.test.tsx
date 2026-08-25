@@ -36,6 +36,7 @@ const snapshot: AgentEnvironmentSnapshot = {
       acceptsImages: true,
       thinkingLevels: ["low", "high", "max"],
       enabled: true,
+      source: "piu",
     },
     {
       id: { provider: "local", modelId: "qwen" },
@@ -43,6 +44,7 @@ const snapshot: AgentEnvironmentSnapshot = {
       acceptsImages: false,
       thinkingLevels: ["low", "medium", "xhigh"],
       enabled: false,
+      source: "project",
     },
   ],
   resources: {
@@ -149,6 +151,12 @@ test("groups the complete inventory with accessible scoped switches", async () =
     false,
     "project",
   );
+  await user.click(screen.getByRole("switch", { name: "Qwen 3.8 27B" }));
+  expect(onResourceEnabledChange).toHaveBeenLastCalledWith(
+    { kind: "modelRoute", route: { provider: "local", modelId: "qwen" } },
+    true,
+    "project",
+  );
 });
 
 test("shows exceptional load state without exposing runtime paths", () => {
@@ -170,13 +178,14 @@ test("shows exceptional load state without exposing runtime paths", () => {
   ).not.toBeInTheDocument();
 });
 
-test("disables only the pending resource and exposes recovery and deferred status", async () => {
+test("disables the complete inventory during a resource change", async () => {
+  const onResourceEnabledChange = vi.fn();
   const onRetry = vi.fn();
   const user = userEvent.setup();
   render(
     <ModelsResourcesPanel
       error="Più couldn’t refresh these resources."
-      onResourceEnabledChange={vi.fn()}
+      onResourceEnabledChange={onResourceEnabledChange}
       onRetry={onRetry}
       pendingResourceId={{ kind: "skill", id: "project://skills/check" }}
       snapshot={snapshot}
@@ -189,10 +198,14 @@ test("disables only the pending resource and exposes recovery and deferred statu
     "Active chats will use this change after the current step.",
   );
   expect(screen.getByRole("switch", { name: "Check" })).toHaveAttribute("aria-disabled", "true");
-  expect(screen.getByRole("switch", { name: "Review tools" })).not.toHaveAttribute(
+  expect(screen.getByRole("switch", { name: "Check" })).toHaveAttribute("aria-busy", "true");
+  expect(screen.getByRole("switch", { name: "Review tools" })).toHaveAttribute(
     "aria-disabled",
     "true",
   );
+  expect(screen.getByRole("switch", { name: "Review tools" })).not.toHaveAttribute("aria-busy");
+  await user.click(screen.getByRole("switch", { name: "Review tools" }));
+  expect(onResourceEnabledChange).not.toHaveBeenCalled();
   await user.click(screen.getByRole("button", { name: "Retry" }));
   expect(onRetry).toHaveBeenCalledOnce();
 });

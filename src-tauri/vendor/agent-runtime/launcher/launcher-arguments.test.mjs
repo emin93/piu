@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  MAX_ENVIRONMENT_PREFERENCES_BYTES,
   parseAuthLauncherArguments,
   parseChatLauncherArguments,
   parseEnvironmentLauncherArguments,
@@ -91,11 +92,17 @@ test("parses the fixed one-shot environment launcher contract", () => {
       "/private/tmp/app/agent",
       "--credential-lock-dir",
       "/private/tmp/app/credential-locks",
+      "--resource-preferences",
+      '{"global":[{"kind":"package","id":"npm:@piu/models@1","enabled":false}],"project":[]}',
     ]),
     {
       cwd: "/private/tmp/project",
       agentDirectory: "/private/tmp/app/agent",
       credentialLockDirectory: "/private/tmp/app/credential-locks",
+      resourcePreferences: {
+        global: [{ kind: "package", id: "npm:@piu/models@1", enabled: false }],
+        project: [],
+      },
     },
   );
 });
@@ -117,4 +124,32 @@ test("environment arguments reject omitted duplicate and unrelated flags", () =>
     /duplicate flag/,
   );
   assert.throws(() => parseEnvironmentLauncherArguments(["--session-dir", "/tmp"]), /unknown flag/);
+  assert.throws(
+    () =>
+      parseEnvironmentLauncherArguments([
+        "--cwd",
+        "/one",
+        "--agent-dir",
+        "/agent",
+        "--credential-lock-dir",
+        "/locks",
+        "--resource-preferences",
+        '{"global":[],"project":[{"kind":"extension","id":"x","enabled":"no"}]}',
+      ]),
+    /invalid shape/,
+  );
+  assert.throws(
+    () =>
+      parseEnvironmentLauncherArguments([
+        "--cwd",
+        "/one",
+        "--agent-dir",
+        "/agent",
+        "--credential-lock-dir",
+        "/locks",
+        "--resource-preferences",
+        "x".repeat(MAX_ENVIRONMENT_PREFERENCES_BYTES + 1),
+      ]),
+    /exceed the input limit/,
+  );
 });

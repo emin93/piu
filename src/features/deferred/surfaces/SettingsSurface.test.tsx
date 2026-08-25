@@ -41,6 +41,7 @@ function environment(enabled: boolean): AgentEnvironmentSnapshot {
         enabled: true,
         id: { modelId: "qwen", provider: "local" },
         name: "Qwen 3.8 27B",
+        source: "project",
         thinkingLevels: ["low", "medium", "xhigh"],
       },
     ],
@@ -66,6 +67,7 @@ test("loads the selected project and applies resource changes with safe-step fee
     setEnabled: vi.fn().mockResolvedValue({
       deferredChatCount: 1,
       enabled: false,
+      restartFailedChatCount: 0,
       resource: { kind: "skill", id: "project://skills/review" },
       scope: "project",
       status: "deferred",
@@ -76,7 +78,7 @@ test("loads the selected project and applies resource changes with safe-step fee
   render(<SettingsSurface agentEnvironmentAdapter={adapter} project={project} />);
 
   expect(screen.getByRole("heading", { name: "Models & Resources" })).toBeVisible();
-  expect(await screen.findByText("Project · Atlas")).toBeVisible();
+  expect(await screen.findAllByText("Project · Atlas")).toHaveLength(2);
   await user.click(screen.getByRole("switch", { name: "Review" }));
 
   await waitFor(() =>
@@ -92,6 +94,28 @@ test("loads the selected project and applies resource changes with safe-step fee
   );
   expect(screen.getByRole("switch", { name: "Review" })).not.toBeChecked();
   expect(adapter.get).toHaveBeenCalledTimes(2);
+});
+
+test("explains when a saved resource change could not restart an idle chat", async () => {
+  const adapter: AgentEnvironmentAdapter = {
+    get: vi.fn().mockResolvedValueOnce(environment(true)).mockResolvedValueOnce(environment(false)),
+    setEnabled: vi.fn().mockResolvedValue({
+      deferredChatCount: 0,
+      enabled: false,
+      restartFailedChatCount: 1,
+      resource: { kind: "skill", id: "project://skills/review" },
+      scope: "project",
+      status: "restartFailed",
+    }),
+  };
+  const user = userEvent.setup();
+
+  render(<SettingsSurface agentEnvironmentAdapter={adapter} project={project} />);
+  await user.click(await screen.findByRole("switch", { name: "Review" }));
+
+  expect(await screen.findByRole("status")).toHaveTextContent(
+    "The change was saved, but Più couldn’t restart 1 idle chat. Open it to reconnect.",
+  );
 });
 
 test("keeps the managed model available when no repository is open", () => {

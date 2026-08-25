@@ -5,6 +5,7 @@ import { expect, test, vi } from "vitest";
 
 import type { InboxSnapshot } from "../../platform/project-inbox";
 import type { ConversationAdapter } from "../../platform/conversations";
+import type { ModelControlsAdapter } from "../../platform/model-controls";
 import type { PromptAttachment } from "../../platform/prompt-attachments";
 import { ProjectDraftController } from "./draft-controller";
 import { ChatActivityController } from "./chat-activity-controller";
@@ -28,6 +29,19 @@ const conversationAdapter: ConversationAdapter = {
   }),
   prompt: vi.fn().mockResolvedValue(undefined),
   stop: vi.fn().mockResolvedValue(undefined),
+};
+
+const selectedRoute = { modelId: "qwen3.8-27b", provider: "local-mlx" };
+const modelControlsAdapter: ModelControlsAdapter<number> = {
+  get: vi.fn().mockResolvedValue({
+    appliesAfterCurrentStep: false,
+    efforts: ["low", "medium", "xhigh"],
+    routes: [{ acceptsImages: false, id: selectedRoute, name: "Qwen 3.8 27B" }],
+    selectedEffort: "medium",
+    selectedRoute,
+  }),
+  selectEffort: vi.fn(),
+  selectRoute: vi.fn(),
 };
 
 const populatedSnapshot: InboxSnapshot = {
@@ -136,6 +150,7 @@ function WorkspaceHarness({
       conversationAdapter={conversationAdapter}
       conversationRevision={0}
       drafts={drafts}
+      modelControlsAdapter={modelControlsAdapter}
       onCancelSetup={vi.fn().mockResolvedValue(undefined)}
       onCreateChat={onCreate}
       onOpenRepository={vi.fn()}
@@ -170,6 +185,7 @@ test("exposes Settings as a quiet sidebar footer action", async () => {
       conversationAdapter={conversationAdapter}
       conversationRevision={0}
       drafts={new ProjectDraftController(() => Promise.resolve())}
+      modelControlsAdapter={modelControlsAdapter}
       onCancelSetup={vi.fn().mockResolvedValue(undefined)}
       onCreateChat={vi.fn().mockResolvedValue(undefined)}
       onOpenRepository={vi.fn()}

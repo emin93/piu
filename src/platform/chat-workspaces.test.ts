@@ -24,7 +24,13 @@ beforeEach(() => {
 test("chat workspace actions cross the typed host commands without paths or options", async () => {
   tauri.invoke.mockResolvedValue(undefined);
 
-  await createChat(7, "Repair parser ownership", []);
+  await createChat(
+    7,
+    "Repair parser ownership",
+    [],
+    { provider: "openai-codex", modelId: "gpt-5.6-sol" },
+    "xhigh",
+  );
   await retryChatSetup("chat-7");
   await cancelChatSetup("chat-7");
   await openChatTerminal("chat-7");
@@ -32,7 +38,15 @@ test("chat workspace actions cross the typed host commands without paths or opti
   expect(tauri.invoke.mock.calls).toEqual([
     [
       "create_chat",
-      { request: { attachments: [], projectId: 7, prompt: "Repair parser ownership" } },
+      {
+        request: {
+          attachments: [],
+          effort: "xhigh",
+          projectId: 7,
+          prompt: "Repair parser ownership",
+          route: { provider: "openai-codex", modelId: "gpt-5.6-sol" },
+        },
+      },
     ],
     ["retry_chat_setup", { request: { chatId: "chat-7" } }],
     ["cancel_chat_setup", { request: { chatId: "chat-7" } }],

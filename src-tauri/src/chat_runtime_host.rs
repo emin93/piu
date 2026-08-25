@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -14,10 +15,10 @@ use ts_rs::TS;
 
 use crate::{
     agent_environment::{
-        AgentEnvironment, AgentEnvironmentError, AgentLaunchResources,
+        AgentEnvironment, AgentEnvironmentError, AgentLaunchResources, AgentResourceId,
         AgentResourcePreferenceChange, AgentResourcePreferenceScope, AgentResourceRefreshStatus,
     },
-    chat_workspaces::{ChatWorkspaceError, ChatWorkspaces},
+    chat_workspaces::{ChatAgentLaunchContext, ChatWorkspaceError, ChatWorkspaces},
     pi_rpc::{PiRpcChild, PiRpcError, PiRpcExtensionUiResponse, PiRpcPolicy, PiRpcProcessSpec},
     project_inbox::{ChatSessionReference, ChatSetupPhase, ProjectInbox, ProjectInboxError},
     prompt_attachments::{
@@ -29,8 +30,6 @@ use crate::{
     },
 };
 
-const MODEL_PROVIDER: &str = "openai-codex";
-const MODEL_ID: &str = "gpt-5.6-sol";
 const THINKING_LEVEL: &str = "xhigh";
 const RESTORED_INTERRUPTED_TURN_MESSAGE: &str =
     "The agent turn was interrupted before Più reopened this chat.";
@@ -83,7 +82,7 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    fn from_pi(value: &str) -> Option<Self> {
+    pub(crate) fn from_pi(value: &str) -> Option<Self> {
         match value {
             "off" => Some(Self::Off),
             "minimal" => Some(Self::Minimal),
@@ -96,7 +95,7 @@ impl ReasoningEffort {
         }
     }
 
-    fn as_pi(self) -> &'static str {
+    pub(crate) fn as_pi(self) -> &'static str {
         match self {
             Self::Off => "off",
             Self::Minimal => "minimal",
@@ -319,6 +318,8 @@ pub enum ChatRuntimeHostError {
     EffortUnavailable { effort: ReasoningEffort },
     #[error("Pi did not retain the requested model controls")]
     InferenceChangeRejected,
+    #[error("Pi rejected the inference change and could not restore the previous controls")]
+    InferenceRollbackFailed,
     #[error("chat {chat_id} cannot start before setup finishes ({phase:?})")]
     SetupIncomplete {
         chat_id: String,
@@ -365,6 +366,7 @@ struct ChatSlot {
     operation: AsyncMutex<()>,
     active: Mutex<Option<ActiveChat>>,
     pending_resource_refresh: Mutex<bool>,
+    project_id: Mutex<Option<i64>>,
     projection: Mutex<ConversationProjection>,
 }
 
@@ -374,6 +376,7 @@ impl ChatSlot {
             operation: AsyncMutex::new(()),
             active: Mutex::new(None),
             pending_resource_refresh: Mutex::new(false),
+            project_id: Mutex::new(None),
             projection: Mutex::new(ConversationProjection::new(
                 ConversationSnapshot::stopped(),
                 0,
@@ -387,8 +390,17 @@ struct ActiveChat {
     child: Arc<PiRpcChild>,
     command_generation: u64,
     launch_resources: AgentLaunchResources,
+    project_id: i64,
     send_only: bool,
     stop_events: CancellationToken,
+    worktree_path: PathBuf,
+}
+
+#[derive(Clone)]
+struct CachedProjectEnvironment {
+    canonical_resources: AgentLaunchResources,
+    model_controls: ModelControlsSnapshot,
+    project_root: PathBuf,
 }
 
 struct ConversationProjection {
@@ -448,6 +460,7 @@ struct HostInner {
     environment: Arc<AgentEnvironment>,
     preferences: Arc<RuntimePreferences>,
     paths: RuntimePaths,
+    project_environments: Mutex<HashMap<i64, CachedProjectEnvironment>>,
     slots: Mutex<HashMap<String, Arc<ChatSlot>>>,
     events: broadcast::Sender<ChatRuntimeChangedEvent>,
 }
@@ -522,6 +535,7 @@ impl ChatRuntimeHost {
                     app_skill_directory: resource_directory.join("agent-runtime/skills"),
                     home: home.to_path_buf(),
                 },
+                project_environments: Mutex::new(HashMap::new()),
                 slots: Mutex::new(HashMap::new()),
                 events,
             }),
@@ -561,6 +575,109 @@ impl ChatRuntimeHost {
         Ok(false)
     }
 
+    async fn chat_launch_context(
+        &self,
+        chat_id: &str,
+    ) -> Result<ChatAgentLaunchContext, ChatRuntimeHostError> {
+        let workspaces = Arc::clone(&self.inner.workspaces);
+        let owned_chat_id = chat_id.to_owned();
+        tokio::task::spawn_blocking(move || workspaces.agent_launch_context(&owned_chat_id))
+            .await
+            .map_err(|error| ChatRuntimeHostError::InvalidSessionState(error.to_string()))?
+            .map_err(Into::into)
+    }
+
+    async fn inspect_project_environment(
+        &self,
+        project_id: i64,
+    ) -> Result<CachedProjectEnvironment, ChatRuntimeHostError> {
+        let environment = Arc::clone(&self.inner.environment);
+        let environment = environment.project_runtime_environment(project_id);
+        let inbox = Arc::clone(&self.inner.inbox);
+        let project = tokio::task::spawn_blocking(move || inbox.project_location(project_id));
+        let (environment, project) = tokio::try_join!(
+            async { environment.await.map_err(ChatRuntimeHostError::from) },
+            async {
+                project
+                    .await
+                    .map_err(|error| ChatRuntimeHostError::InvalidSessionState(error.to_string()))?
+                    .map_err(ChatRuntimeHostError::from)
+            }
+        )?;
+        Ok(CachedProjectEnvironment {
+            canonical_resources: environment.launch_resources,
+            model_controls: environment.model_controls,
+            project_root: project.canonical_path,
+        })
+    }
+
+    fn cached_project_environment(
+        &self,
+        project_id: i64,
+    ) -> Result<Option<CachedProjectEnvironment>, ChatRuntimeHostError> {
+        self.inner
+            .project_environments
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)
+            .map(|projects| projects.get(&project_id).cloned())
+    }
+
+    fn cache_project_environment(
+        &self,
+        project_id: i64,
+        environment: CachedProjectEnvironment,
+    ) -> Result<(), ChatRuntimeHostError> {
+        self.inner
+            .project_environments
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)?
+            .insert(project_id, environment);
+        Ok(())
+    }
+
+    async fn ensure_project_environment(
+        &self,
+        project_id: i64,
+        inspect_on_miss: bool,
+    ) -> Result<CachedProjectEnvironment, ChatRuntimeHostError> {
+        if let Some(environment) = self.cached_project_environment(project_id)? {
+            return Ok(environment);
+        }
+        if !inspect_on_miss {
+            return Err(ChatRuntimeHostError::InvalidSessionState(
+                "the chat environment was not prepared before entering the send path".into(),
+            ));
+        }
+        let environment = self.inspect_project_environment(project_id).await?;
+        self.cache_project_environment(project_id, environment.clone())?;
+        Ok(environment)
+    }
+
+    async fn prepare_launch(
+        &self,
+        chat_id: &str,
+        inspect_on_miss: bool,
+    ) -> Result<
+        (
+            ChatAgentLaunchContext,
+            AgentLaunchResources,
+            ModelControlsSnapshot,
+        ),
+        ChatRuntimeHostError,
+    > {
+        let context = self.chat_launch_context(chat_id).await?;
+        let environment = self
+            .ensure_project_environment(context.project_id, inspect_on_miss)
+            .await?;
+        let launch_resources = remap_launch_resources(
+            &environment.canonical_resources,
+            &environment.project_root,
+            &context.worktree_path,
+        )
+        .await?;
+        Ok((context, launch_resources, environment.model_controls))
+    }
+
     pub async fn refresh_resources(
         &self,
         changed_project_id: i64,
@@ -574,37 +691,142 @@ impl ChatRuntimeHost {
             .iter()
             .map(|(chat_id, slot)| (chat_id.clone(), Arc::clone(slot)))
             .collect::<Vec<_>>();
+        let model_change = matches!(&change.resource, AgentResourceId::ModelRoute { .. });
+        let mut candidates = Vec::new();
+        for (chat_id, slot) in slots {
+            let active_snapshot = {
+                let active = slot.active.lock().map_err(|_| ChatRuntimeHostError::Lock)?;
+                active.as_ref().map(|active| {
+                    (
+                        Arc::clone(&active.child),
+                        active.project_id,
+                        active.launch_resources.clone(),
+                        active.worktree_path.clone(),
+                    )
+                })
+            };
+            let project_id = active_snapshot
+                .as_ref()
+                .map(|(_, project_id, _, _)| *project_id)
+                .or(*slot
+                    .project_id
+                    .lock()
+                    .map_err(|_| ChatRuntimeHostError::Lock)?);
+            let Some(project_id) = project_id else {
+                continue;
+            };
+            if change.scope == AgentResourcePreferenceScope::Project
+                && project_id != changed_project_id
+            {
+                continue;
+            }
+            let Some((child, _, launch_resources, worktree_path)) = active_snapshot else {
+                *slot
+                    .pending_resource_refresh
+                    .lock()
+                    .map_err(|_| ChatRuntimeHostError::Lock)? = true;
+                continue;
+            };
+            candidates.push((
+                chat_id,
+                slot,
+                child,
+                project_id,
+                launch_resources,
+                worktree_path,
+            ));
+        }
+
+        let previous_environments = self
+            .inner
+            .project_environments
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)?
+            .clone();
+        let mut project_ids = candidates
+            .iter()
+            .map(|(_, _, _, project_id, _, _)| *project_id)
+            .collect::<HashSet<_>>();
+        project_ids.insert(changed_project_id);
+        let environments = join_all(project_ids.into_iter().map(|project_id| async move {
+            self.inspect_project_environment(project_id)
+                .await
+                .map(|environment| (project_id, environment))
+        }))
+        .await
+        .into_iter()
+        .collect::<Result<HashMap<_, _>, _>>()?;
+
+        let mut planned = Vec::with_capacity(candidates.len());
+        for (chat_id, slot, child, project_id, launched_resources, worktree_path) in candidates {
+            let environment = environments.get(&project_id).ok_or_else(|| {
+                ChatRuntimeHostError::InvalidSessionState(
+                    "an affected project had no prepared environment".into(),
+                )
+            })?;
+            let effective_resources = if model_change {
+                launched_resources.clone()
+            } else {
+                remap_launch_resources(
+                    &environment.canonical_resources,
+                    &environment.project_root,
+                    &worktree_path,
+                )
+                .await?
+            };
+            let reconcile_model = model_change
+                || previous_environments
+                    .get(&project_id)
+                    .is_none_or(|previous| previous.model_controls != environment.model_controls);
+            planned.push((
+                chat_id,
+                slot,
+                child,
+                launched_resources,
+                effective_resources,
+                reconcile_model.then(|| environment.model_controls.clone()),
+            ));
+        }
+
+        {
+            let mut cached = self
+                .inner
+                .project_environments
+                .lock()
+                .map_err(|_| ChatRuntimeHostError::Lock)?;
+            match change.scope {
+                AgentResourcePreferenceScope::Global => cached.clear(),
+                AgentResourcePreferenceScope::Project => {
+                    cached.remove(&changed_project_id);
+                }
+            }
+            cached.extend(environments);
+        }
+
         let mut restart = Vec::new();
         let mut deferred_chat_count = 0_u32;
-        for (chat_id, slot) in slots {
+        let mut restart_failed_chat_count = 0_u32;
+        for (
+            chat_id,
+            slot,
+            planned_child,
+            launched_resources,
+            effective_resources,
+            model_controls,
+        ) in planned
+        {
             let operation = slot.operation.lock().await;
-            let launched_resources = slot
+            let still_planned_child = slot
                 .active
                 .lock()
                 .map_err(|_| ChatRuntimeHostError::Lock)?
                 .as_ref()
-                .map(|active| active.launch_resources.clone());
-            let Some(launched_resources) = launched_resources else {
-                continue;
-            };
-            let owned_chat_id = chat_id.clone();
-            let workspaces = Arc::clone(&self.inner.workspaces);
-            let context = tokio::task::spawn_blocking(move || {
-                workspaces.agent_launch_context(&owned_chat_id)
-            })
-            .await
-            .map_err(|error| ChatRuntimeHostError::InvalidSessionState(error.to_string()))??;
-            if change.scope == AgentResourcePreferenceScope::Project
-                && context.project_id != changed_project_id
-            {
+                .is_some_and(|active| Arc::ptr_eq(&active.child, &planned_child));
+            if !still_planned_child {
                 continue;
             }
-            let effective_resources = self
-                .inner
-                .environment
-                .launch_resources_for_worktree(context.project_id, &context.worktree_path)
-                .await?;
-            if effective_resources == launched_resources {
+            let resources_changed = effective_resources != launched_resources;
+            if !resources_changed && model_controls.is_none() {
                 *slot
                     .pending_resource_refresh
                     .lock()
@@ -626,6 +848,25 @@ impl ChatRuntimeHost {
                 deferred_chat_count = deferred_chat_count.saturating_add(1);
                 continue;
             }
+            if let Some(model_controls) = model_controls {
+                match self
+                    .reconcile_model_controls_snapshot(&slot, &planned_child, model_controls)
+                    .await
+                {
+                    Ok(_) => {
+                        *slot
+                            .pending_resource_refresh
+                            .lock()
+                            .map_err(|_| ChatRuntimeHostError::Lock)? = false;
+                        if !resources_changed {
+                            continue;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, %chat_id, "could not apply the enabled model fallback");
+                    }
+                }
+            }
             *slot
                 .pending_resource_refresh
                 .lock()
@@ -637,19 +878,43 @@ impl ChatRuntimeHost {
                 .take();
             if let Some(active) = active {
                 active.stop_events.cancel();
-                active.child.shutdown().await?;
-                restart.push(chat_id);
+                if let Err(error) = active.child.shutdown().await {
+                    tracing::warn!(%error, %chat_id, "could not retire chat while applying resources");
+                    *slot
+                        .pending_resource_refresh
+                        .lock()
+                        .map_err(|_| ChatRuntimeHostError::Lock)? = true;
+                    restart_failed_chat_count = restart_failed_chat_count.saturating_add(1);
+                    continue;
+                }
+                restart.push((chat_id, true));
             }
             drop(operation);
         }
-        for chat_id in restart {
-            self.open_for_send(&chat_id).await?;
+        for (chat_id, reconcile_model) in restart {
+            let reopened = self.open_for_send(&chat_id).await.map(|_| ());
+            let reopened = match reopened {
+                Ok(()) if reconcile_model => self.model_controls(&chat_id).await.map(|_| ()),
+                other => other,
+            };
+            if let Err(error) = reopened {
+                tracing::warn!(%error, %chat_id, "could not reopen chat after applying resources");
+                if let Ok(slot) = self.slot(&chat_id)
+                    && let Ok(mut pending) = slot.pending_resource_refresh.lock()
+                {
+                    *pending = true;
+                }
+                restart_failed_chat_count = restart_failed_chat_count.saturating_add(1);
+            }
         }
         change.deferred_chat_count = deferred_chat_count;
-        change.status = if deferred_chat_count == 0 {
-            AgentResourceRefreshStatus::Applied
-        } else {
+        change.restart_failed_chat_count = restart_failed_chat_count;
+        change.status = if restart_failed_chat_count > 0 {
+            AgentResourceRefreshStatus::RestartFailed
+        } else if deferred_chat_count > 0 {
             AgentResourceRefreshStatus::Deferred
+        } else {
+            AgentResourceRefreshStatus::Applied
         };
         Ok(change)
     }
@@ -658,11 +923,12 @@ impl ChatRuntimeHost {
         &self,
         chat_id: &str,
     ) -> Result<ModelControlsSnapshot, ChatRuntimeHostError> {
-        self.open_for_send(chat_id).await?;
+        self.open_slot(chat_id, true, true).await?;
         let slot = self.slot(chat_id)?;
         let _operation = slot.operation.lock().await;
-        let child = active_child(&slot, chat_id)?;
-        model_controls_snapshot(&slot, &child).await
+        let (child, project_id) = active_model_context(&slot, chat_id)?;
+        self.effective_model_controls_snapshot(&slot, &child, project_id)
+            .await
     }
 
     pub async fn select_model_route(
@@ -670,11 +936,13 @@ impl ChatRuntimeHost {
         chat_id: &str,
         route: ModelRouteId,
     ) -> Result<ModelControlsSnapshot, ChatRuntimeHostError> {
-        self.open_for_send(chat_id).await?;
+        self.open_slot(chat_id, true, true).await?;
         let slot = self.slot(chat_id)?;
-        let _operation = slot.operation.lock().await;
-        let child = active_child(&slot, chat_id)?;
-        let previous = model_controls_snapshot(&slot, &child).await?;
+        let operation = slot.operation.lock().await;
+        let (child, project_id) = active_model_context(&slot, chat_id)?;
+        let previous = self
+            .effective_model_controls_snapshot(&slot, &child, project_id)
+            .await?;
         if !previous
             .routes
             .iter()
@@ -688,71 +956,72 @@ impl ChatRuntimeHost {
         let persisted_route = PersistedModelRoute::new(&route.provider, &route.model_id)?;
         let remembered_effort =
             remembered_effort(Arc::clone(&self.inner.preferences), persisted_route.clone()).await?;
-        if let Err(error) = child
-            .request(
-                serde_json::json!({
-                    "type": "set_model",
-                    "provider": &route.provider,
-                    "modelId": &route.model_id,
-                }),
-                CancellationToken::new(),
-            )
-            .await
-        {
-            rollback_model_controls(&child, &previous).await;
-            return Err(error.into());
-        }
-        let mut applied = match model_controls_snapshot(&slot, &child).await {
-            Ok(snapshot) if snapshot.selected_route == route => snapshot,
-            Ok(_) => {
-                rollback_model_controls(&child, &previous).await;
-                return Err(ChatRuntimeHostError::InferenceChangeRejected);
-            }
-            Err(error) => {
-                rollback_model_controls(&child, &previous).await;
-                return Err(error);
-            }
-        };
-        if let Some(remembered_effort) = remembered_effort
-            && applied.efforts.contains(&remembered_effort)
-            && applied.selected_effort != remembered_effort
-        {
-            if let Err(error) = child
+        let changed = async {
+            child
                 .request(
                     serde_json::json!({
-                        "type": "set_thinking_level",
-                        "level": remembered_effort.as_pi(),
+                        "type": "set_model",
+                        "provider": &route.provider,
+                        "modelId": &route.model_id,
                     }),
                     CancellationToken::new(),
                 )
-                .await
-            {
-                rollback_model_controls(&child, &previous).await;
-                return Err(error.into());
+                .await?;
+            let mut applied = self
+                .effective_model_controls_snapshot(&slot, &child, project_id)
+                .await?;
+            if applied.selected_route != route {
+                return Err(ChatRuntimeHostError::InferenceChangeRejected);
             }
-            applied = match model_controls_snapshot(&slot, &child).await {
-                Ok(snapshot) if snapshot.selected_effort == remembered_effort => snapshot,
-                Ok(_) => {
-                    rollback_model_controls(&child, &previous).await;
+            if let Some(remembered_effort) = remembered_effort
+                && applied.efforts.contains(&remembered_effort)
+                && applied.selected_effort != remembered_effort
+            {
+                child
+                    .request(
+                        serde_json::json!({
+                            "type": "set_thinking_level",
+                            "level": remembered_effort.as_pi(),
+                        }),
+                        CancellationToken::new(),
+                    )
+                    .await?;
+                applied = self
+                    .effective_model_controls_snapshot(&slot, &child, project_id)
+                    .await?;
+                if applied.selected_effort != remembered_effort {
                     return Err(ChatRuntimeHostError::InferenceChangeRejected);
                 }
-                Err(error) => {
-                    rollback_model_controls(&child, &previous).await;
+            }
+            persist_selected_route(
+                Arc::clone(&self.inner.preferences),
+                persisted_route,
+                applied.selected_effort,
+            )
+            .await?;
+            Ok::<_, ChatRuntimeHostError>(applied)
+        }
+        .await;
+        match changed {
+            Ok(applied) => {
+                self.cache_applied_model_controls(project_id, &applied)?;
+                Ok(applied)
+            }
+            Err(error) => {
+                if rollback_model_controls(&slot, &child, &previous)
+                    .await
+                    .is_ok()
+                {
                     return Err(error);
                 }
-            };
+                let retired = retire_child_for_recovery(&slot, &child, chat_id).await;
+                drop(operation);
+                if retired {
+                    let _ = self.open_for_send(chat_id).await;
+                }
+                Err(ChatRuntimeHostError::InferenceRollbackFailed)
+            }
         }
-        if let Err(error) = persist_selected_route(
-            Arc::clone(&self.inner.preferences),
-            persisted_route,
-            applied.selected_effort,
-        )
-        .await
-        {
-            rollback_model_controls(&child, &previous).await;
-            return Err(error);
-        }
-        Ok(applied)
     }
 
     pub async fn select_reasoning_effort(
@@ -760,54 +1029,212 @@ impl ChatRuntimeHost {
         chat_id: &str,
         effort: ReasoningEffort,
     ) -> Result<ModelControlsSnapshot, ChatRuntimeHostError> {
-        self.open_for_send(chat_id).await?;
+        self.open_slot(chat_id, true, true).await?;
         let slot = self.slot(chat_id)?;
-        let _operation = slot.operation.lock().await;
-        let child = active_child(&slot, chat_id)?;
-        let previous = model_controls_snapshot(&slot, &child).await?;
+        let operation = slot.operation.lock().await;
+        let (child, project_id) = active_model_context(&slot, chat_id)?;
+        let previous = self
+            .effective_model_controls_snapshot(&slot, &child, project_id)
+            .await?;
         if !previous.efforts.contains(&effort) {
             return Err(ChatRuntimeHostError::EffortUnavailable { effort });
         }
-        if let Err(error) = child
-            .request(
-                serde_json::json!({
-                    "type": "set_thinking_level",
-                    "level": effort.as_pi(),
-                }),
-                CancellationToken::new(),
-            )
-            .await
-        {
-            rollback_model_controls(&child, &previous).await;
-            return Err(error.into());
-        }
-        match model_controls_snapshot(&slot, &child).await {
-            Ok(snapshot) if snapshot.selected_effort == effort => {
-                let route = PersistedModelRoute::new(
-                    &snapshot.selected_route.provider,
-                    &snapshot.selected_route.model_id,
-                )?;
-                if let Err(error) = persist_effort(
-                    Arc::clone(&self.inner.preferences),
-                    route,
-                    snapshot.selected_effort,
+        let changed = async {
+            child
+                .request(
+                    serde_json::json!({
+                        "type": "set_thinking_level",
+                        "level": effort.as_pi(),
+                    }),
+                    CancellationToken::new(),
                 )
-                .await
-                {
-                    rollback_model_controls(&child, &previous).await;
-                    return Err(error);
-                }
+                .await?;
+            let snapshot = self
+                .effective_model_controls_snapshot(&slot, &child, project_id)
+                .await?;
+            if snapshot.selected_effort != effort {
+                return Err(ChatRuntimeHostError::InferenceChangeRejected);
+            }
+            let route = PersistedModelRoute::new(
+                &snapshot.selected_route.provider,
+                &snapshot.selected_route.model_id,
+            )?;
+            persist_effort(
+                Arc::clone(&self.inner.preferences),
+                route,
+                snapshot.selected_effort,
+            )
+            .await?;
+            Ok::<_, ChatRuntimeHostError>(snapshot)
+        }
+        .await;
+        match changed {
+            Ok(snapshot) => {
+                self.cache_applied_model_controls(project_id, &snapshot)?;
                 Ok(snapshot)
             }
-            Ok(_) => {
-                rollback_model_controls(&child, &previous).await;
-                Err(ChatRuntimeHostError::InferenceChangeRejected)
-            }
             Err(error) => {
-                rollback_model_controls(&child, &previous).await;
-                Err(error)
+                if rollback_model_controls(&slot, &child, &previous)
+                    .await
+                    .is_ok()
+                {
+                    return Err(error);
+                }
+                let retired = retire_child_for_recovery(&slot, &child, chat_id).await;
+                drop(operation);
+                if retired {
+                    let _ = self.open_for_send(chat_id).await;
+                }
+                Err(ChatRuntimeHostError::InferenceRollbackFailed)
             }
         }
+    }
+
+    fn cache_applied_model_controls(
+        &self,
+        project_id: i64,
+        applied: &ModelControlsSnapshot,
+    ) -> Result<(), ChatRuntimeHostError> {
+        let mut projects = self
+            .inner
+            .project_environments
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)?;
+        let cached = projects.get_mut(&project_id).ok_or_else(|| {
+            ChatRuntimeHostError::InvalidSessionState(
+                "the active chat had no cached model controls".into(),
+            )
+        })?;
+        cached.model_controls.selected_route = applied.selected_route.clone();
+        cached.model_controls.selected_effort = applied.selected_effort;
+        cached.model_controls.efforts = applied.efforts.clone();
+        Ok(())
+    }
+
+    async fn effective_model_controls_snapshot(
+        &self,
+        slot: &ChatSlot,
+        child: &PiRpcChild,
+        project_id: i64,
+    ) -> Result<ModelControlsSnapshot, ChatRuntimeHostError> {
+        let allowed = self
+            .cached_project_environment(project_id)?
+            .ok_or_else(|| {
+                ChatRuntimeHostError::InvalidSessionState(
+                    "the active chat had no cached model controls".into(),
+                )
+            })?
+            .model_controls;
+        self.reconcile_model_controls_snapshot(slot, child, allowed)
+            .await
+    }
+
+    async fn reconcile_model_controls_snapshot(
+        &self,
+        slot: &ChatSlot,
+        child: &PiRpcChild,
+        allowed: ModelControlsSnapshot,
+    ) -> Result<ModelControlsSnapshot, ChatRuntimeHostError> {
+        let allowed_routes = allowed
+            .routes
+            .iter()
+            .map(|route| route.id.clone())
+            .collect::<HashSet<_>>();
+        let mut snapshot = model_controls_snapshot(slot, child).await?;
+
+        if !allowed_routes.contains(&snapshot.selected_route) {
+            let previous = snapshot;
+            let fallback = allowed
+                .routes
+                .iter()
+                .find(|route| route.id == allowed.selected_route)
+                .filter(|route| {
+                    previous
+                        .routes
+                        .iter()
+                        .any(|candidate| candidate.id == route.id)
+                })
+                .ok_or_else(|| {
+                    ChatRuntimeHostError::InvalidSessionState(
+                        "Più's enabled model routes were absent from the active Pi runtime".into(),
+                    )
+                })?;
+            if let Err(error) = child
+                .request(
+                    serde_json::json!({
+                        "type": "set_model",
+                        "provider": &fallback.id.provider,
+                        "modelId": &fallback.id.model_id,
+                    }),
+                    CancellationToken::new(),
+                )
+                .await
+            {
+                rollback_model_controls(slot, child, &previous).await?;
+                return Err(error.into());
+            }
+            snapshot = match model_controls_snapshot(slot, child).await {
+                Ok(applied) if applied.selected_route == fallback.id => applied,
+                Ok(_) => {
+                    rollback_model_controls(slot, child, &previous).await?;
+                    return Err(ChatRuntimeHostError::InferenceChangeRejected);
+                }
+                Err(error) => {
+                    rollback_model_controls(slot, child, &previous).await?;
+                    return Err(error);
+                }
+            };
+            let desired_effort = snapshot
+                .efforts
+                .contains(&allowed.selected_effort)
+                .then_some(allowed.selected_effort)
+                .or_else(|| snapshot.efforts.first().copied())
+                .ok_or_else(|| {
+                    ChatRuntimeHostError::InvalidSessionState(
+                        "the enabled fallback model exposed no reasoning effort".into(),
+                    )
+                })?;
+            if snapshot.selected_effort != desired_effort {
+                if let Err(error) = child
+                    .request(
+                        serde_json::json!({
+                            "type": "set_thinking_level",
+                            "level": desired_effort.as_pi(),
+                        }),
+                        CancellationToken::new(),
+                    )
+                    .await
+                {
+                    rollback_model_controls(slot, child, &previous).await?;
+                    return Err(error.into());
+                }
+                snapshot = match model_controls_snapshot(slot, child).await {
+                    Ok(applied) if applied.selected_effort == desired_effort => applied,
+                    Ok(_) => {
+                        rollback_model_controls(slot, child, &previous).await?;
+                        return Err(ChatRuntimeHostError::InferenceChangeRejected);
+                    }
+                    Err(error) => {
+                        rollback_model_controls(slot, child, &previous).await?;
+                        return Err(error);
+                    }
+                };
+            }
+        }
+
+        snapshot
+            .routes
+            .retain(|route| allowed_routes.contains(&route.id));
+        if !snapshot
+            .routes
+            .iter()
+            .any(|route| route.id == snapshot.selected_route)
+        {
+            return Err(ChatRuntimeHostError::InvalidSessionState(
+                "the active model route was disabled in Più".into(),
+            ));
+        }
+        Ok(snapshot)
     }
 
     pub async fn send(&self, chat_id: &str, text: &str) -> Result<(), ChatRuntimeHostError> {
@@ -828,6 +1255,7 @@ impl ChatRuntimeHost {
         let delivered_text = prompt_text(text, attachments);
         let command = prompt_command(&delivered_text, attachments, true);
         self.open_for_send(chat_id).await?;
+        self.reconcile_pending_inference(chat_id).await?;
         let sent = self
             .send_active(chat_id, &delivered_text, command.clone(), attachments)
             .await;
@@ -836,8 +1264,32 @@ impl ChatRuntimeHost {
         }
 
         self.open_for_send(chat_id).await?;
+        self.reconcile_pending_inference(chat_id).await?;
         self.send_active(chat_id, &delivered_text, command, attachments)
             .await
+    }
+
+    async fn reconcile_pending_inference(&self, chat_id: &str) -> Result<(), ChatRuntimeHostError> {
+        let slot = self.slot(chat_id)?;
+        let pending = *slot
+            .pending_resource_refresh
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)?;
+        let running = slot
+            .projection
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)?
+            .snapshot
+            .phase
+            == ConversationPhase::Running;
+        if pending && !running {
+            self.model_controls(chat_id).await?;
+            *slot
+                .pending_resource_refresh
+                .lock()
+                .map_err(|_| ChatRuntimeHostError::Lock)? = false;
+        }
+        Ok(())
     }
 
     pub async fn steer(&self, chat_id: &str, text: &str) -> Result<(), ChatRuntimeHostError> {
@@ -1186,22 +1638,43 @@ impl ChatRuntimeHost {
     }
 
     pub async fn open(&self, chat_id: &str) -> Result<ConversationSnapshot, ChatRuntimeHostError> {
-        self.open_slot(chat_id, false).await
+        self.open_slot(chat_id, false, true).await
     }
 
     async fn open_for_send(
         &self,
         chat_id: &str,
     ) -> Result<ConversationSnapshot, ChatRuntimeHostError> {
-        self.open_slot(chat_id, true).await
+        self.open_slot(chat_id, true, true).await
     }
 
     async fn open_slot(
         &self,
         chat_id: &str,
         keep_stopped_runtime: bool,
+        inspect_environment_on_miss: bool,
     ) -> Result<ConversationSnapshot, ChatRuntimeHostError> {
         let slot = self.slot(chat_id)?;
+        if slot
+            .active
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)?
+            .is_some()
+        {
+            return slot
+                .projection
+                .lock()
+                .map_err(|_| ChatRuntimeHostError::Lock)
+                .map(|projection| projection.snapshot.clone());
+        }
+        let (context, launch_resources, launch_model_controls) = self
+            .prepare_launch(chat_id, inspect_environment_on_miss)
+            .await?;
+        *slot
+            .project_id
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)? = Some(context.project_id);
+
         let _operation = slot.operation.lock().await;
         if slot
             .active
@@ -1224,13 +1697,6 @@ impl ChatRuntimeHost {
                 return Ok(projection.snapshot.clone());
             }
         }
-
-        let owned_chat_id = chat_id.to_owned();
-        let workspaces = Arc::clone(&self.inner.workspaces);
-        let context =
-            tokio::task::spawn_blocking(move || workspaces.agent_launch_context(&owned_chat_id))
-                .await
-                .map_err(|error| ChatRuntimeHostError::InvalidSessionState(error.to_string()))??;
         if !matches!(
             context.setup.phase,
             ChatSetupPhase::Succeeded | ChatSetupPhase::NotRequired
@@ -1265,11 +1731,6 @@ impl ChatRuntimeHost {
                 "the stored Pi session path was outside application storage".into(),
             ));
         }
-        let launch_resources = self
-            .inner
-            .environment
-            .launch_resources_for_worktree(context.project_id, &context.worktree_path)
-            .await?;
         let spec = self.process_spec(
             chat_id,
             &context.worktree_path,
@@ -1277,6 +1738,7 @@ impl ChatRuntimeHost {
                 .as_ref()
                 .map(|session| session.path.as_path()),
             &launch_resources,
+            &launch_model_controls,
         )?;
         let child = Arc::new(PiRpcChild::launch(spec, PiRpcPolicy::default()).await?);
         let opened = self.inspect_opened_session(&child).await;
@@ -1402,8 +1864,10 @@ impl ChatRuntimeHost {
             child: Arc::clone(&child),
             command_generation: 0,
             launch_resources,
+            project_id: context.project_id,
             send_only: keep_stopped_runtime && !should_start,
             stop_events: stop_events.clone(),
+            worktree_path: context.worktree_path.clone(),
         });
         self.forward_events(
             chat_id.to_owned(),
@@ -1597,6 +2061,15 @@ impl ChatRuntimeHost {
                                     %chat_id,
                                     "could not resume chat after applying its deferred resources"
                                 );
+                            } else if let Err(error) = host.model_controls(&chat_id).await {
+                                tracing::warn!(
+                                    %error,
+                                    %chat_id,
+                                    "could not reconcile chat inference after its deferred refresh"
+                                );
+                                if let Ok(mut pending) = slot.pending_resource_refresh.lock() {
+                                    *pending = true;
+                                }
                             }
                         }
                         return;
@@ -1699,9 +2172,16 @@ impl ChatRuntimeHost {
         worktree: &Path,
         session_path: Option<&Path>,
         launch_resources: &AgentLaunchResources,
+        model_controls: &ModelControlsSnapshot,
     ) -> Result<PiRpcProcessSpec, ChatRuntimeHostError> {
         let initial_selection = self.inner.preferences.initial_chat_selection(chat_id)?;
         let (model_provider, model_id, thinking_level) = initial_selection
+            .filter(|selection| {
+                model_controls.routes.iter().any(|route| {
+                    route.id.provider == selection.route.provider_id()
+                        && route.id.model_id == selection.route.model_id()
+                })
+            })
             .map(|selection| {
                 (
                     selection.route.provider_id().to_owned(),
@@ -1713,9 +2193,9 @@ impl ChatRuntimeHost {
             })
             .unwrap_or_else(|| {
                 (
-                    MODEL_PROVIDER.to_owned(),
-                    MODEL_ID.to_owned(),
-                    THINKING_LEVEL.to_owned(),
+                    model_controls.selected_route.provider.clone(),
+                    model_controls.selected_route.model_id.clone(),
+                    model_controls.selected_effort.as_pi().to_owned(),
                 )
             });
         let mut arguments = vec![
@@ -1876,6 +2356,46 @@ impl Drop for HostInner {
     }
 }
 
+async fn remap_launch_resources(
+    canonical_resources: &AgentLaunchResources,
+    project_root: &Path,
+    worktree: &Path,
+) -> Result<AgentLaunchResources, ChatRuntimeHostError> {
+    let canonical_worktree = tokio::fs::canonicalize(worktree)
+        .await
+        .map_err(|_| AgentEnvironmentError::InvalidSnapshot)?;
+    let mut extension_paths = Vec::with_capacity(canonical_resources.extension_paths.len());
+    for path in &canonical_resources.extension_paths {
+        extension_paths.push(remap_launch_path(path, project_root, &canonical_worktree).await?);
+    }
+    let mut skill_paths = Vec::with_capacity(canonical_resources.skill_paths.len());
+    for path in &canonical_resources.skill_paths {
+        skill_paths.push(remap_launch_path(path, project_root, &canonical_worktree).await?);
+    }
+    Ok(AgentLaunchResources {
+        extension_paths,
+        skill_paths,
+    })
+}
+
+async fn remap_launch_path(
+    path: &Path,
+    project_root: &Path,
+    canonical_worktree: &Path,
+) -> Result<PathBuf, ChatRuntimeHostError> {
+    let project_relative = path.strip_prefix(project_root).ok();
+    let candidate = project_relative
+        .map(|relative| canonical_worktree.join(relative))
+        .unwrap_or_else(|| path.to_path_buf());
+    let canonical = tokio::fs::canonicalize(candidate)
+        .await
+        .map_err(|_| AgentEnvironmentError::InvalidSnapshot)?;
+    if project_relative.is_some() && !canonical.starts_with(canonical_worktree) {
+        return Err(AgentEnvironmentError::InvalidSnapshot.into());
+    }
+    Ok(canonical)
+}
+
 fn flag(value: &str) -> OsString {
     OsStr::new(value).to_owned()
 }
@@ -1919,12 +2439,34 @@ async fn retire_send_only_child(
     Ok(())
 }
 
-fn active_child(slot: &ChatSlot, chat_id: &str) -> Result<Arc<PiRpcChild>, ChatRuntimeHostError> {
+async fn retire_child_for_recovery(slot: &ChatSlot, child: &PiRpcChild, chat_id: &str) -> bool {
+    let active = slot.active.lock().ok().and_then(|mut active| {
+        active
+            .as_ref()
+            .is_some_and(|active| std::ptr::eq(active.child.as_ref(), child))
+            .then(|| active.take())
+            .flatten()
+    });
+    let Some(active) = active else {
+        return false;
+    };
+    active.stop_events.cancel();
+    if let Err(error) = active.child.shutdown().await {
+        tracing::warn!(%error, %chat_id, "could not retire chat after failed inference rollback");
+        return false;
+    }
+    true
+}
+
+fn active_model_context(
+    slot: &ChatSlot,
+    chat_id: &str,
+) -> Result<(Arc<PiRpcChild>, i64), ChatRuntimeHostError> {
     slot.active
         .lock()
         .map_err(|_| ChatRuntimeHostError::Lock)?
         .as_ref()
-        .map(|active| Arc::clone(&active.child))
+        .map(|active| (Arc::clone(&active.child), active.project_id))
         .ok_or_else(|| ChatRuntimeHostError::NotActive {
             chat_id: chat_id.to_owned(),
         })
@@ -2067,9 +2609,13 @@ fn model_route_id(model: &Value) -> Result<ModelRouteId, ChatRuntimeHostError> {
     })
 }
 
-async fn rollback_model_controls(child: &PiRpcChild, previous: &ModelControlsSnapshot) {
+async fn rollback_model_controls(
+    slot: &ChatSlot,
+    child: &PiRpcChild,
+    previous: &ModelControlsSnapshot,
+) -> Result<(), ChatRuntimeHostError> {
     let route = &previous.selected_route;
-    let _ = child
+    let route_restored = child
         .request(
             serde_json::json!({
                 "type": "set_model",
@@ -2078,8 +2624,9 @@ async fn rollback_model_controls(child: &PiRpcChild, previous: &ModelControlsSna
             }),
             CancellationToken::new(),
         )
-        .await;
-    let _ = child
+        .await
+        .is_ok();
+    let effort_restored = child
         .request(
             serde_json::json!({
                 "type": "set_thinking_level",
@@ -2087,7 +2634,20 @@ async fn rollback_model_controls(child: &PiRpcChild, previous: &ModelControlsSna
             }),
             CancellationToken::new(),
         )
-        .await;
+        .await
+        .is_ok();
+    let restored = model_controls_snapshot(slot, child).await;
+    if route_restored
+        && effort_restored
+        && restored.is_ok_and(|snapshot| {
+            snapshot.selected_route == previous.selected_route
+                && snapshot.selected_effort == previous.selected_effort
+        })
+    {
+        Ok(())
+    } else {
+        Err(ChatRuntimeHostError::InferenceRollbackFailed)
+    }
 }
 
 async fn remembered_effort(

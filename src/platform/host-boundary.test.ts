@@ -5,22 +5,26 @@ import type { HostRoundTripRequest } from "../generated/HostRoundTripRequest";
 import type { HostRoundTripResponse } from "../generated/HostRoundTripResponse";
 import { verifyHostBoundary } from "./host-boundary";
 
-const boundary = vi.hoisted(() => ({
-  handler: undefined as ((event: Event<HostRoundTripResponse>) => void) | undefined,
-  order: [] as string[],
-}));
+const boundary = vi.hoisted(
+  (): {
+    handler: ((event: Event<HostRoundTripResponse>) => void) | undefined;
+    order: string[];
+  } => ({ handler: undefined, order: [] }),
+);
 
-vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(
-    (
-      _eventName: string,
-      handler: (event: Event<HostRoundTripResponse>) => void,
-    ): Promise<() => void> => {
-      boundary.order.push("listen");
-      boundary.handler = handler;
-      return Promise.resolve(() => boundary.order.push("unlisten"));
-    },
-  ),
+vi.mock("@tauri-apps/api/webviewWindow", () => ({
+  getCurrentWebviewWindow: () => ({
+    listen: vi.fn(
+      (
+        _eventName: string,
+        handler: (event: Event<HostRoundTripResponse>) => void,
+      ): Promise<() => void> => {
+        boundary.order.push("listen");
+        boundary.handler = handler;
+        return Promise.resolve(() => boundary.order.push("unlisten"));
+      },
+    ),
+  }),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({

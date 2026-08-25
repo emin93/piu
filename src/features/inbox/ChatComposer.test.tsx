@@ -136,7 +136,7 @@ test("persists a keyboard-selected project route before creating the chat", asyn
 
   await user.click(screen.getByRole("button", { name: "Send message" }));
 
-  expect(onSubmit).toHaveBeenCalledWith(7, "Create with Codex", []);
+  expect(onSubmit).toHaveBeenCalledWith(7, "Create with Codex", [], codexRoute, "max");
   expect(events).toEqual(["select route", "route persisted", "create chat"]);
 });
 

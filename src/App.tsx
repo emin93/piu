@@ -21,6 +21,8 @@ import {
 } from "@/components/ui/empty";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { ModelRouteId } from "@/generated/ModelRouteId";
+import type { ReasoningEffort } from "@/generated/ReasoningEffort";
 import { DeferredSurface, type DeferredSurfaceName } from "./features/deferred/DeferredSurface";
 import { ProjectDraftController } from "./features/inbox/draft-controller";
 import { ChatActivityController } from "./features/inbox/chat-activity-controller";
@@ -267,10 +269,16 @@ export function App({
   );
 
   const createProjectChat = useCallback(
-    async (projectId: number, prompt: string, attachments: readonly PromptAttachment[]) => {
+    async (
+      projectId: number,
+      prompt: string,
+      attachments: readonly PromptAttachment[],
+      route: ModelRouteId,
+      effort: ReasoningEffort,
+    ) => {
       await drafts.flush(projectId);
       try {
-        const created = await createChat(projectId, prompt, attachments);
+        const created = await createChat(projectId, prompt, attachments, route, effort);
         drafts.forget(projectId);
         setups.reconcile(created.snapshot);
         setSnapshot(created.snapshot);

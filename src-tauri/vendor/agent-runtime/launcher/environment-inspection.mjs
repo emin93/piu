@@ -53,9 +53,51 @@ function messageFrom(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function resourcePreferenceMaps(resourcePreferences = { global: [], project: [] }) {
+  const maps = {
+    global: { extension: new Map(), package: new Map() },
+    project: { extension: new Map(), package: new Map() },
+  };
+  for (const scope of ["global", "project"]) {
+    for (const { kind, id, enabled } of resourcePreferences[scope]) {
+      maps[scope][kind].set(id, enabled);
+    }
+  }
+  return maps;
+}
+
+function effectiveResolvedResourceEnabled(resource, preferences, kind) {
+  const packageId = resource.metadata.origin === "package" ? resource.metadata.source : undefined;
+  return (
+    (kind === "extension" ? preferences.project.extension.get(resource.path) : undefined) ??
+    (packageId === undefined ? undefined : preferences.project.package.get(packageId)) ??
+    (kind === "extension" ? preferences.global.extension.get(resource.path) : undefined) ??
+    (packageId === undefined ? undefined : preferences.global.package.get(packageId)) ??
+    resource.enabled
+  );
+}
+
 function isolatedNpmLookupCommand(agentDirectory) {
   const emptyGlobalRoot = join(agentDirectory, ".piu-empty-global-npm");
   return [process.execPath, isolatedNpmRootLauncher, emptyGlobalRoot, "--"];
+}
+
+function captureProviderOwners(extensionsResult, extensionOwners, providerOwners) {
+  providerOwners.clear();
+  for (const { name, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
+    const owner = extensionOwners.get(extensionPath);
+    if (owner === undefined) throw new Error(`provider ${name} has no resolved owning extension`);
+    providerOwners.set(name, owner);
+  }
+  for (const { provider, extensionPath } of extensionsResult.runtime
+    .pendingNativeProviderRegistrations) {
+    const owner = extensionOwners.get(extensionPath);
+    if (owner === undefined) {
+      throw new Error(`provider ${provider.id} has no resolved owning extension`);
+    }
+    providerOwners.set(provider.id, owner);
+  }
+  return extensionsResult;
 }
 
 function isWithin(path, root) {
@@ -150,8 +192,24 @@ export async function inspectPiuEnvironment(
     skills: await keepOwnedResources(resolved.skills, ownedRoots, canonicalizePath),
   };
 
-  const enabledExtensions = resolved.extensions.filter(({ enabled }) => enabled);
-  const enabledSkills = resolved.skills.filter(({ enabled }) => enabled);
+  const resourcePreferences = resourcePreferenceMaps(config.resourcePreferences);
+  const enabledExtensions = resolved.extensions.filter((resource) =>
+    effectiveResolvedResourceEnabled(resource, resourcePreferences, "extension"),
+  );
+  const enabledSkills = resolved.skills.filter((resource) =>
+    effectiveResolvedResourceEnabled(resource, resourcePreferences, "skill"),
+  );
+  const extensionOwners = new Map(
+    enabledExtensions.map(({ path, metadata }) => [
+      path,
+      {
+        extensionId: path,
+        scope: metadata.scope,
+        ...(metadata.origin === "package" ? { packageId: metadata.source } : {}),
+      },
+    ]),
+  );
+  const providerOwners = new Map();
   const services = await pi.createAgentSessionServices({
     cwd: config.cwd,
     agentDir: config.agentDirectory,
@@ -165,6 +223,8 @@ export async function inspectPiuEnvironment(
       noPromptTemplates: true,
       noSkills: true,
       noThemes: true,
+      extensionsOverride: (extensionsResult) =>
+        captureProviderOwners(extensionsResult, extensionOwners, providerOwners),
     },
   });
   for (const diagnostic of services.diagnostics) {
@@ -193,13 +253,25 @@ export async function inspectPiuEnvironment(
   }
 
   return {
-    modelRoutes: availableModels.map((model) => ({
-      provider: model.provider,
-      id: model.id,
-      name: model.name,
-      acceptsImages: model.input?.includes("image") ?? false,
-      thinkingLevels: getSupportedThinkingLevels(model),
-    })),
+    modelRoutes: availableModels.map((model) => {
+      const owner = providerOwners.get(model.provider);
+      return {
+        provider: model.provider,
+        id: model.id,
+        name: model.name,
+        acceptsImages: model.input?.includes("image") ?? false,
+        thinkingLevels: getSupportedThinkingLevels(model),
+        scope: owner?.scope ?? "user",
+        ...(owner === undefined
+          ? {}
+          : {
+              owner: {
+                extensionId: owner.extensionId,
+                ...(owner.packageId === undefined ? {} : { packageId: owner.packageId }),
+              },
+            }),
+      };
+    }),
     resources: {
       extensions: resolved.extensions.map((resource) => resourceItem(resource)),
       skills: resolved.skills.map((resource) => resourceItem(resource, skillNames)),

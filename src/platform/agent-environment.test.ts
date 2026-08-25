@@ -67,6 +67,7 @@ test("resource inventory and preference changes stay behind the typed environmen
   const change = {
     deferredChatCount: 1,
     enabled: false,
+    restartFailedChatCount: 0,
     resource: { kind: "skill" as const, id: "project://skills/review" },
     scope: "project" as const,
     status: "deferred" as const,

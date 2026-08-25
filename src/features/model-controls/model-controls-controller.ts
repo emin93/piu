@@ -1,6 +1,7 @@
 import type { ModelControlsSnapshot } from "@/generated/ModelControlsSnapshot";
 import type { ModelRouteId } from "@/generated/ModelRouteId";
 import type { ReasoningEffort } from "@/generated/ReasoningEffort";
+import { conversationErrorMessage } from "@/platform/conversations";
 import type { ModelControlsAdapter } from "@/platform/model-controls";
 
 type Listener = () => void;
@@ -44,6 +45,15 @@ function selectedRouteName(controls: ModelControlsSnapshot) {
   return (
     controls.routes.find((route) => sameRoute(route.id, controls.selectedRoute))?.name ??
     controls.selectedRoute.modelId
+  );
+}
+
+function isInferenceRollbackFailure(error: unknown) {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "inferenceRollbackFailed"
   );
 }
 
@@ -130,12 +140,18 @@ export class ModelControlsController<TargetId extends number | string = string> 
       const controls = await this.#adapter.selectRoute(this.#targetId, route);
       if (generation !== this.#generation) return;
       this.#publish({ controls, error: null, pending: null, phase: "ready" });
-    } catch {
+    } catch (error) {
       if (generation !== this.#generation) return;
-      this.#retry = () => this.selectRoute(route);
+      const rollbackFailed = isInferenceRollbackFailure(error);
+      this.#retry = rollbackFailed ? null : () => this.selectRoute(route);
       this.#publish({
         controls: current,
-        error: `Couldn’t switch to ${target.name}. Still using ${selectedRouteName(current)}.`,
+        error: rollbackFailed
+          ? conversationErrorMessage(
+              error,
+              "Pi couldn’t safely restore the previous model. Reopen the chat and try again.",
+            )
+          : `Couldn’t switch to ${target.name}. Still using ${selectedRouteName(current)}.`,
         pending: null,
         phase: "failed",
       });
@@ -169,12 +185,18 @@ export class ModelControlsController<TargetId extends number | string = string> 
       const controls = await this.#adapter.selectEffort(this.#targetId, effort);
       if (generation !== this.#generation) return;
       this.#publish({ controls, error: null, pending: null, phase: "ready" });
-    } catch {
+    } catch (error) {
       if (generation !== this.#generation) return;
-      this.#retry = () => this.selectEffort(effort);
+      const rollbackFailed = isInferenceRollbackFailure(error);
+      this.#retry = rollbackFailed ? null : () => this.selectEffort(effort);
       this.#publish({
         controls: current,
-        error: `Couldn’t change reasoning effort. Still using ${reasoningEffortLabel(current.selectedEffort)}.`,
+        error: rollbackFailed
+          ? conversationErrorMessage(
+              error,
+              "Pi couldn’t safely restore the previous model. Reopen the chat and try again.",
+            )
+          : `Couldn’t change reasoning effort. Still using ${reasoningEffortLabel(current.selectedEffort)}.`,
         pending: null,
         phase: "failed",
       });

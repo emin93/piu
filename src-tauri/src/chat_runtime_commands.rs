@@ -93,6 +93,7 @@ pub enum ChatRuntimeCommandErrorCode {
     ModelUnavailable,
     EffortUnavailable,
     InferenceChangeRejected,
+    InferenceRollbackFailed,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -133,6 +134,12 @@ impl From<ChatRuntimeHostError> for ChatRuntimeCommandError {
             ChatRuntimeHostError::InferenceChangeRejected => Self {
                 code: ChatRuntimeCommandErrorCode::InferenceChangeRejected,
                 message: "Pi couldn’t switch models. The previous model is still selected.".into(),
+            },
+            ChatRuntimeHostError::InferenceRollbackFailed => Self {
+                code: ChatRuntimeCommandErrorCode::InferenceRollbackFailed,
+                message:
+                    "Pi couldn’t safely restore the previous model. Reopen the chat and try again."
+                        .into(),
             },
             ChatRuntimeHostError::SetupIncomplete { .. } => Self {
                 code: ChatRuntimeCommandErrorCode::SetupIncomplete,
@@ -242,6 +249,18 @@ mod tests {
 
             assert_eq!(error.code, ChatRuntimeCommandErrorCode::ConversationFailed);
         }
+    }
+
+    #[test]
+    fn failed_inference_rollback_has_distinct_recovery_copy() {
+        let error = ChatRuntimeCommandError::from(ChatRuntimeHostError::InferenceRollbackFailed);
+
+        assert_eq!(
+            error.code,
+            ChatRuntimeCommandErrorCode::InferenceRollbackFailed
+        );
+        assert!(error.message.contains("Reopen the chat"));
+        assert!(!error.message.contains("previous model is still selected"));
     }
 }
 

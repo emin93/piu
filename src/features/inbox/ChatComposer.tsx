@@ -11,6 +11,8 @@ import { ComposerInferenceControls } from "@/features/model-controls/ComposerInf
 import { ModelControlsController } from "@/features/model-controls/model-controls-controller";
 import { tauriProjectModelControlsAdapter } from "@/platform/agent-environment";
 import type { ModelControlsAdapter } from "@/platform/model-controls";
+import type { ModelRouteId } from "@/generated/ModelRouteId";
+import type { ReasoningEffort } from "@/generated/ReasoningEffort";
 import type { PromptAttachment } from "@/platform/prompt-attachments";
 import type { ProjectSummary } from "@/platform/project-inbox";
 
@@ -24,6 +26,8 @@ interface ChatComposerProps {
     projectId: number,
     prompt: string,
     attachments: readonly PromptAttachment[],
+    route: ModelRouteId,
+    effort: ReasoningEffort,
   ) => Promise<string | undefined>;
   project: ProjectSummary;
 }
@@ -73,17 +77,25 @@ export function ChatComposer({
 
   const submit = useCallback(async () => {
     const prompt = draft.prompt.trim();
+    const inference = modelControls.getSnapshot();
     if (
       !onSubmit ||
       (!prompt && draft.attachments.length === 0) ||
       submitting ||
-      modelControls.getSnapshot().phase === "changing"
+      inference.phase !== "ready" ||
+      !inference.controls
     ) {
       return;
     }
     setSubmitting(true);
     setSubmissionError(undefined);
-    const error = await onSubmit(project.id, prompt, draft.attachments);
+    const error = await onSubmit(
+      project.id,
+      prompt,
+      draft.attachments,
+      inference.controls.selectedRoute,
+      inference.controls.selectedEffort,
+    );
     setSubmitting(false);
     if (error) setSubmissionError(error);
   }, [draft.attachments, draft.prompt, modelControls, onSubmit, project.id, submitting]);
@@ -142,7 +154,8 @@ export function ChatComposer({
                 !onSubmit ||
                 (!draft.prompt.trim() && draft.attachments.length === 0) ||
                 submitting ||
-                modelControlsSnapshot.phase === "changing"
+                modelControlsSnapshot.phase !== "ready" ||
+                !modelControlsSnapshot.controls
               }
               size="icon"
               type="submit"

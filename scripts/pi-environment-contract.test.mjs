@@ -29,8 +29,10 @@ test("the pinned Pi SDK inspects only explicitly isolated Più resources without
     home: join(fixtureRoot, "standalone-home"),
   };
   const globalSkill = join(paths.agentDirectory, "skills", "shared-review");
+  const globalExtensions = join(paths.agentDirectory, "extensions");
   const projectSkill = join(paths.cwd, ".pi", "skills", "shared-review");
   const projectExtensions = join(paths.cwd, ".pi", "extensions");
+  const providerExecutionMarker = join(fixtureRoot, "provider-executed");
   const standaloneAgent = join(paths.home, ".pi", "agent");
   const standaloneSkill = join(paths.home, ".agents", "skills", "standalone-only");
   const previousHome = process.env.HOME;
@@ -38,6 +40,7 @@ test("the pinned Pi SDK inspects only explicitly isolated Più resources without
   try {
     await Promise.all([
       mkdir(globalSkill, { recursive: true }),
+      mkdir(globalExtensions, { recursive: true }),
       mkdir(projectSkill, { recursive: true }),
       mkdir(projectExtensions, { recursive: true }),
       mkdir(join(standaloneAgent, "extensions"), { recursive: true }),
@@ -51,6 +54,18 @@ test("the pinned Pi SDK inspects only explicitly isolated Più resources without
       writeFile(
         join(globalSkill, "SKILL.md"),
         "---\nname: shared-review\ndescription: Global fixture\n---\nGlobal.\n",
+      ),
+      writeFile(
+        join(globalExtensions, "routes.js"),
+        `import { fauxProvider } from "@earendil-works/pi-ai";
+
+export default function (extension) {
+  extension.registerProvider(fauxProvider({
+    provider: "piu-global-contract",
+    models: [{ id: "global", name: "Global", reasoning: false }],
+  }).provider);
+}
+`,
       ),
       writeFile(
         join(projectSkill, "SKILL.md"),
@@ -70,10 +85,32 @@ export default function (extension) {
   });
   fixture.models[0].thinkingLevelMap = { xhigh: "xhigh", max: "max" };
   extension.registerProvider(fixture.provider);
+  extension.registerProvider(fauxProvider({
+    provider: "piu-override-contract",
+    models: [{ id: "shared", name: "Project base", reasoning: false }],
+  }).provider);
+  extension.registerProvider(fauxProvider({
+    provider: "piu-override-contract",
+    models: [{ id: "shared", name: "Project override", reasoning: false }],
+  }).provider);
 }
 `,
       ),
       writeFile(join(projectExtensions, "broken.js"), "export default function ( {\n"),
+      writeFile(
+        join(projectExtensions, "toggle.js"),
+        `import { writeFileSync } from "node:fs";
+import { fauxProvider } from "@earendil-works/pi-ai";
+
+export default function (extension) {
+  writeFileSync(${JSON.stringify(providerExecutionMarker)}, "executed");
+  extension.registerProvider(fauxProvider({
+    provider: "piu-toggle-contract",
+    models: [{ id: "toggle", name: "Toggle", reasoning: false }],
+  }).provider);
+}
+`,
+      ),
       writeFile(join(standaloneAgent, "settings.json"), "{ this is deliberately invalid json"),
       writeFile(
         join(standaloneAgent, "extensions", "standalone.js"),
@@ -115,6 +152,8 @@ export default function (extension) {
           name: "Deep",
           acceptsImages: true,
           thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+          scope: "project",
+          owner: { extensionId: join(projectExtensions, "route.js") },
         },
         {
           provider: "piu-environment-contract",
@@ -122,6 +161,36 @@ export default function (extension) {
           name: "Plain",
           acceptsImages: true,
           thinkingLevels: ["off"],
+          scope: "project",
+          owner: { extensionId: join(projectExtensions, "route.js") },
+        },
+      ],
+    );
+    assert.deepEqual(
+      result.modelRoutes.filter(({ provider }) => provider === "piu-global-contract"),
+      [
+        {
+          provider: "piu-global-contract",
+          id: "global",
+          name: "Global",
+          acceptsImages: true,
+          thinkingLevels: ["off"],
+          scope: "user",
+          owner: { extensionId: join(globalExtensions, "routes.js") },
+        },
+      ],
+    );
+    assert.deepEqual(
+      result.modelRoutes.filter(({ provider }) => provider === "piu-override-contract"),
+      [
+        {
+          provider: "piu-override-contract",
+          id: "shared",
+          name: "Project override",
+          acceptsImages: true,
+          thinkingLevels: ["off"],
+          scope: "project",
+          owner: { extensionId: join(projectExtensions, "route.js") },
         },
       ],
     );
@@ -159,6 +228,56 @@ export default function (extension) {
       ),
       true,
     );
+    await rm(providerExecutionMarker, { force: true });
+    const toggleExtension = join(projectExtensions, "toggle.js");
+    const disabled = await inspectPiuEnvironment(
+      {
+        agentDirectory: paths.agentDirectory,
+        cwd: paths.cwd,
+        resourcePreferences: {
+          global: [{ kind: "extension", id: toggleExtension, enabled: false }],
+          project: [],
+        },
+      },
+      {
+        credentials: new InMemoryCredentialStore(),
+        getSupportedThinkingLevels,
+        modelsStore: new InMemoryModelsStore(),
+        pi,
+      },
+    );
+    await assert.rejects(access(providerExecutionMarker));
+    assert.equal(
+      disabled.resources.extensions.some(({ id }) => id === toggleExtension),
+      true,
+    );
+    assert.equal(
+      disabled.modelRoutes.some(({ provider }) => provider === "piu-toggle-contract"),
+      false,
+    );
+
+    const reenabled = await inspectPiuEnvironment(
+      {
+        agentDirectory: paths.agentDirectory,
+        cwd: paths.cwd,
+        resourcePreferences: {
+          global: [{ kind: "extension", id: toggleExtension, enabled: false }],
+          project: [{ kind: "extension", id: toggleExtension, enabled: true }],
+        },
+      },
+      {
+        credentials: new InMemoryCredentialStore(),
+        getSupportedThinkingLevels,
+        modelsStore: new InMemoryModelsStore(),
+        pi,
+      },
+    );
+    await access(providerExecutionMarker);
+    assert.equal(
+      reenabled.modelRoutes.some(({ provider }) => provider === "piu-toggle-contract"),
+      true,
+    );
+    await rm(providerExecutionMarker, { force: true });
     assert.deepEqual(await tree(join(fixtureRoot, "app")), appTreeBefore);
     assert.deepEqual(await tree(paths.home), standaloneTreeBefore);
     assert.equal(process.env.HOME, paths.home);

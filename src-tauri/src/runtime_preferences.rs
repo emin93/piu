@@ -60,12 +60,26 @@ pub enum ResourceScope {
     Project(i64),
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ResourcePreferenceCheckpoint {
+    scope: ResourceScope,
+    resource: RuntimeResource,
+    enabled: Option<bool>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeResource {
     ModelRoute(ModelRoute),
     Skill(String),
     Extension(String),
     Package(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResourceEnableOverride {
+    pub scope: ResourceScope,
+    pub resource: RuntimeResource,
+    pub enabled: bool,
 }
 
 impl RuntimeResource {
@@ -299,78 +313,10 @@ impl RuntimePreferences {
         scope: ResourceScope,
         route: &ModelRoute,
         enabled: bool,
-        fallback: Option<&ModelSelection>,
     ) -> Result<(), RuntimePreferencesError> {
         route.validate()?;
-        let fallback = fallback
-            .map(|selection| {
-                selection.route.validate()?;
-                let effort = selection
-                    .effort
-                    .as_deref()
-                    .filter(|effort| !effort.is_empty())
-                    .ok_or(RuntimePreferencesError::InvalidEffort)?;
-                Ok::<(&ModelRoute, &str), RuntimePreferencesError>((&selection.route, effort))
-            })
-            .transpose()?;
         let resource = RuntimeResource::model_route(route.clone());
-        let (kind, provider_id, resource_id) = resource.storage_identity()?;
-        let mut database = self
-            .database
-            .lock()
-            .map_err(|_| RuntimePreferencesError::LockPoisoned)?;
-        let transaction = database
-            .connection_mut()
-            .transaction()
-            .map_err(DatabaseError::Query)?;
-        match scope {
-            ResourceScope::Global => transaction.execute(
-                "INSERT INTO global_resource_enable_overrides (
-                   resource_kind, provider_id, resource_id, enabled
-                 ) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(resource_kind, provider_id, resource_id)
-                 DO UPDATE SET enabled = excluded.enabled",
-                params![kind, provider_id, resource_id, enabled],
-            ),
-            ResourceScope::Project(project_id) => {
-                validate_project_id(project_id)?;
-                transaction.execute(
-                    "INSERT INTO project_resource_enable_overrides (
-                       project_id, resource_kind, provider_id, resource_id, enabled
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(project_id, resource_kind, provider_id, resource_id)
-                     DO UPDATE SET enabled = excluded.enabled",
-                    params![project_id, kind, provider_id, resource_id, enabled],
-                )
-            }
-        }
-        .map_err(DatabaseError::Query)?;
-        if let Some((fallback_route, effort)) = fallback {
-            transaction
-                .execute(
-                    "INSERT INTO model_route_efforts (provider_id, model_id, effort)
-                     VALUES (?1, ?2, ?3)
-                     ON CONFLICT(provider_id, model_id) DO UPDATE SET effort = excluded.effort",
-                    params![
-                        fallback_route.provider_id(),
-                        fallback_route.model_id(),
-                        effort
-                    ],
-                )
-                .map_err(DatabaseError::Query)?;
-            transaction
-                .execute(
-                    "INSERT INTO runtime_model_selection (singleton, provider_id, model_id)
-                     VALUES (1, ?1, ?2)
-                     ON CONFLICT(singleton) DO UPDATE SET
-                        provider_id = excluded.provider_id,
-                        model_id = excluded.model_id",
-                    params![fallback_route.provider_id(), fallback_route.model_id()],
-                )
-                .map_err(DatabaseError::Query)?;
-        }
-        transaction.commit().map_err(DatabaseError::Query)?;
-        Ok(())
+        self.set_resource_enabled(scope, &resource, enabled)
     }
 
     pub fn resource_enabled(
@@ -407,6 +353,68 @@ impl RuntimePreferences {
         })
     }
 
+    pub(crate) fn inspector_resource_overrides(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<ResourceEnableOverride>, RuntimePreferencesError> {
+        validate_project_id(project_id)?;
+        self.with_connection(|connection| {
+            let mut overrides = Vec::new();
+            let mut global = connection
+                .prepare(
+                    "SELECT resource_kind, resource_id, enabled
+                     FROM global_resource_enable_overrides
+                     WHERE resource_kind IN ('extension', 'package')
+                     ORDER BY resource_kind, resource_id",
+                )
+                .map_err(DatabaseError::Query)?;
+            let rows = global
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                })
+                .map_err(DatabaseError::Query)?;
+            for row in rows {
+                let (kind, id, enabled) = row.map_err(DatabaseError::Query)?;
+                overrides.push(ResourceEnableOverride {
+                    scope: ResourceScope::Global,
+                    resource: inspector_resource(kind, id)?,
+                    enabled,
+                });
+            }
+
+            let mut project = connection
+                .prepare(
+                    "SELECT resource_kind, resource_id, enabled
+                     FROM project_resource_enable_overrides
+                     WHERE project_id = ?1 AND resource_kind IN ('extension', 'package')
+                     ORDER BY resource_kind, resource_id",
+                )
+                .map_err(DatabaseError::Query)?;
+            let rows = project
+                .query_map([project_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                })
+                .map_err(DatabaseError::Query)?;
+            for row in rows {
+                let (kind, id, enabled) = row.map_err(DatabaseError::Query)?;
+                overrides.push(ResourceEnableOverride {
+                    scope: ResourceScope::Project(project_id),
+                    resource: inspector_resource(kind, id)?,
+                    enabled,
+                });
+            }
+            Ok(overrides)
+        })
+    }
+
     pub fn clear_resource_override(
         &self,
         scope: ResourceScope,
@@ -433,6 +441,73 @@ impl RuntimePreferences {
             .map_err(DatabaseError::Query)?;
             Ok(())
         })
+    }
+
+    pub(crate) fn checkpoint_resource_change(
+        &self,
+        scope: ResourceScope,
+        resource: &RuntimeResource,
+    ) -> Result<ResourcePreferenceCheckpoint, RuntimePreferencesError> {
+        let enabled = self.resource_enabled(scope, resource)?;
+        Ok(ResourcePreferenceCheckpoint {
+            scope,
+            resource: resource.clone(),
+            enabled,
+        })
+    }
+
+    pub(crate) fn restore_resource_change(
+        &self,
+        checkpoint: ResourcePreferenceCheckpoint,
+    ) -> Result<(), RuntimePreferencesError> {
+        let (kind, provider_id, resource_id) = checkpoint.resource.storage_identity()?;
+        let mut database = self
+            .database
+            .lock()
+            .map_err(|_| RuntimePreferencesError::LockPoisoned)?;
+        let transaction = database
+            .connection_mut()
+            .transaction()
+            .map_err(DatabaseError::Query)?;
+        match (checkpoint.scope, checkpoint.enabled) {
+            (ResourceScope::Global, Some(enabled)) => transaction.execute(
+                "INSERT INTO global_resource_enable_overrides (
+                   resource_kind, provider_id, resource_id, enabled
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(resource_kind, provider_id, resource_id)
+                 DO UPDATE SET enabled = excluded.enabled",
+                params![kind, provider_id, resource_id, enabled],
+            ),
+            (ResourceScope::Global, None) => transaction.execute(
+                "DELETE FROM global_resource_enable_overrides
+                 WHERE resource_kind = ?1 AND provider_id = ?2 AND resource_id = ?3",
+                params![kind, provider_id, resource_id],
+            ),
+            (ResourceScope::Project(project_id), Some(enabled)) => {
+                validate_project_id(project_id)?;
+                transaction.execute(
+                    "INSERT INTO project_resource_enable_overrides (
+                       project_id, resource_kind, provider_id, resource_id, enabled
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(project_id, resource_kind, provider_id, resource_id)
+                     DO UPDATE SET enabled = excluded.enabled",
+                    params![project_id, kind, provider_id, resource_id, enabled],
+                )
+            }
+            (ResourceScope::Project(project_id), None) => {
+                validate_project_id(project_id)?;
+                transaction.execute(
+                    "DELETE FROM project_resource_enable_overrides
+                     WHERE project_id = ?1 AND resource_kind = ?2
+                       AND provider_id = ?3 AND resource_id = ?4",
+                    params![project_id, kind, provider_id, resource_id],
+                )
+            }
+        }
+        .map_err(DatabaseError::Query)?;
+
+        transaction.commit().map_err(DatabaseError::Query)?;
+        Ok(())
     }
 
     fn with_connection<T>(
@@ -508,5 +583,61 @@ fn validate_project_id(project_id: i64) -> Result<(), RuntimePreferencesError> {
         Ok(())
     } else {
         Err(RuntimePreferencesError::InvalidProjectId)
+    }
+}
+
+fn inspector_resource(
+    kind: String,
+    id: String,
+) -> Result<RuntimeResource, RuntimePreferencesError> {
+    match kind.as_str() {
+        "extension" => Ok(RuntimeResource::extension(id)),
+        "package" => Ok(RuntimeResource::package(id)),
+        _ => Err(RuntimePreferencesError::InvalidResourceIdentity),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_change_rollback_preserves_a_concurrent_model_selection() {
+        let root = tempfile::TempDir::new().unwrap();
+        let database_path = root.path().join("piu.sqlite3");
+        let preferences = RuntimePreferences::open(&database_path).unwrap();
+        let chat_preferences = RuntimePreferences::open(&database_path).unwrap();
+        let codex = ModelRoute::new("openai-codex", "gpt-5.6-sol").unwrap();
+        let qwen = ModelRoute::new("local-mlx", "qwen3.8-27b").unwrap();
+        preferences
+            .select_route_with_effort(&codex, "high")
+            .unwrap();
+        let resource = RuntimeResource::model_route(codex.clone());
+        let checkpoint = preferences
+            .checkpoint_resource_change(ResourceScope::Global, &resource)
+            .unwrap();
+
+        preferences
+            .set_model_route_enabled(ResourceScope::Global, &codex, false)
+            .unwrap();
+        chat_preferences
+            .select_route_with_effort(&qwen, "xhigh")
+            .unwrap();
+        preferences.restore_resource_change(checkpoint).unwrap();
+
+        assert_eq!(
+            preferences
+                .resource_enabled(ResourceScope::Global, &resource)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            preferences.current_selection().unwrap(),
+            Some(qwen.selection(Some("xhigh")))
+        );
+        assert_eq!(
+            preferences.remembered_effort(&qwen).unwrap().as_deref(),
+            Some("xhigh")
+        );
     }
 }

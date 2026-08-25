@@ -1,5 +1,6 @@
 import type { AgentEnvironmentSnapshot } from "@/generated/AgentEnvironmentSnapshot";
 import type { AgentResourceId } from "@/generated/AgentResourceId";
+import type { AgentResourcePreferenceChange } from "@/generated/AgentResourcePreferenceChange";
 import type { AgentResourcePreferenceScope } from "@/generated/AgentResourcePreferenceScope";
 import type { AgentEnvironmentAdapter } from "@/platform/agent-environment";
 
@@ -28,6 +29,23 @@ function errorMessage(error: unknown, fallback: string) {
     if (typeof message === "string" && message.trim()) return message;
   }
   return fallback;
+}
+
+function changeStatus(change: AgentResourcePreferenceChange) {
+  const notices: string[] = [];
+  if (change.restartFailedChatCount > 0) {
+    const chats = change.restartFailedChatCount === 1 ? "chat" : "chats";
+    notices.push(
+      `The change was saved, but Più couldn’t restart ${change.restartFailedChatCount} idle ${chats}. Open ${change.restartFailedChatCount === 1 ? "it" : "them"} to reconnect.`,
+    );
+  }
+  if (change.deferredChatCount > 0) {
+    const chats = change.deferredChatCount === 1 ? "chat" : "chats";
+    notices.push(
+      `${change.deferredChatCount} active ${chats} will use this change after the current step.`,
+    );
+  }
+  return notices.length > 0 ? notices.join(" ") : null;
 }
 
 export class AgentEnvironmentController {
@@ -72,7 +90,7 @@ export class AgentEnvironmentController {
   }
 
   load = async () => {
-    if (this.#projectId === null) return;
+    if (this.#projectId === null || this.#snapshot.phase === "changing") return;
     const generation = ++this.#generation;
     this.#retry = { kind: "load" };
     this.#publish({
@@ -112,7 +130,7 @@ export class AgentEnvironmentController {
     enabled: boolean,
     scope: AgentResourcePreferenceScope,
   ) => {
-    if (this.#projectId === null) return;
+    if (this.#projectId === null || this.#snapshot.phase === "changing") return;
     const generation = ++this.#generation;
     this.#retry = { enabled, kind: "resource", resource, scope };
     const previous = this.#snapshot.environment;
@@ -123,17 +141,9 @@ export class AgentEnvironmentController {
       phase: "changing",
       status: null,
     });
+    let change: AgentResourcePreferenceChange;
     try {
-      const change = await this.#adapter.setEnabled(this.#projectId, scope, resource, enabled);
-      const environment = await this.#adapter.get(this.#projectId);
-      if (generation !== this.#generation) return;
-      const chats = change.deferredChatCount === 1 ? "chat" : "chats";
-      const status =
-        change.status === "deferred" && change.deferredChatCount > 0
-          ? `${change.deferredChatCount} active ${chats} will use this change after the current step.`
-          : null;
-      this.#retry = { kind: "load" };
-      this.#publish({ environment, error: null, pendingResource: null, phase: "ready", status });
+      change = await this.#adapter.setEnabled(this.#projectId, scope, resource, enabled);
     } catch (cause) {
       if (generation !== this.#generation) return;
       this.#publish({
@@ -142,6 +152,26 @@ export class AgentEnvironmentController {
         pendingResource: null,
         phase: "failed",
         status: null,
+      });
+      return;
+    }
+    if (generation !== this.#generation) return;
+
+    const status = changeStatus(change);
+    this.#retry = { kind: "load" };
+    try {
+      const environment = await this.#adapter.get(this.#projectId);
+      if (generation !== this.#generation) return;
+      this.#publish({ environment, error: null, pendingResource: null, phase: "ready", status });
+    } catch {
+      if (generation !== this.#generation) return;
+      this.#publish({
+        environment: null,
+        error:
+          "The change was saved, but Più couldn’t refresh models and resources. Retry to load the saved state.",
+        pendingResource: null,
+        phase: "failed",
+        status,
       });
     }
   };

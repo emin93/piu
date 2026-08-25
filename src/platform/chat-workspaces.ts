@@ -7,7 +7,9 @@ import type { ChatTerminalRequest } from "../generated/ChatTerminalRequest";
 import type { ChatWorkspaceCommandError } from "../generated/ChatWorkspaceCommandError";
 import type { ChatWorkspaceCommandErrorCode } from "../generated/ChatWorkspaceCommandErrorCode";
 import type { CreateChatResponse } from "../generated/CreateChatResponse";
+import type { ModelRouteId } from "../generated/ModelRouteId";
 import type { PromptAttachment } from "../generated/PromptAttachment";
+import type { ReasoningEffort } from "../generated/ReasoningEffort";
 
 export type { ChatSetupChangedEvent } from "../generated/ChatSetupChangedEvent";
 export type { ChatSetupSummary } from "../generated/ChatSetupSummary";
@@ -22,15 +24,18 @@ const CHAT_WORKSPACE_ERROR_CODES = new Set<ChatWorkspaceCommandErrorCode>([
   "creationFailed",
   "storageUnavailable",
   "invalidAttachment",
+  "inferenceUnavailable",
 ]);
 
 export function createChat(
   projectId: number,
   prompt: string,
   attachments: readonly PromptAttachment[],
+  route: ModelRouteId,
+  effort: ReasoningEffort,
 ) {
   return invoke<CreateChatResponse>("create_chat", {
-    request: { attachments, projectId, prompt },
+    request: { attachments, effort, projectId, prompt, route },
   });
 }
 

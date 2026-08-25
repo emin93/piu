@@ -18,15 +18,48 @@ use piu_lib::{
     git_process::GitProcess,
     project_inbox::{ChatSetupPhase, ProjectInbox},
     prompt_attachments::{PromptAttachment, PromptAttachmentError, PromptAttachmentKind},
-    runtime_preferences::RuntimePreferences,
+    runtime_preferences::{
+        ModelRoute, ModelSelection, ResourceScope, RuntimePreferences, RuntimeResource,
+    },
 };
 use support::{TemporaryAppData, TemporaryGitRemote};
+use tauri::{
+    WebviewWindowBuilder,
+    ipc::{CallbackFn, InvokeBody},
+    test,
+    webview::InvokeRequest,
+};
 
 const FIXTURE_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn default_model_selection() -> ModelSelection {
+    ModelRoute::new("openai-codex", "gpt-5.6-sol")
+        .unwrap()
+        .selection(Some("xhigh"))
+}
 
 fn project_skill() -> AgentResourceId {
     AgentResourceId::Skill {
         id: "project://skills/check".into(),
+    }
+}
+
+fn project_extension() -> AgentResourceId {
+    AgentResourceId::Extension {
+        id: "project://extensions/review".into(),
+    }
+}
+
+fn codex_route() -> ModelRouteId {
+    ModelRouteId {
+        provider: "openai-codex".into(),
+        model_id: "gpt-5.6-sol".into(),
+    }
+}
+
+fn codex_resource() -> AgentResourceId {
+    AgentResourceId::ModelRoute {
+        route: codex_route(),
     }
 }
 
@@ -55,6 +88,38 @@ async fn model_controls_do_not_turn_a_completed_chat_into_a_stopped_chat() {
 
     fixture.host.model_controls(&fixture.chat_id).await.unwrap();
 
+    assert_eq!(
+        fixture.host.snapshot(&fixture.chat_id).unwrap().phase,
+        ConversationPhase::Idle
+    );
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_completed_chat_can_switch_model_and_effort_without_changing_its_phase() {
+    let fixture = ChatFixture::with_options(true, true, "streaming");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(0).await;
+
+    let switched = fixture
+        .host
+        .select_model_route(
+            &fixture.chat_id,
+            ModelRouteId {
+                provider: "local-mlx".into(),
+                model_id: "qwen3.8-27b".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let adjusted = fixture
+        .host
+        .select_reasoning_effort(&fixture.chat_id, ReasoningEffort::Medium)
+        .await
+        .unwrap();
+
+    assert_eq!(switched.selected_route.provider, "local-mlx");
+    assert_eq!(adjusted.selected_effort, ReasoningEffort::Medium);
     assert_eq!(
         fixture.host.snapshot(&fixture.chat_id).unwrap().phase,
         ConversationPhase::Idle
@@ -162,6 +227,179 @@ async fn an_idle_affected_child_restarts_on_the_exact_session_and_worktree() {
 }
 
 #[tokio::test]
+async fn a_committed_resource_change_reports_when_the_idle_chat_cannot_restart() {
+    let fixture = ChatFixture::with_options(true, true, "streaming");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(0).await;
+    fixture.host.model_controls(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(1).await;
+    let project_id = fixture.inbox.snapshot().unwrap().projects[0].id;
+    fs::remove_file(
+        fixture
+            .resource_directory
+            .join("agent-runtime/pi/launcher/chat-launcher.mjs"),
+    )
+    .unwrap();
+    let change = fixture
+        .environment
+        .set_resource_enabled(
+            project_id,
+            AgentResourcePreferenceScope::Project,
+            project_skill(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let applied = fixture
+        .host
+        .refresh_resources(project_id, change)
+        .await
+        .unwrap();
+
+    assert_eq!(applied.status, AgentResourceRefreshStatus::RestartFailed);
+    assert_eq!(applied.deferred_chat_count, 0);
+    assert_eq!(applied.restart_failed_chat_count, 1);
+    fixture.wait_for_live_children(0).await;
+}
+
+#[tokio::test]
+async fn a_refresh_without_a_live_child_prepares_the_next_send_off_the_critical_path() {
+    let fixture = ChatFixture::with_options(true, true, "streaming");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(0).await;
+    let project_id = fixture.inbox.snapshot().unwrap().projects[0].id;
+    let change = fixture
+        .environment
+        .set_resource_enabled(
+            project_id,
+            AgentResourcePreferenceScope::Project,
+            project_skill(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let applied = fixture
+        .host
+        .refresh_resources(project_id, change)
+        .await
+        .unwrap();
+    fs::remove_file(
+        fixture
+            .resource_directory
+            .join("agent-runtime/pi/launcher/environment-launcher.zsh"),
+    )
+    .unwrap();
+    fixture
+        .host
+        .send(&fixture.chat_id, "Continue with the refreshed resources")
+        .await
+        .unwrap();
+
+    assert_eq!(applied.status, AgentResourceRefreshStatus::Applied);
+    assert_eq!(applied.deferred_chat_count, 0);
+    assert_eq!(applied.restart_failed_chat_count, 0);
+    assert_eq!(fixture.session_launch_count(&fixture.chat_id), 2);
+    let arguments = fixture.record(&format!(
+        "arguments-{}",
+        fixture.session_id(&fixture.chat_id)
+    ));
+    assert!(!arguments.contains(".pi/skills/check/SKILL.md"));
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_planning_failure_rolls_back_the_preference_and_preserves_the_previous_host_cache() {
+    let fixture = ChatFixture::with_options(true, true, "streaming");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(0).await;
+    fixture.host.model_controls(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(1).await;
+    let project_id = fixture.inbox.snapshot().unwrap().projects[0].id;
+    let preferences = RuntimePreferences::open(&fixture._app_data.database_path()).unwrap();
+    let resource = RuntimeResource::skill("project://skills/check");
+    assert_eq!(
+        preferences
+            .resource_enabled(ResourceScope::Project(project_id), &resource)
+            .unwrap(),
+        None
+    );
+    let launches_before = fixture.session_launch_count(&fixture.chat_id);
+    let inspections_before = fixture.environment_inspection_count();
+    let unavailable_worktree = fixture.worktree.with_extension("planning-failure");
+    fs::rename(&fixture.worktree, &unavailable_worktree).unwrap();
+    let app = piu_lib::configure_builder(
+        test::mock_builder()
+            .manage(Arc::clone(&fixture.environment))
+            .manage(fixture.host.clone()),
+    )
+    .build(test::mock_context(test::noop_assets()))
+    .unwrap();
+    let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+
+    let error = test::get_ipc_response(
+        &webview,
+        InvokeRequest {
+            cmd: "set_agent_resource_enabled".into(),
+            callback: CallbackFn(0),
+            error: CallbackFn(1),
+            url: "tauri://localhost".parse().unwrap(),
+            body: InvokeBody::Json(serde_json::json!({
+                "request": {
+                    "projectId": project_id,
+                    "scope": "project",
+                    "resource": { "kind": "skill", "id": "project://skills/check" },
+                    "enabled": false
+                }
+            })),
+            headers: Default::default(),
+            invoke_key: test::INVOKE_KEY.into(),
+        },
+    )
+    .expect_err("worktree remapping should fail after environment inspection");
+    assert_eq!(error["code"], "inspectionFailed");
+    assert!(fixture.environment_inspection_count() >= inspections_before + 2);
+    assert_eq!(
+        preferences
+            .resource_enabled(ResourceScope::Project(project_id), &resource)
+            .unwrap(),
+        None,
+        "the command must restore the exact absent preference override"
+    );
+
+    fs::rename(&unavailable_worktree, &fixture.worktree).unwrap();
+    fs::remove_file(
+        fixture
+            .resource_directory
+            .join("agent-runtime/pi/launcher/environment-launcher.zsh"),
+    )
+    .unwrap();
+    fixture.host.stop_runtime(&fixture.chat_id).await.unwrap();
+    fixture
+        .host
+        .send(&fixture.chat_id, "Continue with the previous resources")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fixture.session_launch_count(&fixture.chat_id),
+        launches_before + 1
+    );
+    let arguments = fixture.record(&format!(
+        "arguments-{}",
+        fixture.session_id(&fixture.chat_id)
+    ));
+    assert!(
+        arguments.contains(".pi/skills/check/SKILL.md"),
+        "a launch after rollback must use the previous cached effective environment"
+    );
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn an_active_affected_child_keeps_running_and_reports_the_deferred_refresh() {
     let fixture = ChatFixture::new(true);
     fixture.host.open(&fixture.chat_id).await.unwrap();
@@ -213,6 +451,219 @@ async fn an_active_affected_child_keeps_running_and_reports_the_deferred_refresh
         fixture.host.snapshot(&fixture.chat_id).unwrap().phase,
         ConversationPhase::Running
     );
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn disabling_an_idle_chat_route_applies_the_enabled_fallback_without_restarting() {
+    let fixture = ChatFixture::with_options(true, true, "streaming");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(0).await;
+    fixture.host.model_controls(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(1).await;
+    let launches_before = fixture.session_launch_count(&fixture.chat_id);
+    let project_id = fixture.inbox.snapshot().unwrap().projects[0].id;
+    let change = fixture
+        .environment
+        .set_resource_enabled(
+            project_id,
+            AgentResourcePreferenceScope::Global,
+            codex_resource(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let applied = fixture
+        .host
+        .refresh_resources(project_id, change)
+        .await
+        .unwrap();
+    let controls = fixture.host.model_controls(&fixture.chat_id).await.unwrap();
+
+    assert_eq!(applied.status, AgentResourceRefreshStatus::Applied);
+    assert_eq!(applied.deferred_chat_count, 0);
+    assert_eq!(
+        fixture.session_launch_count(&fixture.chat_id),
+        launches_before
+    );
+    assert_eq!(controls.routes.len(), 1);
+    assert_eq!(controls.selected_route.provider, "local-mlx");
+    assert!(
+        fixture
+            .record("commands")
+            .contains("\"type\":\"set_model\"")
+    );
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn disabling_a_running_chat_route_waits_for_the_terminal_boundary() {
+    let fixture = ChatFixture::with_options(true, true, "controlled-completion");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(1).await;
+    let launches_before = fixture.session_launch_count(&fixture.chat_id);
+    let project_id = fixture.inbox.snapshot().unwrap().projects[0].id;
+    let change = fixture
+        .environment
+        .set_resource_enabled(
+            project_id,
+            AgentResourcePreferenceScope::Global,
+            codex_resource(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let applied = fixture
+        .host
+        .refresh_resources(project_id, change)
+        .await
+        .unwrap();
+    assert_eq!(applied.status, AgentResourceRefreshStatus::Deferred);
+    assert_eq!(applied.deferred_chat_count, 1);
+    assert_eq!(
+        fixture.session_launch_count(&fixture.chat_id),
+        launches_before
+    );
+
+    fs::write(
+        fixture
+            ._app_data
+            .path()
+            .join("host-fixture")
+            .join(format!("complete-{}", fixture.session_id(&fixture.chat_id))),
+        "complete\n",
+    )
+    .unwrap();
+    tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+        loop {
+            if fixture.session_launch_count(&fixture.chat_id) == launches_before + 1
+                && fixture
+                    .record(&format!(
+                        "arguments-{}",
+                        fixture.session_id(&fixture.chat_id)
+                    ))
+                    .contains("--model-provider\nlocal-mlx\n")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the enabled fallback should apply after the active turn completes");
+
+    let controls = fixture.host.model_controls(&fixture.chat_id).await.unwrap();
+    assert_eq!(controls.routes.len(), 1);
+    assert_eq!(controls.selected_route.provider, "local-mlx");
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn disabling_an_inactive_chat_route_reconciles_before_its_next_send() {
+    let fixture = ChatFixture::with_options(true, true, "streaming");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture.wait_for_live_children(0).await;
+    let project_id = fixture.inbox.snapshot().unwrap().projects[0].id;
+    let change = fixture
+        .environment
+        .set_resource_enabled(
+            project_id,
+            AgentResourcePreferenceScope::Global,
+            codex_resource(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let applied = fixture
+        .host
+        .refresh_resources(project_id, change)
+        .await
+        .unwrap();
+    fixture
+        .host
+        .send(&fixture.chat_id, "Continue on the enabled model")
+        .await
+        .unwrap();
+
+    assert_eq!(applied.status, AgentResourceRefreshStatus::Applied);
+    let arguments = fixture.record(&format!(
+        "arguments-{}",
+        fixture.session_id(&fixture.chat_id)
+    ));
+    assert!(arguments.contains("--model-provider\nlocal-mlx\n"));
+    assert!(arguments.contains("--model-id\nqwen3.8-27b\n"));
+    assert!(
+        fixture
+            .record("commands")
+            .contains("\"message\":\"Continue on the enabled model\"")
+    );
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn disabling_a_provider_extension_reopens_an_idle_chat_on_an_enabled_route() {
+    let fixture = ChatFixture::with_options(true, true, "streaming");
+    let project_id = fixture.inbox.snapshot().unwrap().projects[0].id;
+    fixture
+        .environment
+        .select_model_route(
+            project_id,
+            ModelRouteId {
+                provider: "local-mlx".into(),
+                model_id: "qwen3.8-27b".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let local_chat = fixture.create_chat("Inspect the runtime");
+    fixture.host.open(&local_chat).await.unwrap();
+    fixture.wait_for_live_children(0).await;
+    fixture.host.model_controls(&local_chat).await.unwrap();
+    fixture.wait_for_live_children(1).await;
+    let launches_before = fixture.session_launch_count(&local_chat);
+
+    let change = fixture
+        .environment
+        .set_resource_enabled(
+            project_id,
+            AgentResourcePreferenceScope::Project,
+            project_extension(),
+            false,
+        )
+        .await
+        .unwrap();
+    let applied = fixture
+        .host
+        .refresh_resources(project_id, change)
+        .await
+        .unwrap();
+
+    assert_eq!(applied.status, AgentResourceRefreshStatus::Applied);
+    assert_eq!(
+        fixture.session_launch_count(&local_chat),
+        launches_before + 1
+    );
+    let arguments = fixture.record(&format!("arguments-{}", fixture.session_id(&local_chat)));
+    assert!(arguments.contains("--model-provider\nopenai-codex\n"));
+    assert!(!arguments.contains("--model-provider\nlocal-mlx\n"));
+    assert!(
+        !arguments.contains(
+            fixture
+                ._app_data
+                .path()
+                .join("worktrees")
+                .join(&local_chat)
+                .join(".pi/extensions/review.mjs")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    let controls = fixture.host.model_controls(&local_chat).await.unwrap();
+    assert_eq!(controls.routes.len(), 1);
+    assert_eq!(controls.selected_route.provider, "openai-codex");
     fixture.host.shutdown_all().await;
 }
 
@@ -315,7 +766,12 @@ async fn a_resource_refresh_does_not_restart_a_project_with_an_effective_overrid
         .project;
     let second_chat = fixture
         .workspaces
-        .create_chat(second_project.id, "Inspect the runtime", &[])
+        .create_chat(
+            second_project.id,
+            "Inspect the runtime",
+            &[],
+            default_model_selection(),
+        )
         .unwrap()
         .chat;
     fixture
@@ -378,6 +834,101 @@ async fn a_resource_refresh_does_not_restart_a_project_with_an_effective_overrid
         "the second project's effective override should leave its idle child untouched"
     );
     assert_eq!(fixture.live_children(), 2);
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_global_refresh_drops_an_inaccessible_inactive_project_cache() {
+    let fixture = ChatFixture::with_options(true, true, "streaming");
+    let second_remote = TemporaryGitRemote::new();
+    fs::write(second_remote.working_path().join("README.md"), "second\n").unwrap();
+    second_remote.git(["add", "."]);
+    second_remote.git(["commit", "-m", "second fixture"]);
+    second_remote.git(["push", "-u", "origin", "main"]);
+    let second_project = fixture
+        .inbox
+        .open_repository(second_remote.working_path())
+        .unwrap()
+        .project;
+    let second_chat = fixture
+        .workspaces
+        .create_chat(
+            second_project.id,
+            "Cache the second project",
+            &[],
+            default_model_selection(),
+        )
+        .unwrap()
+        .chat;
+    fixture
+        .workspaces
+        .start_setup(&second_chat.id, Arc::new(|_| {}))
+        .unwrap();
+    fixture.host.open(&second_chat.id).await.unwrap();
+    fixture.wait_for_live_children(0).await;
+    let moved_repository = second_remote.working_path().with_extension("moved");
+    fs::rename(second_remote.working_path(), &moved_repository).unwrap();
+    let first_project_id = fixture.inbox.snapshot().unwrap().projects[0].id;
+
+    let change = fixture
+        .environment
+        .set_resource_enabled(
+            first_project_id,
+            AgentResourcePreferenceScope::Global,
+            project_skill(),
+            false,
+        )
+        .await
+        .unwrap();
+    let applied = fixture
+        .host
+        .refresh_resources(first_project_id, change)
+        .await
+        .unwrap();
+
+    assert_eq!(applied.status, AgentResourceRefreshStatus::Applied);
+    assert_eq!(applied.restart_failed_chat_count, 0);
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_refresh_inspects_an_affected_project_once_for_all_of_its_chats() {
+    let fixture = ChatFixture::with_options(true, true, "streaming");
+    let second_chat = fixture.create_chat("Inspect the runtime");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    fixture.host.open(&second_chat).await.unwrap();
+    fixture.wait_for_live_children(0).await;
+    fixture.host.model_controls(&fixture.chat_id).await.unwrap();
+    fixture.host.model_controls(&second_chat).await.unwrap();
+    fixture.wait_for_live_children(2).await;
+    let inspections_before = fixture.environment_inspection_count();
+    let project_id = fixture.inbox.snapshot().unwrap().projects[0].id;
+    let change = fixture
+        .environment
+        .set_resource_enabled(
+            project_id,
+            AgentResourcePreferenceScope::Global,
+            project_skill(),
+            false,
+        )
+        .await
+        .unwrap();
+    let inspections_after_commit = fixture.environment_inspection_count();
+
+    let applied = fixture
+        .host
+        .refresh_resources(project_id, change)
+        .await
+        .unwrap();
+
+    assert_eq!(applied.status, AgentResourceRefreshStatus::Applied);
+    assert_eq!(applied.restart_failed_chat_count, 0);
+    assert_eq!(
+        fixture.environment_inspection_count(),
+        inspections_after_commit + 1,
+        "refresh should discover once for the project, not once per chat"
+    );
+    assert!(inspections_after_commit > inspections_before);
     fixture.host.shutdown_all().await;
 }
 
@@ -511,6 +1062,49 @@ async fn a_partial_model_change_rolls_back_the_previous_route_and_effort() {
 }
 
 #[tokio::test]
+async fn a_rejected_model_change_with_a_rejected_rollback_reopens_the_exact_session() {
+    let fixture = ChatFixture::with_options(true, true, "reject-model");
+    fixture.host.open(&fixture.chat_id).await.unwrap();
+    let session = fixture
+        .inbox
+        .chat_session(&fixture.chat_id)
+        .unwrap()
+        .expect("the active chat should already have an exact session");
+
+    let error = fixture
+        .host
+        .select_model_route(
+            &fixture.chat_id,
+            ModelRouteId {
+                provider: "local-mlx".into(),
+                model_id: "qwen3.8-27b".into(),
+            },
+        )
+        .await
+        .expect_err("a rejected change and rollback must not claim the old route is active");
+
+    assert!(matches!(
+        error,
+        ChatRuntimeHostError::InferenceRollbackFailed
+    ));
+    assert_eq!(fixture.session_launch_count(&fixture.chat_id), 2);
+    assert_eq!(fixture.live_children(), 1);
+    assert_eq!(
+        fixture.inbox.chat_session(&fixture.chat_id).unwrap(),
+        Some(session)
+    );
+    assert!(
+        fixture
+            .record(&format!(
+                "arguments-{}",
+                fixture.session_id(&fixture.chat_id)
+            ))
+            .contains("--model-id\ngpt-5.6-sol\n")
+    );
+    fixture.host.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn a_new_chat_launches_with_its_captured_route_across_host_relaunch() {
     let fixture = ChatFixture::new(true);
     fixture.host.open(&fixture.chat_id).await.unwrap();
@@ -606,7 +1200,12 @@ impl ChatFixture {
             app_data.path().join("worktrees"),
         ));
         let chat = workspaces
-            .create_chat(project.id, "Inspect the runtime", &[])
+            .create_chat(
+                project.id,
+                "Inspect the runtime",
+                &[],
+                default_model_selection(),
+            )
             .expect("create chat")
             .chat;
         if run_setup {
@@ -654,14 +1253,26 @@ impl ChatFixture {
             std::ffi::OsString::from("PIU_ENVIRONMENT_FIXTURE_RECORD_DIR"),
             app_data.path().join("environment-fixture").into_os_string(),
         );
+        let environment_launcher =
+            resource_directory.join("agent-runtime/pi/launcher/environment-launcher.zsh");
+        let environment_fixture = fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/agent-environment-child.zsh"),
+        )
+        .unwrap()
+        .replacen(
+            "mkdir -p \"$record_dir\"",
+            "mkdir -p \"$record_dir\"\nprint -r -- inspection >> \"$record_dir/inspections\"",
+            1,
+        );
+        fs::write(&environment_launcher, environment_fixture).unwrap();
         let environment = Arc::new(
             AgentEnvironment::new(
                 Arc::clone(&inbox),
                 Arc::new(RuntimePreferences::open(&app_data.database_path()).unwrap()),
                 AgentEnvironmentProcessSpec {
                     executable: std::path::PathBuf::from("/bin/zsh"),
-                    launcher: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("tests/fixtures/agent-environment-child.zsh"),
+                    launcher: environment_launcher,
                     agent_directory: app_data.path().join("agent"),
                     credential_lock_directory: app_data.path().join("credential-locks"),
                     environment: environment_variables,
@@ -712,7 +1323,12 @@ impl ChatFixture {
         let project_id = self.inbox.snapshot().unwrap().projects.first().unwrap().id;
         let chat = self
             .workspaces
-            .create_chat(project_id, prompt, attachments)
+            .create_chat(
+                project_id,
+                prompt,
+                attachments,
+                self.current_model_selection(),
+            )
             .unwrap()
             .chat;
         let setup = self
@@ -735,6 +1351,14 @@ impl ChatFixture {
         .expect("create fresh runtime host")
     }
 
+    fn current_model_selection(&self) -> ModelSelection {
+        RuntimePreferences::open(&self._app_data.database_path())
+            .unwrap()
+            .current_selection()
+            .unwrap()
+            .unwrap_or_else(default_model_selection)
+    }
+
     fn session_id(&self, chat_id: &str) -> String {
         format!("pi-{chat_id}")
     }
@@ -754,6 +1378,16 @@ impl ChatFixture {
         fs::read_dir(self._app_data.path().join("host-fixture/live"))
             .map(|entries| entries.count())
             .unwrap_or_default()
+    }
+
+    fn environment_inspection_count(&self) -> usize {
+        fs::read_to_string(
+            self._app_data
+                .path()
+                .join("environment-fixture/inspections"),
+        )
+        .map(|inspections| inspections.lines().count())
+        .unwrap_or_default()
     }
 
     async fn wait_for_live_children(&self, expected: usize) {

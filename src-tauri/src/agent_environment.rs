@@ -7,11 +7,12 @@ use std::{
     time::Duration,
 };
 
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    sync::Mutex as AsyncMutex,
+    sync::{Mutex as AsyncMutex, OwnedMutexGuard},
     time::timeout,
 };
 use ts_rs::TS;
@@ -19,11 +20,14 @@ use ts_rs::TS;
 use crate::{
     chat_runtime_host::{ModelControlsSnapshot, ModelRouteId, ModelRouteSummary, ReasoningEffort},
     owned_process::{OwnedProcessGroup, spawn_owned_piped_process},
-    project_inbox::{ProjectInbox, ProjectInboxError},
+    project_inbox::{ProjectAvailability, ProjectInbox, ProjectInboxError},
     runtime_preferences::{
-        ModelRoute, ResourceScope, RuntimePreferences, RuntimePreferencesError, RuntimeResource,
+        ModelRoute, ResourceEnableOverride, ResourcePreferenceCheckpoint, ResourceScope,
+        RuntimePreferences, RuntimePreferencesError, RuntimeResource,
     },
 };
+
+const MAX_INSPECTOR_PREFERENCES_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct AgentEnvironmentProcessSpec {
@@ -32,6 +36,55 @@ pub struct AgentEnvironmentProcessSpec {
     pub agent_directory: PathBuf,
     pub credential_lock_directory: PathBuf,
     pub environment: BTreeMap<OsString, OsString>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InspectorResourcePreferences {
+    global: Vec<InspectorResourcePreference>,
+    project: Vec<InspectorResourcePreference>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum InspectorResourcePreference {
+    Extension { id: String, enabled: bool },
+    Package { id: String, enabled: bool },
+}
+
+impl InspectorResourcePreferences {
+    fn from_overrides(
+        project_id: i64,
+        overrides: Vec<ResourceEnableOverride>,
+    ) -> Result<Self, AgentEnvironmentError> {
+        let mut preferences = Self {
+            global: Vec::new(),
+            project: Vec::new(),
+        };
+        for preference in overrides {
+            let resource = match preference.resource {
+                RuntimeResource::Extension(id) => InspectorResourcePreference::Extension {
+                    id,
+                    enabled: preference.enabled,
+                },
+                RuntimeResource::Package(id) => InspectorResourcePreference::Package {
+                    id,
+                    enabled: preference.enabled,
+                },
+                RuntimeResource::ModelRoute(_) | RuntimeResource::Skill(_) => {
+                    return Err(AgentEnvironmentError::InvalidSnapshot);
+                }
+            };
+            match preference.scope {
+                ResourceScope::Global => preferences.global.push(resource),
+                ResourceScope::Project(id) if id == project_id => {
+                    preferences.project.push(resource);
+                }
+                ResourceScope::Project(_) => return Err(AgentEnvironmentError::InvalidSnapshot),
+            }
+        }
+        Ok(preferences)
+    }
 }
 
 impl AgentEnvironmentProcessSpec {
@@ -147,6 +200,7 @@ pub struct AgentModelRoute {
     pub accepts_images: bool,
     pub thinking_levels: Vec<ReasoningEffort>,
     pub enabled: bool,
+    pub source: AgentResourceSource,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -199,6 +253,12 @@ pub struct AgentLaunchResources {
     pub skill_paths: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AgentProjectRuntimeEnvironment {
+    pub launch_resources: AgentLaunchResources,
+    pub model_controls: ModelControlsSnapshot,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 #[ts(export, export_to = "../../src/generated/")]
@@ -223,6 +283,7 @@ pub enum AgentResourcePreferenceScope {
 pub enum AgentResourceRefreshStatus {
     Applied,
     Deferred,
+    RestartFailed,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -234,6 +295,7 @@ pub struct AgentResourcePreferenceChange {
     pub enabled: bool,
     pub status: AgentResourceRefreshStatus,
     pub deferred_chat_count: u32,
+    pub restart_failed_chat_count: u32,
 }
 
 #[derive(Debug, Error)]
@@ -277,7 +339,23 @@ pub struct AgentEnvironment {
     preferences: Arc<RuntimePreferences>,
     process: AgentEnvironmentProcessSpec,
     policy: AgentEnvironmentPolicy,
-    preference_change: AsyncMutex<()>,
+    preference_change: Arc<AsyncMutex<()>>,
+}
+
+pub(crate) struct AgentResourcePreferenceCommit {
+    change: AgentResourcePreferenceChange,
+    checkpoint: ResourcePreferenceCheckpoint,
+    _guard: OwnedMutexGuard<()>,
+}
+
+impl AgentResourcePreferenceCommit {
+    pub(crate) fn change(&self) -> AgentResourcePreferenceChange {
+        self.change.clone()
+    }
+
+    pub(crate) fn finish(self) -> AgentResourcePreferenceChange {
+        self.change
+    }
 }
 
 impl AgentEnvironment {
@@ -312,7 +390,7 @@ impl AgentEnvironment {
             preferences,
             process,
             policy,
-            preference_change: AsyncMutex::new(()),
+            preference_change: Arc::new(AsyncMutex::new(())),
         })
     }
 
@@ -331,11 +409,53 @@ impl AgentEnvironment {
         Ok(self.snapshot(project_id).await?.model_controls)
     }
 
+    pub async fn validate_model_selection(
+        &self,
+        project_id: i64,
+        route: ModelRouteId,
+        effort: ReasoningEffort,
+    ) -> Result<crate::runtime_preferences::ModelSelection, AgentEnvironmentError> {
+        let snapshot = self.snapshot(project_id).await?;
+        let selected = snapshot
+            .model_routes
+            .iter()
+            .find(|candidate| candidate.enabled && candidate.id == route)
+            .ok_or_else(|| AgentEnvironmentError::ModelUnavailable {
+                provider: route.provider.clone(),
+                model_id: route.model_id.clone(),
+            })?;
+        if !selected.thinking_levels.contains(&effort) {
+            return Err(AgentEnvironmentError::EffortUnavailable { effort });
+        }
+        Ok(persisted_route(&route)?.selection(Some(effort.as_pi())))
+    }
+
     pub async fn launch_resources(
         &self,
         project_id: i64,
     ) -> Result<AgentLaunchResources, AgentEnvironmentError> {
         let discovered = self.discover(project_id).await?;
+        self.launch_resources_from_discovered(project_id, &discovered)
+    }
+
+    pub(crate) async fn project_runtime_environment(
+        &self,
+        project_id: i64,
+    ) -> Result<AgentProjectRuntimeEnvironment, AgentEnvironmentError> {
+        let discovered = self.discover(project_id).await?;
+        let launch_resources = self.launch_resources_from_discovered(project_id, &discovered)?;
+        let model_controls = self.materialize(project_id, discovered)?.model_controls;
+        Ok(AgentProjectRuntimeEnvironment {
+            launch_resources,
+            model_controls,
+        })
+    }
+
+    fn launch_resources_from_discovered(
+        &self,
+        project_id: i64,
+        discovered: &DiscoveredEnvironment,
+    ) -> Result<AgentLaunchResources, AgentEnvironmentError> {
         let extension_paths = discovered
             .resources
             .extensions
@@ -436,11 +556,11 @@ impl AgentEnvironment {
             .preferences
             .remembered_effort(&persisted)?
             .as_deref()
-            .and_then(reasoning_effort)
+            .and_then(ReasoningEffort::from_pi)
             .filter(|effort| selected.thinking_levels.contains(effort))
             .unwrap_or(selected.thinking_levels[0]);
         self.preferences
-            .select_route_with_effort(&persisted, effort_as_pi(effort))?;
+            .select_route_with_effort(&persisted, effort.as_pi())?;
         let mut controls = controls_for(&available.model_routes, &selected.id, effort)?;
         controls.applies_after_current_step = false;
         Ok(controls)
@@ -463,7 +583,7 @@ impl AgentEnvironment {
             return Err(AgentEnvironmentError::EffortUnavailable { effort });
         }
         self.preferences
-            .select_route_with_effort(&persisted_route(&selected.id)?, effort_as_pi(effort))?;
+            .select_route_with_effort(&persisted_route(&selected.id)?, effort.as_pi())?;
         controls_for(&available.model_routes, &selected.id, effort)
     }
 
@@ -474,7 +594,20 @@ impl AgentEnvironment {
         resource: AgentResourceId,
         enabled: bool,
     ) -> Result<AgentResourcePreferenceChange, AgentEnvironmentError> {
-        let _change = self.preference_change.lock().await;
+        Ok(self
+            .commit_resource_enabled(project_id, scope, resource, enabled)
+            .await?
+            .finish())
+    }
+
+    pub(crate) async fn commit_resource_enabled(
+        &self,
+        project_id: i64,
+        scope: AgentResourcePreferenceScope,
+        resource: AgentResourceId,
+        enabled: bool,
+    ) -> Result<AgentResourcePreferenceCommit, AgentEnvironmentError> {
+        let guard = Arc::clone(&self.preference_change).lock_owned().await;
         let discovered = self.discover(project_id).await?;
         if !discovered.contains(&resource) {
             return Err(AgentEnvironmentError::ResourceUnavailable);
@@ -483,69 +616,300 @@ impl AgentEnvironment {
             AgentResourcePreferenceScope::Global => ResourceScope::Global,
             AgentResourcePreferenceScope::Project => ResourceScope::Project(project_id),
         };
+        if !enabled && self.resource_can_affect_models(scope, &resource, &discovered) {
+            self.validate_resource_disable(project_id, scope, &resource, &discovered)
+                .await?;
+        }
         if let AgentResourceId::ModelRoute { route } = &resource {
-            let available = self.materialize(project_id, discovered)?;
-            let target = available
-                .model_routes
-                .iter()
-                .find(|candidate| candidate.id == *route)
-                .ok_or(AgentEnvironmentError::ResourceUnavailable)?;
             let target_persisted = persisted_route(route)?;
-            let persisted_selection_is_target = self
+            let persisted_resource = RuntimeResource::model_route(target_persisted.clone());
+            let checkpoint = self
                 .preferences
-                .current_selection()?
-                .is_some_and(|selection| selection.route == target_persisted);
-            let fallback = if !enabled
-                && (persisted_selection_is_target
-                    || available.model_controls.selected_route == target.id)
-            {
-                let mut fallback = None;
-                for candidate in &available.model_routes {
-                    if candidate.id != target.id
-                        && self.route_enabled_for_scope(project_id, candidate, scope)?
-                    {
-                        fallback = Some(candidate);
-                        break;
-                    }
-                }
-                let fallback =
-                    fallback.ok_or(AgentEnvironmentError::CannotDisableLastModelRoute)?;
-                let fallback_route = persisted_route(&fallback.id)?;
-                let effort = self
-                    .preferences
-                    .remembered_effort(&fallback_route)?
-                    .as_deref()
-                    .and_then(reasoning_effort)
-                    .filter(|effort| fallback.thinking_levels.contains(effort))
-                    .unwrap_or(fallback.thinking_levels[0]);
-                Some(fallback_route.selection(Some(effort_as_pi(effort))))
-            } else {
-                None
-            };
+                .checkpoint_resource_change(persisted_scope, &persisted_resource)?;
             self.preferences.set_model_route_enabled(
                 persisted_scope,
                 &target_persisted,
                 enabled,
-                fallback.as_ref(),
             )?;
-            return Ok(AgentResourcePreferenceChange {
+            return Ok(AgentResourcePreferenceCommit {
+                change: AgentResourcePreferenceChange {
+                    scope,
+                    resource,
+                    enabled,
+                    status: AgentResourceRefreshStatus::Applied,
+                    deferred_chat_count: 0,
+                    restart_failed_chat_count: 0,
+                },
+                checkpoint,
+                _guard: guard,
+            });
+        }
+        let persisted_resource = persisted_resource(&resource)?;
+        let checkpoint = self
+            .preferences
+            .checkpoint_resource_change(persisted_scope, &persisted_resource)?;
+        self.preferences
+            .set_resource_enabled(persisted_scope, &persisted_resource, enabled)?;
+        Ok(AgentResourcePreferenceCommit {
+            change: AgentResourcePreferenceChange {
                 scope,
                 resource,
                 enabled,
                 status: AgentResourceRefreshStatus::Applied,
                 deferred_chat_count: 0,
-            });
-        }
-        let persisted_resource = persisted_resource(&resource)?;
-        self.preferences
-            .set_resource_enabled(persisted_scope, &persisted_resource, enabled)?;
-        Ok(AgentResourcePreferenceChange {
-            scope,
-            resource,
-            enabled,
-            status: AgentResourceRefreshStatus::Applied,
-            deferred_chat_count: 0,
+                restart_failed_chat_count: 0,
+            },
+            checkpoint,
+            _guard: guard,
         })
+    }
+
+    pub(crate) fn rollback_resource_change(
+        &self,
+        commit: AgentResourcePreferenceCommit,
+    ) -> Result<(), AgentEnvironmentError> {
+        self.preferences
+            .restore_resource_change(commit.checkpoint)?;
+        Ok(())
+    }
+
+    fn resource_can_affect_models(
+        &self,
+        scope: AgentResourcePreferenceScope,
+        resource: &AgentResourceId,
+        discovered: &DiscoveredEnvironment,
+    ) -> bool {
+        match resource {
+            AgentResourceId::ModelRoute { .. } => true,
+            AgentResourceId::Extension { .. } | AgentResourceId::Package { .. }
+                if scope == AgentResourcePreferenceScope::Global =>
+            {
+                true
+            }
+            AgentResourceId::Extension { .. } | AgentResourceId::Package { .. } => {
+                self.resource_affects_models(resource, discovered)
+            }
+            AgentResourceId::Skill { .. } => false,
+        }
+    }
+
+    fn resource_affects_models(
+        &self,
+        resource: &AgentResourceId,
+        discovered: &DiscoveredEnvironment,
+    ) -> bool {
+        match resource {
+            AgentResourceId::ModelRoute { route } => discovered
+                .model_routes
+                .iter()
+                .any(|model| model.provider == route.provider && model.id == route.model_id),
+            AgentResourceId::Extension { id } => discovered.model_routes.iter().any(|route| {
+                route
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.extension_id == *id)
+            }),
+            AgentResourceId::Package { id } => discovered.model_routes.iter().any(|route| {
+                route
+                    .owner
+                    .as_ref()
+                    .and_then(|owner| owner.package_id.as_ref())
+                    == Some(id)
+            }),
+            AgentResourceId::Skill { .. } => false,
+        }
+    }
+
+    async fn validate_resource_disable(
+        &self,
+        project_id: i64,
+        scope: AgentResourcePreferenceScope,
+        target: &AgentResourceId,
+        discovered: &DiscoveredEnvironment,
+    ) -> Result<(), AgentEnvironmentError> {
+        let mut affects_models = self.resource_affects_models(target, discovered);
+        if affects_models
+            && !self.has_enabled_model_route_after_change(project_id, scope, target, discovered)?
+        {
+            return Err(AgentEnvironmentError::CannotDisableLastModelRoute);
+        }
+        if scope == AgentResourcePreferenceScope::Project {
+            return Ok(());
+        }
+
+        let projects = Arc::clone(&self.projects);
+        let projects = tokio::task::spawn_blocking(move || projects.snapshot())
+            .await
+            .map_err(|_| AgentEnvironmentError::RuntimeStorage)??
+            .projects;
+        let unavailable_project_present = projects.iter().any(|project| {
+            project.id != project_id && project.availability != ProjectAvailability::Available
+        });
+        let other_project_ids = projects
+            .into_iter()
+            .filter(|project| {
+                project.id != project_id && project.availability == ProjectAvailability::Available
+            })
+            .map(|project| project.id)
+            .collect::<Vec<_>>();
+        let other_projects = join_all(other_project_ids.into_iter().map(
+            |other_project_id| async move {
+                self.discover(other_project_id)
+                    .await
+                    .map(|discovered| (other_project_id, discovered))
+            },
+        ))
+        .await;
+        for project in other_projects {
+            let (other_project_id, discovered) = project?;
+            let affected = self.resource_affects_models(target, &discovered);
+            affects_models |= affected;
+            if affected
+                && !self.has_enabled_model_route_after_change(
+                    other_project_id,
+                    scope,
+                    target,
+                    &discovered,
+                )?
+            {
+                return Err(AgentEnvironmentError::CannotDisableLastModelRoute);
+            }
+        }
+        if unavailable_project_present && affects_models {
+            return Err(AgentEnvironmentError::CannotDisableLastModelRoute);
+        }
+        Ok(())
+    }
+
+    fn has_enabled_model_route_after_change(
+        &self,
+        project_id: i64,
+        scope: AgentResourcePreferenceScope,
+        target: &AgentResourceId,
+        discovered: &DiscoveredEnvironment,
+    ) -> Result<bool, AgentEnvironmentError> {
+        let target = persisted_resource(target)?;
+        discovered
+            .model_routes
+            .iter()
+            .try_fold(false, |enabled, route| {
+                Ok(enabled
+                    || self.model_route_enabled_after_disable(
+                        project_id,
+                        scope,
+                        &target,
+                        route,
+                        &discovered.resources,
+                    )?)
+            })
+    }
+
+    fn model_route_enabled_after_disable(
+        &self,
+        project_id: i64,
+        scope: AgentResourcePreferenceScope,
+        target: &RuntimeResource,
+        route: &DiscoveredModelRoute,
+        resources: &DiscoveredResources,
+    ) -> Result<bool, AgentEnvironmentError> {
+        let route_id = ModelRouteId {
+            provider: route.provider.clone(),
+            model_id: route.id.clone(),
+        };
+        let route_enabled = self.effective_enabled_after_disable(
+            project_id,
+            &RuntimeResource::model_route(persisted_route(&route_id)?),
+            None,
+            true,
+            scope,
+            target,
+        )?;
+        if !route_enabled {
+            return Ok(false);
+        }
+        let Some(owner) = &route.owner else {
+            return Ok(true);
+        };
+        let extension = resources
+            .extensions
+            .iter()
+            .find(|resource| resource.id == owner.extension_id)
+            .ok_or(AgentEnvironmentError::InvalidSnapshot)?;
+        let package = owner.package_id.as_ref().map(RuntimeResource::package);
+        self.effective_enabled_after_disable(
+            project_id,
+            &RuntimeResource::extension(&owner.extension_id),
+            package.as_ref(),
+            extension.enabled,
+            scope,
+            target,
+        )
+    }
+
+    fn effective_enabled_after_disable(
+        &self,
+        project_id: i64,
+        resource: &RuntimeResource,
+        package: Option<&RuntimeResource>,
+        discovered: bool,
+        changed_scope: AgentResourcePreferenceScope,
+        target: &RuntimeResource,
+    ) -> Result<bool, AgentEnvironmentError> {
+        let project_scope = ResourceScope::Project(project_id);
+        Ok(self
+            .resource_enabled_after_disable(project_scope, resource, changed_scope, target)?
+            .or(package
+                .map(|package| {
+                    self.resource_enabled_after_disable(
+                        project_scope,
+                        package,
+                        changed_scope,
+                        target,
+                    )
+                })
+                .transpose()?
+                .flatten())
+            .or(self.resource_enabled_after_disable(
+                ResourceScope::Global,
+                resource,
+                changed_scope,
+                target,
+            )?)
+            .or(package
+                .map(|package| {
+                    self.resource_enabled_after_disable(
+                        ResourceScope::Global,
+                        package,
+                        changed_scope,
+                        target,
+                    )
+                })
+                .transpose()?
+                .flatten())
+            .unwrap_or(discovered))
+    }
+
+    fn resource_enabled_after_disable(
+        &self,
+        scope: ResourceScope,
+        resource: &RuntimeResource,
+        changed_scope: AgentResourcePreferenceScope,
+        target: &RuntimeResource,
+    ) -> Result<Option<bool>, AgentEnvironmentError> {
+        let is_changed_scope = matches!(
+            (scope, changed_scope),
+            (ResourceScope::Global, AgentResourcePreferenceScope::Global)
+                | (
+                    ResourceScope::Project(_),
+                    AgentResourcePreferenceScope::Project
+                )
+        );
+        if is_changed_scope && resource == target {
+            return Ok(Some(false));
+        }
+        self.preferences
+            .resource_enabled(scope, resource)
+            .map_err(Into::into)
     }
 
     async fn discover(
@@ -556,7 +920,17 @@ impl AgentEnvironment {
         let location = tokio::task::spawn_blocking(move || projects.project_location(project_id))
             .await
             .map_err(|_| AgentEnvironmentError::RuntimeStorage)??;
-        run_inspector(&self.process, &self.policy, &location.canonical_path).await
+        let preferences = InspectorResourcePreferences::from_overrides(
+            project_id,
+            self.preferences.inspector_resource_overrides(project_id)?,
+        )?;
+        run_inspector(
+            &self.process,
+            &self.policy,
+            &location.canonical_path,
+            &preferences,
+        )
+        .await
     }
 
     fn materialize(
@@ -564,10 +938,11 @@ impl AgentEnvironment {
         project_id: i64,
         discovered: DiscoveredEnvironment,
     ) -> Result<AgentEnvironmentSnapshot, AgentEnvironmentError> {
+        let resources = &discovered.resources;
         let mut model_routes = discovered
             .model_routes
             .into_iter()
-            .map(|route| self.model_route(project_id, route))
+            .map(|route| self.model_route(project_id, route, resources))
             .collect::<Result<Vec<_>, _>>()?;
         validate_unique_model_routes(&model_routes)?;
         let enabled_routes = model_routes
@@ -591,7 +966,7 @@ impl AgentEnvironment {
             .preferences
             .remembered_effort(&selected_persisted)?
             .as_deref()
-            .and_then(reasoning_effort)
+            .and_then(ReasoningEffort::from_pi)
             .filter(|effort| selected_route.thinking_levels.contains(effort))
             .unwrap_or(selected_route.thinking_levels[0]);
         let model_controls = controls_for(&model_routes, &selected_route.id, selected_effort)?;
@@ -635,6 +1010,7 @@ impl AgentEnvironment {
         &self,
         project_id: i64,
         route: DiscoveredModelRoute,
+        resources: &DiscoveredResources,
     ) -> Result<AgentModelRoute, AgentEnvironmentError> {
         if route.provider.is_empty() || route.id.is_empty() || route.name.is_empty() {
             return Err(AgentEnvironmentError::InvalidSnapshot);
@@ -642,7 +1018,9 @@ impl AgentEnvironment {
         let thinking_levels = route
             .thinking_levels
             .iter()
-            .map(|level| reasoning_effort(level).ok_or(AgentEnvironmentError::InvalidSnapshot))
+            .map(|level| {
+                ReasoningEffort::from_pi(level).ok_or(AgentEnvironmentError::InvalidSnapshot)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         if thinking_levels.is_empty()
             || thinking_levels.iter().collect::<HashSet<_>>().len() != thinking_levels.len()
@@ -653,18 +1031,25 @@ impl AgentEnvironment {
             provider: route.provider,
             model_id: route.id,
         };
-        let enabled = self.effective_enabled(
+        let route_enabled = self.effective_enabled(
             project_id,
             &RuntimeResource::model_route(persisted_route(&id)?),
             None,
             true,
         )?;
+        let owner_enabled = route
+            .owner
+            .as_ref()
+            .map(|owner| self.discovered_model_owner_enabled(project_id, owner, resources))
+            .transpose()?
+            .unwrap_or(true);
         Ok(AgentModelRoute {
             id,
             name: route.name,
             accepts_images: route.accepts_images,
             thinking_levels,
-            enabled,
+            enabled: route_enabled && owner_enabled,
+            source: route.scope.into(),
         })
     }
 
@@ -762,22 +1147,37 @@ impl AgentEnvironment {
             .map(|enabled| enabled.then(|| PathBuf::from(&resource.path)))
     }
 
-    fn route_enabled_for_scope(
+    fn discovered_model_owner_enabled(
         &self,
         project_id: i64,
-        route: &AgentModelRoute,
-        scope: AgentResourcePreferenceScope,
+        owner: &DiscoveredModelRouteOwner,
+        resources: &DiscoveredResources,
     ) -> Result<bool, AgentEnvironmentError> {
-        let resource = RuntimeResource::model_route(persisted_route(&route.id)?);
-        match scope {
-            AgentResourcePreferenceScope::Global => Ok(self
-                .preferences
-                .resource_enabled(ResourceScope::Global, &resource)?
-                .unwrap_or(true)),
-            AgentResourcePreferenceScope::Project => {
-                self.effective_enabled(project_id, &resource, None, true)
-            }
+        let extension = resources
+            .extensions
+            .iter()
+            .find(|resource| resource.id == owner.extension_id)
+            .ok_or(AgentEnvironmentError::InvalidSnapshot)?;
+        let expected_package =
+            (extension.origin == DiscoveredOrigin::Package).then_some(extension.source.as_str());
+        if owner.package_id.as_deref() != expected_package
+            || owner.package_id.as_ref().is_some_and(|package_id| {
+                !resources
+                    .packages
+                    .iter()
+                    .any(|package| package.id == *package_id)
+            })
+        {
+            return Err(AgentEnvironmentError::InvalidSnapshot);
         }
+        let extension_resource = RuntimeResource::extension(&extension.id);
+        let package_resource = owner.package_id.as_ref().map(RuntimeResource::package);
+        self.effective_enabled(
+            project_id,
+            &extension_resource,
+            package_resource.as_ref(),
+            extension.enabled,
+        )
     }
 }
 
@@ -876,31 +1276,6 @@ fn persisted_resource(
     })
 }
 
-fn reasoning_effort(level: &str) -> Option<ReasoningEffort> {
-    match level {
-        "off" => Some(ReasoningEffort::Off),
-        "minimal" => Some(ReasoningEffort::Minimal),
-        "low" => Some(ReasoningEffort::Low),
-        "medium" => Some(ReasoningEffort::Medium),
-        "high" => Some(ReasoningEffort::High),
-        "xhigh" => Some(ReasoningEffort::ExtraHigh),
-        "max" => Some(ReasoningEffort::Maximum),
-        _ => None,
-    }
-}
-
-fn effort_as_pi(effort: ReasoningEffort) -> &'static str {
-    match effort {
-        ReasoningEffort::Off => "off",
-        ReasoningEffort::Minimal => "minimal",
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-        ReasoningEffort::ExtraHigh => "xhigh",
-        ReasoningEffort::Maximum => "max",
-    }
-}
-
 fn validate(
     process: &AgentEnvironmentProcessSpec,
     policy: &AgentEnvironmentPolicy,
@@ -932,10 +1307,16 @@ async fn run_inspector(
     process: &AgentEnvironmentProcessSpec,
     policy: &AgentEnvironmentPolicy,
     repository: &Path,
+    preferences: &InspectorResourcePreferences,
 ) -> Result<DiscoveredEnvironment, AgentEnvironmentError> {
     tokio::fs::create_dir_all(&process.credential_lock_directory)
         .await
         .map_err(|_| AgentEnvironmentError::RuntimeStorage)?;
+    let preferences =
+        serde_json::to_string(preferences).map_err(|_| AgentEnvironmentError::InvalidSnapshot)?;
+    if preferences.len() > MAX_INSPECTOR_PREFERENCES_BYTES {
+        return Err(AgentEnvironmentError::InvalidPolicy);
+    }
     let arguments = vec![
         process.launcher.as_os_str().to_owned(),
         OsString::from("--cwd"),
@@ -944,6 +1325,8 @@ async fn run_inspector(
         process.agent_directory.as_os_str().to_owned(),
         OsString::from("--credential-lock-dir"),
         process.credential_lock_directory.as_os_str().to_owned(),
+        OsString::from("--resource-preferences"),
+        OsString::from(preferences),
     ];
     let owned = spawn_owned_piped_process(
         &process.executable,
@@ -1059,6 +1442,15 @@ struct DiscoveredModelRoute {
     name: String,
     accepts_images: bool,
     thinking_levels: Vec<String>,
+    scope: DiscoveredScope,
+    owner: Option<DiscoveredModelRouteOwner>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DiscoveredModelRouteOwner {
+    extension_id: String,
+    package_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -12,7 +13,7 @@ use piu_lib::{
     agent_environment::{
         AgentEnvironment, AgentEnvironmentError, AgentEnvironmentPolicy,
         AgentEnvironmentProcessSpec, AgentResourceId, AgentResourcePreferenceScope,
-        AgentResourceSource,
+        AgentResourceRefreshStatus, AgentResourceSource,
     },
     chat_runtime_host::ChatRuntimeHost,
     chat_runtime_host::{ModelRouteId, ReasoningEffort},
@@ -164,6 +165,11 @@ async fn project_snapshot_uses_the_verified_repository_and_returns_deep_typed_co
     assert_eq!(snapshot.model_routes.len(), 2);
     assert_eq!(snapshot.model_routes[0].name, "GPT 5.6");
     assert!(snapshot.model_routes[0].enabled);
+    assert_eq!(snapshot.model_routes[0].source, AgentResourceSource::Piu);
+    assert_eq!(
+        snapshot.model_routes[1].source,
+        AgentResourceSource::Project
+    );
     assert_eq!(snapshot.model_controls.routes.len(), 2);
     assert_eq!(
         snapshot.model_controls.selected_route,
@@ -265,6 +271,9 @@ async fn resource_preferences_are_validated_against_the_project_inventory() {
     assert_eq!(change.resource, resource);
     assert_eq!(change.scope, AgentResourcePreferenceScope::Project);
     assert!(!change.enabled);
+    assert_eq!(change.status, AgentResourceRefreshStatus::Applied);
+    assert_eq!(change.deferred_chat_count, 0);
+    assert_eq!(change.restart_failed_chat_count, 0);
     let snapshot = fixture
         .environment
         .snapshot(fixture.project_id)
@@ -289,13 +298,214 @@ async fn resource_preferences_are_validated_against_the_project_inventory() {
 }
 
 #[tokio::test]
-async fn disabling_the_selected_route_atomically_persists_a_valid_fallback() {
+async fn inspector_launch_receives_bounded_scoped_provider_resource_preferences() {
     let fixture = Fixture::new("snapshot", test_policy());
     fixture
         .environment
         .set_resource_enabled(
             fixture.project_id,
             AgentResourcePreferenceScope::Global,
+            AgentResourceId::Package {
+                id: "npm:@piu/review@1.0.0".into(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    fixture
+        .environment
+        .set_resource_enabled(
+            fixture.project_id,
+            AgentResourcePreferenceScope::Project,
+            AgentResourceId::Extension {
+                id: "package://extensions/review".into(),
+            },
+            true,
+        )
+        .await
+        .unwrap();
+
+    fixture
+        .environment
+        .snapshot(fixture.project_id)
+        .await
+        .unwrap();
+    let arguments = fs::read_to_string(fixture._root.path().join("arguments")).unwrap();
+    let arguments = arguments.lines().collect::<Vec<_>>();
+    let preferences = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--resource-preferences")
+        .map(|pair| pair[1])
+        .expect("the inspector launch must contain its typed resource preference payload");
+    assert!(preferences.len() < 256 * 1024);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(preferences).unwrap(),
+        serde_json::json!({
+            "global": [
+                {
+                    "kind": "package",
+                    "id": "npm:@piu/review@1.0.0",
+                    "enabled": false
+                }
+            ],
+            "project": [
+                {
+                    "kind": "extension",
+                    "id": "package://extensions/review",
+                    "enabled": true
+                }
+            ]
+        })
+    );
+}
+
+#[tokio::test]
+async fn owning_extension_and_package_preferences_make_provider_routes_unavailable() {
+    let fixture = Fixture::new("owned-models", test_policy());
+    let extension_route = ModelRouteId {
+        provider: "extension-models".into(),
+        model_id: "fast".into(),
+    };
+    fixture
+        .environment
+        .select_model_route(fixture.project_id, extension_route.clone())
+        .await
+        .unwrap();
+
+    fixture
+        .environment
+        .set_resource_enabled(
+            fixture.project_id,
+            AgentResourcePreferenceScope::Project,
+            AgentResourceId::Extension {
+                id: "piu://extensions/models".into(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    let after_extension = fixture
+        .environment
+        .snapshot(fixture.project_id)
+        .await
+        .unwrap();
+    assert!(
+        !after_extension
+            .model_routes
+            .iter()
+            .find(|route| route.id == extension_route)
+            .unwrap()
+            .enabled
+    );
+    assert_eq!(
+        after_extension.model_controls.selected_route.provider,
+        "openai-codex"
+    );
+    assert!(matches!(
+        fixture
+            .environment
+            .validate_model_selection(fixture.project_id, extension_route, ReasoningEffort::Low,)
+            .await,
+        Err(AgentEnvironmentError::ModelUnavailable { .. })
+    ));
+
+    fixture
+        .environment
+        .set_resource_enabled(
+            fixture.project_id,
+            AgentResourcePreferenceScope::Global,
+            AgentResourceId::Package {
+                id: "npm:@piu/models@1.0.0".into(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    let after_package = fixture
+        .environment
+        .snapshot(fixture.project_id)
+        .await
+        .unwrap();
+    assert!(
+        !after_package
+            .model_routes
+            .iter()
+            .find(|route| route.id.provider == "package-models")
+            .unwrap()
+            .enabled
+    );
+    assert_eq!(after_package.model_controls.routes.len(), 1);
+
+    fixture
+        .environment
+        .set_resource_enabled(
+            fixture.project_id,
+            AgentResourcePreferenceScope::Global,
+            AgentResourceId::Package {
+                id: "npm:@piu/models@1.0.0".into(),
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    fixture
+        .environment
+        .set_resource_enabled(
+            fixture.project_id,
+            AgentResourcePreferenceScope::Project,
+            AgentResourceId::ModelRoute {
+                route: ModelRouteId {
+                    provider: "openai-codex".into(),
+                    model_id: "gpt-5.6-sol".into(),
+                },
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .environment
+            .set_resource_enabled(
+                fixture.project_id,
+                AgentResourcePreferenceScope::Project,
+                AgentResourceId::Package {
+                    id: "npm:@piu/models@1.0.0".into(),
+                },
+                false,
+            )
+            .await,
+        Err(AgentEnvironmentError::CannotDisableLastModelRoute)
+    ));
+}
+
+#[tokio::test]
+async fn a_project_route_disable_uses_a_local_fallback_without_changing_the_last_selection() {
+    let fixture = Fixture::new("snapshot", test_policy());
+    let unaffected_repository = fixture._root.path().join("unaffected-repository");
+    make_repository(&unaffected_repository);
+    let unaffected_project_id = fixture
+        .inbox
+        .open_repository(&unaffected_repository)
+        .unwrap()
+        .project
+        .id;
+    fixture
+        .environment
+        .select_model_route(
+            fixture.project_id,
+            ModelRouteId {
+                provider: "openai-codex".into(),
+                model_id: "gpt-5.6-sol".into(),
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .environment
+        .set_resource_enabled(
+            fixture.project_id,
+            AgentResourcePreferenceScope::Project,
             AgentResourceId::ModelRoute {
                 route: ModelRouteId {
                     provider: "openai-codex".into(),
@@ -319,15 +529,40 @@ async fn disabling_the_selected_route_atomically_persists_a_valid_fallback() {
     );
     let persisted = RuntimePreferences::open(&fixture.app_data.join("piu.sqlite3")).unwrap();
     let selection = persisted.current_selection().unwrap().unwrap();
-    assert_eq!(selection.route.provider_id(), "local");
-    assert_eq!(selection.effort.as_deref(), Some("low"));
+    assert_eq!(selection.route.provider_id(), "openai-codex");
+    assert_eq!(selection.route.model_id(), "gpt-5.6-sol");
+    assert_eq!(selection.effort.as_deref(), Some("off"));
+    let unaffected = fixture
+        .environment
+        .snapshot(unaffected_project_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        unaffected.model_controls.selected_route.provider,
+        "openai-codex"
+    );
+    assert_eq!(unaffected.model_controls.routes.len(), 2);
+    assert!(matches!(
+        fixture
+            .environment
+            .validate_model_selection(
+                fixture.project_id,
+                ModelRouteId {
+                    provider: "openai-codex".into(),
+                    model_id: "gpt-5.6-sol".into(),
+                },
+                ReasoningEffort::High,
+            )
+            .await,
+        Err(AgentEnvironmentError::ModelUnavailable { .. })
+    ));
 
     assert!(matches!(
         fixture
             .environment
             .set_resource_enabled(
                 fixture.project_id,
-                AgentResourcePreferenceScope::Global,
+                AgentResourcePreferenceScope::Project,
                 AgentResourceId::ModelRoute {
                     route: ModelRouteId {
                         provider: "local".into(),
@@ -346,6 +581,243 @@ async fn disabling_the_selected_route_atomically_persists_a_valid_fallback() {
             .await
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn a_global_route_disable_rejects_an_inactive_project_with_no_fallback() {
+    let root = TempDir::new().unwrap();
+    let app_data = root.path().join("app-data");
+    let first_repository = root.path().join("first");
+    let inactive_repository = root.path().join("inactive");
+    fs::create_dir_all(&app_data).unwrap();
+    make_repository(&first_repository);
+    make_repository(&inactive_repository);
+    let database_path = app_data.join("piu.sqlite3");
+    let inbox = Arc::new(
+        ProjectInbox::with_git(
+            &database_path,
+            GitProcess::with_executable("/usr/bin/git".into()),
+        )
+        .unwrap(),
+    );
+    let first_project_id = inbox.open_repository(&first_repository).unwrap().project.id;
+    inbox.open_repository(&inactive_repository).unwrap();
+
+    let launcher = root.path().join("project-model-catalog.zsh");
+    fs::write(
+        &launcher,
+        r#"#!/bin/zsh
+set -eu
+if [[ "$PWD" == "$PIU_PROJECT_WITH_FALLBACK" ]]; then
+  models='[{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT 5.6","acceptsImages":true,"thinkingLevels":["off"],"scope":"user"},{"provider":"local","id":"qwen","name":"Qwen","acceptsImages":false,"thinkingLevels":["low"],"scope":"project"}]'
+else
+  models='[{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT 5.6","acceptsImages":true,"thinkingLevels":["off"],"scope":"user"}]'
+fi
+printf '{"modelRoutes":%s,"resources":{"extensions":[],"skills":[],"packages":[]},"diagnostics":[]}\n' "$models"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut process_environment = BTreeMap::new();
+    process_environment.insert(OsString::from("HOME"), OsString::from("/Users/piu-test"));
+    process_environment.insert(OsString::from("PATH"), OsString::from("/usr/bin:/bin"));
+    process_environment.insert(
+        OsString::from("PIU_PROJECT_WITH_FALLBACK"),
+        first_repository.canonicalize().unwrap().into_os_string(),
+    );
+    let environment = AgentEnvironment::new(
+        Arc::clone(&inbox),
+        Arc::new(RuntimePreferences::open(&database_path).unwrap()),
+        AgentEnvironmentProcessSpec {
+            executable: PathBuf::from("/bin/zsh"),
+            launcher,
+            agent_directory: app_data.join("agent"),
+            credential_lock_directory: app_data.join("credential-locks"),
+            environment: process_environment,
+        },
+        test_policy(),
+    )
+    .unwrap();
+
+    let result = environment
+        .set_resource_enabled(
+            first_project_id,
+            AgentResourcePreferenceScope::Global,
+            AgentResourceId::ModelRoute {
+                route: ModelRouteId {
+                    provider: "openai-codex".into(),
+                    model_id: "gpt-5.6-sol".into(),
+                },
+            },
+            false,
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(AgentEnvironmentError::CannotDisableLastModelRoute)
+    ));
+    assert!(
+        environment
+            .snapshot(first_project_id)
+            .await
+            .unwrap()
+            .model_routes
+            .iter()
+            .all(|route| route.enabled)
+    );
+}
+
+#[tokio::test]
+async fn a_global_provider_resource_disable_checks_projects_where_the_owner_is_effective() {
+    let root = TempDir::new().unwrap();
+    let app_data = root.path().join("app-data");
+    let shadowed_repository = root.path().join("shadowed");
+    let sole_route_repository = root.path().join("sole-route");
+    fs::create_dir_all(&app_data).unwrap();
+    make_repository(&shadowed_repository);
+    make_repository(&sole_route_repository);
+    let database_path = app_data.join("piu.sqlite3");
+    let inbox = Arc::new(
+        ProjectInbox::with_git(
+            &database_path,
+            GitProcess::with_executable("/usr/bin/git".into()),
+        )
+        .unwrap(),
+    );
+    let shadowed_project_id = inbox
+        .open_repository(&shadowed_repository)
+        .unwrap()
+        .project
+        .id;
+    inbox.open_repository(&sole_route_repository).unwrap();
+
+    let launcher = root.path().join("provider-owner-catalog.zsh");
+    fs::write(
+        &launcher,
+        r#"#!/bin/zsh
+set -eu
+extension='{"id":"package://extensions/models","name":"Models","path":"/private/tmp/piu/packages/models/extension.mjs","enabled":true,"source":"npm:@piu/models@1.0.0","scope":"user","origin":"package"}'
+package='{"id":"npm:@piu/models@1.0.0","name":"Models","source":"npm:@piu/models@1.0.0","scope":"user","filtered":false}'
+if [[ "$PWD" == "$PIU_SOLE_ROUTE_PROJECT" ]]; then
+  models='[{"provider":"package-models","id":"only","name":"Only model","acceptsImages":false,"thinkingLevels":["low"],"scope":"user","owner":{"extensionId":"package://extensions/models","packageId":"npm:@piu/models@1.0.0"}}]'
+else
+  models='[{"provider":"openai-codex","id":"gpt-5.6-sol","name":"GPT 5.6","acceptsImages":true,"thinkingLevels":["off"],"scope":"user"}]'
+fi
+printf '{"modelRoutes":%s,"resources":{"extensions":[%s],"skills":[],"packages":[%s]},"diagnostics":[]}\n' "$models" "$extension" "$package"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut process_environment = BTreeMap::new();
+    process_environment.insert(OsString::from("HOME"), OsString::from("/Users/piu-test"));
+    process_environment.insert(OsString::from("PATH"), OsString::from("/usr/bin:/bin"));
+    process_environment.insert(
+        OsString::from("PIU_SOLE_ROUTE_PROJECT"),
+        sole_route_repository
+            .canonicalize()
+            .unwrap()
+            .into_os_string(),
+    );
+    let environment = AgentEnvironment::new(
+        Arc::clone(&inbox),
+        Arc::new(RuntimePreferences::open(&database_path).unwrap()),
+        AgentEnvironmentProcessSpec {
+            executable: PathBuf::from("/bin/zsh"),
+            launcher,
+            agent_directory: app_data.join("agent"),
+            credential_lock_directory: app_data.join("credential-locks"),
+            environment: process_environment,
+        },
+        test_policy(),
+    )
+    .unwrap();
+
+    for resource in [
+        AgentResourceId::Extension {
+            id: "package://extensions/models".into(),
+        },
+        AgentResourceId::Package {
+            id: "npm:@piu/models@1.0.0".into(),
+        },
+    ] {
+        assert!(matches!(
+            environment
+                .set_resource_enabled(
+                    shadowed_project_id,
+                    AgentResourcePreferenceScope::Global,
+                    resource,
+                    false,
+                )
+                .await,
+            Err(AgentEnvironmentError::CannotDisableLastModelRoute)
+        ));
+    }
+    assert_eq!(
+        environment
+            .snapshot(shadowed_project_id)
+            .await
+            .unwrap()
+            .model_controls
+            .selected_route
+            .provider,
+        "openai-codex"
+    );
+}
+
+#[tokio::test]
+async fn a_global_route_disable_is_conservative_for_an_unavailable_project() {
+    let fixture = Fixture::new("snapshot", test_policy());
+    let unavailable_repository = fixture._root.path().join("unavailable-repository");
+    let moved_repository = fixture._root.path().join("moved-repository");
+    make_repository(&unavailable_repository);
+    fixture
+        .inbox
+        .open_repository(&unavailable_repository)
+        .unwrap();
+    fs::rename(&unavailable_repository, &moved_repository).unwrap();
+
+    let result = fixture
+        .environment
+        .set_resource_enabled(
+            fixture.project_id,
+            AgentResourcePreferenceScope::Global,
+            AgentResourceId::ModelRoute {
+                route: ModelRouteId {
+                    provider: "openai-codex".into(),
+                    model_id: "gpt-5.6-sol".into(),
+                },
+            },
+            false,
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(AgentEnvironmentError::CannotDisableLastModelRoute)
+    ));
+    assert!(
+        fixture
+            .environment
+            .snapshot(fixture.project_id)
+            .await
+            .unwrap()
+            .model_routes
+            .iter()
+            .all(|route| route.enabled)
+    );
+    fixture
+        .environment
+        .set_resource_enabled(
+            fixture.project_id,
+            AgentResourcePreferenceScope::Global,
+            AgentResourceId::Extension {
+                id: "piu://extensions/review".into(),
+            },
+            false,
+        )
+        .await
+        .expect("an unrelated extension toggle must not inspect the unavailable project");
 }
 
 #[tokio::test]
@@ -536,4 +1008,5 @@ fn snapshot_and_resource_preference_cross_the_typed_tauri_boundary() {
     .deserialize::<piu_lib::agent_environment::AgentResourcePreferenceChange>()
     .unwrap();
     assert!(!change.enabled);
+    assert_eq!(change.restart_failed_chat_count, 0);
 }

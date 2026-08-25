@@ -127,6 +127,44 @@ test("a rejected change retains the working route and can be retried", async () 
   });
 });
 
+test.each([
+  {
+    change: (controls: ModelControlsController) => controls.selectRoute(codexRoute),
+    override: {
+      selectRoute: vi.fn().mockRejectedValue({
+        code: "inferenceRollbackFailed",
+        message: "Pi couldn’t safely restore the previous model. Reopen the chat and try again.",
+      }),
+    },
+  },
+  {
+    change: (controls: ModelControlsController) => controls.selectEffort("xhigh"),
+    override: {
+      selectEffort: vi.fn().mockRejectedValue({
+        code: "inferenceRollbackFailed",
+        message: "Pi couldn’t safely restore the previous model. Reopen the chat and try again.",
+      }),
+    },
+  },
+])(
+  "a failed inference rollback reports the recovery action without offering retry",
+  async (testCase) => {
+    const controls = new ModelControlsController<string>("chat-7", adapter(testCase.override));
+    await controls.load();
+
+    await testCase.change(controls);
+
+    expect(controls.getSnapshot()).toEqual({
+      controls: initialControls,
+      error: "Pi couldn’t safely restore the previous model. Reopen the chat and try again.",
+      pending: null,
+      phase: "failed",
+    });
+    await controls.retry();
+    expect(testCase.override.selectRoute ?? testCase.override.selectEffort).toHaveBeenCalledOnce();
+  },
+);
+
 test("reasoning changes use only a level present in the effective snapshot", async () => {
   const selectEffort = vi.fn<ModelControlsAdapter["selectEffort"]>();
   const controls = new ModelControlsController("chat-7", adapter({ selectEffort }));

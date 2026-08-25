@@ -31,6 +31,7 @@ interface ModelsResourcesPanelProps {
 }
 
 interface ResourceRowProps {
+  disabled: boolean;
   enabled: boolean;
   name: string;
   onResourceEnabledChange: ModelsResourcesPanelProps["onResourceEnabledChange"];
@@ -62,6 +63,7 @@ function scopeForSource(source: AgentResourceSource): AgentResourcePreferenceSco
 }
 
 const ResourceRow = memo(function ResourceRow({
+  disabled,
   enabled,
   name,
   onResourceEnabledChange,
@@ -90,7 +92,7 @@ const ResourceRow = memo(function ResourceRow({
         aria-busy={pending || undefined}
         aria-label={name}
         checked={enabled}
-        disabled={pending}
+        disabled={disabled}
         onCheckedChange={(checked) => void onResourceEnabledChange(resource, checked, scope)}
       />
     </li>
@@ -151,6 +153,7 @@ function ResourceGroup({
 function resourceRows(
   resources: readonly AgentResourceSummary[],
   kind: "skill" | "extension",
+  inventoryDisabled: boolean,
   pendingResourceId: AgentResourceId | null | undefined,
   projectName: string | undefined,
   onResourceEnabledChange: ModelsResourcesPanelProps["onResourceEnabledChange"],
@@ -158,13 +161,15 @@ function resourceRows(
   const pendingKey = pendingResourceId ? resourceKey(pendingResourceId) : null;
   return resources.map((summary) => {
     const resource = { kind, id: summary.id } satisfies AgentResourceId;
+    const key = resourceKey(resource);
     return (
       <ResourceRow
+        disabled={inventoryDisabled}
         enabled={summary.enabled}
-        key={resourceKey(resource)}
+        key={key}
         name={summary.name}
         onResourceEnabledChange={onResourceEnabledChange}
-        pending={pendingKey === resourceKey(resource)}
+        pending={pendingKey === key}
         resource={resource}
         scope={scopeForSource(summary.source)}
         sourceLabel={sourceLabel(summary.source, projectName)}
@@ -216,6 +221,7 @@ export const ModelsResourcesPanel = memo(function ModelsResourcesPanel({
   snapshot,
   status,
 }: ModelsResourcesPanelProps) {
+  const inventoryDisabled = pendingResourceId != null;
   const pendingKey = pendingResourceId ? resourceKey(pendingResourceId) : null;
   const generalDiagnostics = snapshot?.diagnostics.filter(
     (diagnostic) =>
@@ -256,7 +262,7 @@ export const ModelsResourcesPanel = memo(function ModelsResourcesPanel({
       {loading ? (
         <LoadingInventory />
       ) : snapshot ? (
-        <div className="models-resources-inventory">
+        <div className="models-resources-inventory" aria-busy={inventoryDisabled || undefined}>
           <ResourceGroup
             diagnosticResource="model"
             diagnostics={snapshot.diagnostics}
@@ -268,14 +274,15 @@ export const ModelsResourcesPanel = memo(function ModelsResourcesPanel({
                 const resource = { kind: "modelRoute", route: route.id } satisfies AgentResourceId;
                 return (
                   <ResourceRow
+                    disabled={inventoryDisabled}
                     enabled={route.enabled}
                     key={resourceKey(resource)}
                     name={route.name}
                     onResourceEnabledChange={onResourceEnabledChange}
                     pending={pendingKey === resourceKey(resource)}
                     resource={resource}
-                    scope="global"
-                    sourceLabel="Più"
+                    scope={scopeForSource(route.source)}
+                    sourceLabel={sourceLabel(route.source, projectName)}
                   />
                 );
               })}
@@ -292,6 +299,7 @@ export const ModelsResourcesPanel = memo(function ModelsResourcesPanel({
               {resourceRows(
                 snapshot.resources.skills,
                 "skill",
+                inventoryDisabled,
                 pendingResourceId,
                 projectName,
                 onResourceEnabledChange,
@@ -311,6 +319,7 @@ export const ModelsResourcesPanel = memo(function ModelsResourcesPanel({
               {resourceRows(
                 snapshot.resources.extensions,
                 "extension",
+                inventoryDisabled,
                 pendingResourceId,
                 projectName,
                 onResourceEnabledChange,
@@ -331,6 +340,7 @@ export const ModelsResourcesPanel = memo(function ModelsResourcesPanel({
                 const resource = { kind: "package", id: summary.id } satisfies AgentResourceId;
                 return (
                   <ResourceRow
+                    disabled={inventoryDisabled}
                     enabled={summary.enabled}
                     key={resourceKey(resource)}
                     name={summary.name}

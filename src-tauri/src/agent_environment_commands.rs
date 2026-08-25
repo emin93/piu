@@ -167,17 +167,28 @@ pub async fn set_agent_resource_enabled(
     request: SetAgentResourceEnabledRequest,
 ) -> Result<AgentResourcePreferenceChange, AgentEnvironmentCommandError> {
     let project_id = request.project_id;
-    let change = environment
-        .set_resource_enabled(project_id, request.scope, request.resource, request.enabled)
+    let commit = environment
+        .commit_resource_enabled(project_id, request.scope, request.resource, request.enabled)
         .await
         .map_err(AgentEnvironmentCommandError::from)?;
-    chat_runtime
-        .refresh_resources(project_id, change)
+    match chat_runtime
+        .refresh_resources(project_id, commit.change())
         .await
-        .map_err(|_| AgentEnvironmentCommandError {
-            code: AgentEnvironmentCommandErrorCode::InspectionFailed,
-            message: "Più couldn’t refresh the affected chats. Try again.".into(),
-        })
+    {
+        Ok(change) => {
+            let _ = commit.finish();
+            Ok(change)
+        }
+        Err(_) => {
+            environment
+                .rollback_resource_change(commit)
+                .map_err(AgentEnvironmentCommandError::from)?;
+            Err(AgentEnvironmentCommandError {
+                code: AgentEnvironmentCommandErrorCode::InspectionFailed,
+                message: "Più couldn’t refresh the affected chats. Try again.".into(),
+            })
+        }
+    }
 }
 
 #[cfg(test)]

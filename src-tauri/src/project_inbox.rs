@@ -17,7 +17,7 @@ use crate::{
     prompt_attachments::{
         PromptAttachment, PromptAttachmentError, validate as validate_attachments,
     },
-    runtime_preferences::{ModelRoute, ModelSelection, current_selection},
+    runtime_preferences::{ModelRoute, ModelSelection},
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -605,7 +605,7 @@ impl ProjectInbox {
 
     pub(crate) fn reserve_chat_creation(
         &self,
-        reservation: &mut ChatCreationReservation,
+        reservation: &ChatCreationReservation,
     ) -> Result<(), ProjectInboxError> {
         let attachments_json = encode_attachments(&reservation.attachments)?;
         self.with_database(|database| {
@@ -613,16 +613,10 @@ impl ProjectInbox {
                 .connection_mut()
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(DatabaseError::Query)?;
-            let selection = current_selection(&transaction)?;
-            let provider_id = selection
-                .as_ref()
-                .map(|selection| selection.route.provider_id());
-            let model_id = selection
-                .as_ref()
-                .map(|selection| selection.route.model_id());
-            let effort = selection
-                .as_ref()
-                .and_then(|selection| selection.effort.as_deref());
+            let selection = reservation.initial_model_selection.as_ref();
+            let provider_id = selection.map(|selection| selection.route.provider_id());
+            let model_id = selection.map(|selection| selection.route.model_id());
+            let effort = selection.and_then(|selection| selection.effort.as_deref());
             transaction
                 .execute(
                     "INSERT INTO chat_workspace_creations (
@@ -654,7 +648,6 @@ impl ProjectInbox {
                 )
                 .map_err(DatabaseError::Query)?;
             transaction.commit().map_err(DatabaseError::Query)?;
-            reservation.initial_model_selection = selection;
             Ok(())
         })
     }

@@ -30,6 +30,7 @@ const CHAT_RUNTIME_ERROR_CODES = new Set<ChatRuntimeCommandErrorCode>([
   "modelUnavailable",
   "effortUnavailable",
   "inferenceChangeRejected",
+  "inferenceRollbackFailed",
 ]);
 
 export interface ConversationMessage {

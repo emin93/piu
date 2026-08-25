@@ -436,6 +436,82 @@ export default function (pi) {
   }
 });
 
+test("chat startup skips missing packages without mutating package state", async () => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "piu-package-startup-contract-"));
+  const paths = {
+    agentDirectory: join(fixtureRoot, "app", "agent"),
+    credentialLockDirectory: join(fixtureRoot, "app", "credential-locks"),
+    cwd: join(fixtureRoot, "worktree"),
+    extensionPaths: [],
+    home: join(fixtureRoot, "home"),
+    modelId: "present-model",
+    modelProvider: "piu-present-package",
+    sessionDirectory: join(fixtureRoot, "app", "sessions"),
+    skillPaths: [],
+    thinkingLevel: "off",
+  };
+  const presentPackage = join(paths.agentDirectory, "packages", "present");
+  const presentExtension = join(presentPackage, "extensions", "provider.js");
+  const npmInvocationMarker = join(fixtureRoot, "npm-was-invoked");
+  const npmSentinel = join(fixtureRoot, "npm-sentinel.mjs");
+  const settingsPath = join(paths.agentDirectory, "settings.json");
+  paths.extensionPaths = [presentExtension];
+  let chat;
+
+  try {
+    await Promise.all([
+      mkdir(paths.agentDirectory, { recursive: true }),
+      mkdir(paths.credentialLockDirectory, { recursive: true }),
+      mkdir(paths.cwd, { recursive: true }),
+      mkdir(paths.home, { recursive: true }),
+      mkdir(paths.sessionDirectory, { recursive: true }),
+      mkdir(join(presentPackage, "extensions"), { recursive: true }),
+    ]);
+    const settings = JSON.stringify(
+      {
+        npmCommand: [nodeExecutable, npmSentinel],
+        packages: [presentPackage, "npm:@piu-contract/missing-package@0.0.0"],
+      },
+      null,
+      2,
+    );
+    await Promise.all([
+      writeFile(
+        presentExtension,
+        `import { fauxProvider } from "@earendil-works/pi-ai";
+
+export default function (pi) {
+  pi.registerProvider(fauxProvider({
+    provider: "piu-present-package",
+    models: [{ id: "present-model", name: "Present package model", reasoning: false }],
+  }).provider);
+}
+`,
+      ),
+      writeFile(
+        npmSentinel,
+        `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(npmInvocationMarker)}, "invoked");
+process.exitCode = 77;
+`,
+      ),
+      writeFile(settingsPath, settings),
+    ]);
+
+    chat = startChat(paths);
+    const state = (await chat.request({ type: "get_state" })).data;
+
+    assert.equal(state.model.provider, "piu-present-package");
+    assert.equal(state.model.id, "present-model");
+    assert.equal(await readFile(settingsPath, "utf8"), settings);
+    await assert.rejects(access(npmInvocationMarker), { code: "ENOENT" });
+    await assert.rejects(access(join(paths.agentDirectory, "npm")), { code: "ENOENT" });
+  } finally {
+    if (chat) await chat.stop().catch(() => {});
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("the pinned launcher creates and resumes one exact isolated Pi session", async () => {
   await access(nodeExecutable);
   await access(launcher);

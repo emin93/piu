@@ -3,4 +3,4 @@ import type { AgentResourceId } from "./AgentResourceId";
 import type { AgentResourcePreferenceScope } from "./AgentResourcePreferenceScope";
 import type { AgentResourceRefreshStatus } from "./AgentResourceRefreshStatus";
 
-export type AgentResourcePreferenceChange = { scope: AgentResourcePreferenceScope, resource: AgentResourceId, enabled: boolean, status: AgentResourceRefreshStatus, deferredChatCount: number, };
+export type AgentResourcePreferenceChange = { scope: AgentResourcePreferenceScope, resource: AgentResourceId, enabled: boolean, status: AgentResourceRefreshStatus, deferredChatCount: number, restartFailedChatCount: number, };

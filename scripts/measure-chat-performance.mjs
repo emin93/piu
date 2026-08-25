@@ -26,6 +26,12 @@ function requireNoSlowFrames(summary, label) {
   }
 }
 
+function requireNoRenders(count, label) {
+  if (count !== 0) {
+    throw new Error(`${label} rendered ${String(count)} times`);
+  }
+}
+
 function waitForChildExit(child, timeoutMs) {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
   return new Promise((resolveExit) => {
@@ -122,6 +128,10 @@ try {
   requireAtMost(report.chatSwitchVisibleNextFrameMs, 100, "Visible chat switching");
   requireAtMost(report.navigationVisibleNextFrameMs, 50, "Visible project navigation");
   requireAtMost(report.composerInputNextFrameMs, 50, "Composer input");
+  requireNoRenders(
+    report.inferenceControlRendersDuringStreaming,
+    "Inference controls during transcript streaming",
+  );
   requireNoSlowFrames(report.scrollingFrames, "Transcript scrolling");
   requireNoSlowFrames(report.streamingFrames, "Transcript streaming");
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);

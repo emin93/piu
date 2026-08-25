@@ -49,12 +49,13 @@ function createPiContract() {
     },
   };
   const isolatedSettingsManager = { kind: "isolated" };
+  let availableModels = [
+    { provider: "piu-contract", id: "reasoning", name: "Reasoning", reasoning: true },
+    { provider: "piu-contract", id: "plain", name: "Plain", reasoning: false },
+  ];
   const modelRuntime = {
     async getAvailable() {
-      return [
-        { provider: "piu-contract", id: "reasoning", name: "Reasoning", reasoning: true },
-        { provider: "piu-contract", id: "plain", name: "Plain", reasoning: false },
-      ];
+      return availableModels;
     },
     getError() {
       return "fixture model warning";
@@ -100,6 +101,30 @@ function createPiContract() {
     async createAgentSessionServices(options) {
       resourceLoaderOptions = options.resourceLoaderOptions;
       assert.equal(options.settingsManager, isolatedSettingsManager);
+      options.resourceLoaderOptions.extensionsOverride({
+        extensions: [],
+        errors: [],
+        runtime: {
+          pendingProviderRegistrations: [
+            {
+              name: "piu-contract",
+              config: {},
+              extensionPath: resolved.extensions[0].path,
+            },
+            {
+              name: "project-contract",
+              config: {},
+              extensionPath: resolved.extensions[0].path,
+            },
+          ],
+          pendingNativeProviderRegistrations: [],
+        },
+      });
+      availableModels = [
+        { ...availableModels[0], name: "Project reasoning override" },
+        availableModels[1],
+        { provider: "project-contract", id: "project-model", name: "Project", reasoning: true },
+      ];
       return {
         diagnostics: [{ type: "warning", message: "fixture runtime warning" }],
         modelRuntime,
@@ -163,9 +188,11 @@ test("discovers effective routes and inventories isolated Più resources", async
     {
       provider: "piu-contract",
       id: "reasoning",
-      name: "Reasoning",
+      name: "Project reasoning override",
       acceptsImages: false,
       thinkingLevels: ["off", "low", "max"],
+      scope: "project",
+      owner: { extensionId: `${paths.cwd}/.pi/extensions/route.mjs` },
     },
     {
       provider: "piu-contract",
@@ -173,6 +200,17 @@ test("discovers effective routes and inventories isolated Più resources", async
       name: "Plain",
       acceptsImages: false,
       thinkingLevels: ["off"],
+      scope: "project",
+      owner: { extensionId: `${paths.cwd}/.pi/extensions/route.mjs` },
+    },
+    {
+      provider: "project-contract",
+      id: "project-model",
+      name: "Project",
+      acceptsImages: false,
+      thinkingLevels: ["off", "low", "max"],
+      scope: "project",
+      owner: { extensionId: `${paths.cwd}/.pi/extensions/route.mjs` },
     },
   ]);
   assert.deepEqual(contract.modelRuntimeOptions, {
@@ -224,7 +262,9 @@ test("discovers effective routes and inventories isolated Più resources", async
       },
     ],
   });
-  assert.deepEqual(contract.resourceLoaderOptions, {
+  const { extensionsOverride, ...resourceLoaderOptions } = contract.resourceLoaderOptions;
+  assert.equal(typeof extensionsOverride, "function");
+  assert.deepEqual(resourceLoaderOptions, {
     additionalExtensionPaths: [`${paths.cwd}/.pi/extensions/route.mjs`],
     additionalSkillPaths: [`${paths.agentDirectory}/skills/review/SKILL.md`],
     noContextFiles: true,
@@ -276,6 +316,249 @@ test("discovers effective routes and inventories isolated Più resources", async
       message: "fixture model warning",
     },
   ]);
+});
+
+async function inspectModelProvenance({
+  extensionScope,
+  extensionSource = "local",
+  extensionOrigin = "top-level",
+  initialModels,
+  registrations,
+  effectiveModels,
+  resourcePreferences = { global: [], project: [] },
+}) {
+  const extensionPath =
+    extensionScope === "user"
+      ? `${paths.agentDirectory}/extensions/route.mjs`
+      : `${paths.cwd}/.pi/extensions/route.mjs`;
+  let availableModels = initialModels;
+  let loadedExtensionPaths = [];
+  const modelRuntime = {
+    async getAvailable() {
+      return availableModels;
+    },
+    getError() {
+      return undefined;
+    },
+  };
+  const settingsManager = {
+    applyOverrides() {},
+    drainErrors() {
+      return [];
+    },
+  };
+
+  class DefaultPackageManager {
+    async resolve() {
+      return {
+        extensions: [
+          {
+            path: extensionPath,
+            enabled: true,
+            metadata: {
+              source: extensionSource,
+              scope: extensionScope,
+              origin: extensionOrigin,
+            },
+          },
+        ],
+        skills: [],
+        prompts: [],
+        themes: [],
+      };
+    }
+
+    listConfiguredPackages() {
+      return extensionOrigin === "package"
+        ? [
+            {
+              source: extensionSource,
+              scope: extensionScope,
+              filtered: false,
+              installedPath: extensionPath,
+            },
+          ]
+        : [];
+    }
+  }
+
+  const pi = {
+    DefaultPackageManager,
+    ModelRuntime: {
+      async create() {
+        return modelRuntime;
+      },
+    },
+    SettingsManager: {
+      create() {
+        return settingsManager;
+      },
+      inMemory() {
+        return {};
+      },
+    },
+    async createAgentSessionServices(options) {
+      loadedExtensionPaths = options.resourceLoaderOptions.additionalExtensionPaths;
+      const extensionLoaded =
+        options.resourceLoaderOptions.additionalExtensionPaths.includes(extensionPath);
+      options.resourceLoaderOptions.extensionsOverride({
+        extensions: [],
+        errors: [],
+        runtime: {
+          pendingProviderRegistrations: extensionLoaded
+            ? registrations.map((registration) => ({
+                ...registration,
+                extensionPath,
+              }))
+            : [],
+          pendingNativeProviderRegistrations: [],
+        },
+      });
+      availableModels = extensionLoaded ? effectiveModels : initialModels;
+      return {
+        diagnostics: [],
+        modelRuntime,
+        resourceLoader: {
+          getExtensions() {
+            return { errors: [] };
+          },
+          getSkills() {
+            return { skills: [], diagnostics: [] };
+          },
+        },
+      };
+    },
+  };
+
+  const result = await inspectPiuEnvironment(
+    { ...paths, resourcePreferences },
+    {
+      canonicalizePath: async (path) => path,
+      credentials: {},
+      getSupportedThinkingLevels: () => ["off"],
+      modelsStore: {},
+      pi,
+    },
+  );
+  return {
+    extensionPath,
+    loadedExtensionPaths,
+    result,
+  };
+}
+
+const userModel = {
+  provider: "shared-contract",
+  id: "model",
+  name: "Shared model",
+  reasoning: false,
+};
+
+for (const scenario of [
+  {
+    name: "global extension model additions as user routes",
+    extensionScope: "user",
+    initialModels: [userModel],
+    registrations: [{ name: "global-contract", config: {} }],
+    effectiveModels: [
+      userModel,
+      { provider: "global-contract", id: "model", name: "Global model", reasoning: false },
+    ],
+    route: { provider: "global-contract", id: "model" },
+    scope: "user",
+  },
+  {
+    name: "project extension model additions as project routes",
+    extensionScope: "project",
+    initialModels: [userModel],
+    registrations: [{ name: "project-contract", config: {} }],
+    effectiveModels: [
+      userModel,
+      { provider: "project-contract", id: "model", name: "Project model", reasoning: false },
+    ],
+    route: { provider: "project-contract", id: "model" },
+    scope: "project",
+  },
+  {
+    name: "project extension provider overrides as project routes",
+    extensionScope: "project",
+    initialModels: [userModel],
+    registrations: [{ name: "shared-contract", config: { baseUrl: "https://project.invalid" } }],
+    effectiveModels: [userModel],
+    route: { provider: "shared-contract", id: "model" },
+    scope: "project",
+  },
+  {
+    name: "package extension model additions with package ownership",
+    extensionScope: "user",
+    extensionSource: "npm:@piu/models@1.0.0",
+    extensionOrigin: "package",
+    initialModels: [userModel],
+    registrations: [{ name: "package-contract", config: {} }],
+    effectiveModels: [
+      userModel,
+      { provider: "package-contract", id: "model", name: "Package model", reasoning: false },
+    ],
+    route: { provider: "package-contract", id: "model" },
+    scope: "user",
+  },
+]) {
+  test(`classifies ${scenario.name}`, async () => {
+    const inspected = await inspectModelProvenance(scenario);
+    const route = inspected.result.modelRoutes.find(
+      ({ provider, id }) => provider === scenario.route.provider && id === scenario.route.id,
+    );
+
+    assert.equal(route?.scope, scenario.scope);
+    assert.deepEqual(route?.owner, {
+      extensionId:
+        scenario.extensionScope === "user"
+          ? `${paths.agentDirectory}/extensions/route.mjs`
+          : `${paths.cwd}/.pi/extensions/route.mjs`,
+      ...(scenario.extensionOrigin === "package" ? { packageId: scenario.extensionSource } : {}),
+    });
+  });
+}
+
+test("applies Più extension and package preferences before provider code executes", async () => {
+  const scenario = {
+    extensionScope: "user",
+    extensionSource: "npm:@piu/models@1.0.0",
+    extensionOrigin: "package",
+    initialModels: [userModel],
+    registrations: [{ name: "package-contract", config: {} }],
+    effectiveModels: [
+      userModel,
+      { provider: "package-contract", id: "model", name: "Package model", reasoning: false },
+    ],
+  };
+  const disabled = await inspectModelProvenance({
+    ...scenario,
+    resourcePreferences: {
+      global: [{ kind: "package", id: "npm:@piu/models@1.0.0", enabled: false }],
+      project: [],
+    },
+  });
+  assert.deepEqual(disabled.loadedExtensionPaths, []);
+  assert.equal(
+    disabled.result.modelRoutes.some(({ provider }) => provider === "package-contract"),
+    false,
+  );
+  assert.equal(disabled.result.resources.extensions.length, 1);
+  assert.equal(disabled.result.resources.packages.length, 1);
+
+  const reenabled = await inspectModelProvenance({
+    ...scenario,
+    resourcePreferences: {
+      global: [{ kind: "package", id: "npm:@piu/models@1.0.0", enabled: false }],
+      project: [{ kind: "extension", id: disabled.extensionPath, enabled: true }],
+    },
+  });
+  assert.deepEqual(reenabled.loadedExtensionPaths, [reenabled.extensionPath]);
+  assert.equal(
+    reenabled.result.modelRoutes.some(({ provider }) => provider === "package-contract"),
+    true,
+  );
 });
 
 test("rejects paths that could fall back to standalone Pi state", async () => {

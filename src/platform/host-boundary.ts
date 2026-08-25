@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 import type { HostRoundTripRequest } from "../generated/HostRoundTripRequest";
 import type { HostRoundTripResponse } from "../generated/HostRoundTripResponse";
@@ -21,11 +21,14 @@ export async function verifyHostBoundary(): Promise<HostBoundaryVerification> {
   const matchingEvent = new Promise<HostRoundTripResponse>((resolve) => {
     resolveEvent = resolve;
   });
-  const unlisten = await listen<HostRoundTripResponse>(HOST_ROUND_TRIP_EVENT, ({ payload }) => {
-    if (payload.correlationId === request.correlationId) {
-      resolveEvent(payload);
-    }
-  });
+  const unlisten = await getCurrentWebviewWindow().listen<HostRoundTripResponse>(
+    HOST_ROUND_TRIP_EVENT,
+    ({ payload }) => {
+      if (payload.correlationId === request.correlationId) {
+        resolveEvent(payload);
+      }
+    },
+  );
   let eventTimeout: number | undefined;
 
   try {
