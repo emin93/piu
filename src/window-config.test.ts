@@ -3,11 +3,11 @@ import { expect, test } from "vitest";
 import defaultCapability from "../src-tauri/capabilities/default.json";
 import tauriConfig from "../src-tauri/tauri.conf.json";
 
-test("the native traffic lights are centered in Più's 52-pixel titlebar", () => {
+test("the native traffic lights use Più's 52-pixel titlebar centerline", () => {
   expect(tauriConfig.app.windows[0]).toMatchObject({
     hiddenTitle: true,
     titleBarStyle: "Overlay",
-    trafficLightPosition: { x: 14, y: 19 },
+    trafficLightPosition: { x: 14, y: 26 },
   });
 });
 
