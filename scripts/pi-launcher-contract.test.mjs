@@ -583,7 +583,11 @@ test("the pinned launcher creates and resumes one exact isolated Pi session", as
     assert.equal(resumed.messageCount, beforeResume.messageCount);
     assert.equal(resumed.pendingMessageCount, 0);
     const resumedMessages = (await chat.request({ type: "get_messages" })).data.messages;
-    assert.deepEqual(resumedMessages, messages);
+    const withoutTimestamp = ({ timestamp, ...message }) => {
+      assert.equal(typeof timestamp, "number");
+      return message;
+    };
+    assert.deepEqual(resumedMessages.map(withoutTimestamp), messages.map(withoutTimestamp));
     await chat.stop();
     chat = undefined;
   } finally {

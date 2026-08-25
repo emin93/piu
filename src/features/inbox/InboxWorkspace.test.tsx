@@ -265,7 +265,9 @@ test("keeps one controlled draft per project across navigation", async () => {
 test("scopes a failed chat submission to the project that produced it", async () => {
   const onCreate = vi
     .fn()
-    .mockResolvedValueOnce("Più couldn’t fetch a fresh origin/main. Check remote access and try again.")
+    .mockResolvedValueOnce(
+      "Più couldn’t fetch a fresh origin/main. Check remote access and try again.",
+    )
     .mockResolvedValue(undefined);
   const user = userEvent.setup();
   render(<WorkspaceHarness onCreate={onCreate} />);
