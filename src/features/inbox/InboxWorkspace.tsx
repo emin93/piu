@@ -132,6 +132,7 @@ class TranscriptStateCache {
 }
 
 function SelectedChatStage({
+  cacheOwner,
   chat,
   chatModelControlsAdapter,
   conversationAdapter,
@@ -144,6 +145,7 @@ function SelectedChatStage({
   rememberTranscriptState,
   setups,
 }: {
+  cacheOwner: object;
   chat: ChatSummary;
   chatModelControlsAdapter?: ModelControlsAdapter;
   conversationAdapter: ConversationAdapter;
@@ -190,6 +192,7 @@ function SelectedChatStage({
     >
       <ChatConversationPanel
         adapter={conversationAdapter}
+        cacheOwner={cacheOwner}
         chatId={chat.id}
         initialTranscriptState={initialTranscriptState}
         key={chat.id}
@@ -550,6 +553,10 @@ export function InboxWorkspace({
   const deletionNeighborChatIdRef = useRef<string | undefined>(undefined);
   const newChatTriggerRef = useRef<HTMLButtonElement>(null);
   const transcriptStates = useMemo(() => new TranscriptStateCache(), []);
+  const conversationCacheOwner = useMemo(
+    () => ({ chatModelControlsAdapter, conversationAdapter }),
+    [chatModelControlsAdapter, conversationAdapter],
+  );
   const scopeProject = snapshot.projects.find(({ id }) => id === selectedProjectId);
   const selection = useMemo(
     () => selectInbox(snapshot, { projectId: selectedProjectId, query }),
@@ -618,6 +625,10 @@ export function InboxWorkspace({
       return;
     }
 
+    const { invalidateCachedChatConversationSession } =
+      await import("../conversation/chat-conversation-session-cache");
+    invalidateCachedChatConversationSession(conversationCacheOwner, chatPendingDeletion.id);
+
     const neighborChatId = deletionNeighborChatIdRef.current;
     const neighborRow = neighborChatId
       ? [...document.querySelectorAll<HTMLElement>("[data-chat-id]")].find(
@@ -628,7 +639,7 @@ export function InboxWorkspace({
       neighborRow?.querySelector<HTMLButtonElement>(".chat-row-select") ??
       newChatTriggerRef.current;
     closeDeletionDialog();
-  }, [chatPendingDeletion, closeDeletionDialog, onDeleteChat]);
+  }, [chatPendingDeletion, closeDeletionDialog, conversationCacheOwner, onDeleteChat]);
 
   return (
     <main className="workspace" aria-label="Più inbox">
@@ -772,6 +783,7 @@ export function InboxWorkspace({
           <EmptyInbox actionError={actionError} onOpenRepository={onOpenRepository} />
         ) : selectedChat ? (
           <SelectedChatStage
+            cacheOwner={conversationCacheOwner}
             chat={selectedChat}
             chatModelControlsAdapter={chatModelControlsAdapter}
             conversationAdapter={conversationAdapter}
@@ -789,8 +801,10 @@ export function InboxWorkspace({
             drafts={drafts}
             key={targetProject.id}
             modelControlsAdapter={modelControlsAdapter}
+            onRequestCodexSignIn={onRequestCodexSignIn}
             onSubmit={onCreateChat}
             project={targetProject}
+            revision={conversationRevision}
           />
         ) : null}
       </section>

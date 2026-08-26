@@ -1,4 +1,4 @@
-import { ArrowUpIcon, TriangleAlertIcon } from "lucide-react";
+import { ArrowUpIcon, KeyRoundIcon, TriangleAlertIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import { ProductComposer } from "@/components/ProductComposer";
@@ -22,6 +22,7 @@ interface ChatComposerProps {
   drafts: ProjectDraftController;
   layout?: "centered" | "docked";
   modelControlsAdapter?: ModelControlsAdapter<number>;
+  onRequestCodexSignIn?: () => void;
   onSubmit?: (
     projectId: number,
     prompt: string,
@@ -30,6 +31,7 @@ interface ChatComposerProps {
     effort: ReasoningEffort,
   ) => Promise<string | undefined>;
   project: ProjectSummary;
+  revision?: number;
 }
 
 function draftStatusCopy(status: DraftPersistenceStatus) {
@@ -43,8 +45,10 @@ export function ChatComposer({
   drafts,
   layout = "centered",
   modelControlsAdapter = tauriProjectModelControlsAdapter,
+  onRequestCodexSignIn,
   onSubmit,
   project,
+  revision = 0,
 }: ChatComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const available = project.availability === "available";
@@ -72,8 +76,9 @@ export function ChatComposer({
   useEffect(() => {
     if (!available) return;
     void modelControls.load();
-    return () => modelControls.dispose();
-  }, [available, modelControls]);
+  }, [available, modelControls, revision]);
+
+  useEffect(() => () => modelControls.dispose(), [modelControls]);
 
   const submit = useCallback(async () => {
     const prompt = draft.prompt.trim();
@@ -185,14 +190,27 @@ export function ChatComposer({
                           </Button>
                         ) : null}
                         {modelControlsSnapshot.error ? (
-                          <Button
-                            onClick={() => void modelControls.retry()}
-                            size="sm"
-                            type="button"
-                            variant="outline"
-                          >
-                            Try again
-                          </Button>
+                          <>
+                            {!modelControlsSnapshot.controls && onRequestCodexSignIn ? (
+                              <Button
+                                onClick={onRequestCodexSignIn}
+                                size="sm"
+                                type="button"
+                                variant="outline"
+                              >
+                                <KeyRoundIcon aria-hidden="true" />
+                                Sign in to Codex
+                              </Button>
+                            ) : null}
+                            <Button
+                              onClick={() => void modelControls.retry()}
+                              size="sm"
+                              type="button"
+                              variant="outline"
+                            >
+                              Try again
+                            </Button>
+                          </>
                         ) : null}
                       </div>
                     ) : undefined,

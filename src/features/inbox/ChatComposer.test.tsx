@@ -146,11 +146,13 @@ test("keeps the draft usable when project controls fail and retries inline", asy
     .mockRejectedValueOnce(new Error("inspection failed"))
     .mockResolvedValueOnce(modelControls);
   const drafts = new ProjectDraftController(vi.fn().mockResolvedValue(undefined));
+  const requestCodexSignIn = vi.fn();
   const user = userEvent.setup();
   render(
     <ChatComposer
       drafts={drafts}
       modelControlsAdapter={modelAdapter({ get })}
+      onRequestCodexSignIn={requestCodexSignIn}
       onSubmit={vi.fn().mockResolvedValue(undefined)}
       project={project}
     />,
@@ -162,12 +164,54 @@ test("keeps the draft usable when project controls fail and retries inline", asy
   const textarea = screen.getByRole("textbox", { name: "Draft for Atlas" });
   await user.type(textarea, "The draft remains editable");
   expect(textarea).toHaveValue("The draft remains editable");
+  await user.click(screen.getByRole("button", { name: "Sign in to Codex" }));
+  expect(requestCodexSignIn).toHaveBeenCalledOnce();
 
   await user.click(screen.getByRole("button", { name: "Try again" }));
 
   expect(await screen.findByRole("button", { name: "Model: Qwen 3.8 27B" })).toBeVisible();
   expect(get).toHaveBeenCalledTimes(2);
   expect(screen.queryByText("Model controls are unavailable. Try again.")).not.toBeInTheDocument();
+});
+
+test("reloads project controls after Codex sign-in without losing the draft", async () => {
+  const get = vi
+    .fn<ModelControlsAdapter<number>["get"]>()
+    .mockRejectedValueOnce(new Error("no model routes"))
+    .mockResolvedValueOnce(modelControls);
+  const adapter = modelAdapter({ get });
+  const drafts = new ProjectDraftController(vi.fn().mockResolvedValue(undefined));
+  const user = userEvent.setup();
+  const { rerender } = render(
+    <ChatComposer
+      drafts={drafts}
+      modelControlsAdapter={adapter}
+      onRequestCodexSignIn={vi.fn()}
+      onSubmit={vi.fn().mockResolvedValue(undefined)}
+      project={project}
+      revision={0}
+    />,
+  );
+
+  expect(await screen.findByRole("button", { name: "Sign in to Codex" })).toBeVisible();
+  const textarea = screen.getByRole("textbox", { name: "Draft for Atlas" });
+  await user.type(textarea, "Keep this while authenticating");
+
+  rerender(
+    <ChatComposer
+      drafts={drafts}
+      modelControlsAdapter={adapter}
+      onRequestCodexSignIn={vi.fn()}
+      onSubmit={vi.fn().mockResolvedValue(undefined)}
+      project={project}
+      revision={1}
+    />,
+  );
+
+  expect(await screen.findByRole("button", { name: "Model: Qwen 3.8 27B" })).toBeVisible();
+  expect(textarea).toHaveValue("Keep this while authenticating");
+  expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
+  expect(get).toHaveBeenCalledTimes(2);
 });
 
 test("moves the same focused composer from centered to docked without losing its draft", async () => {

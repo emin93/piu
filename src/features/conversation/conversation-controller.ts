@@ -25,12 +25,17 @@ export class ConversationController {
   readonly #chatId: string;
   #disconnect: (() => void) | undefined;
   #generation = 0;
+  #hasSnapshot = false;
   #revision = 0;
   readonly store = new ConversationStore(STOPPED_CONVERSATION);
 
   constructor(chatId: string, adapter: ConversationAdapter) {
     this.#adapter = adapter;
     this.#chatId = chatId;
+  }
+
+  get hasSnapshot() {
+    return this.#hasSnapshot;
   }
 
   #apply(event: ConversationEvent, revision?: number) {
@@ -59,6 +64,7 @@ export class ConversationController {
     }
     this.#disconnect = connection.disconnect;
     this.store.replace(connection.snapshot);
+    this.#hasSnapshot = true;
     this.#revision = connection.snapshot.revision ?? 0;
     connected = true;
     for (const pending of pendingEvents) {

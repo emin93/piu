@@ -5,7 +5,7 @@ import { beforeEach, expect, test, vi } from "vitest";
 
 import type { ModelRouteId } from "@/generated/ModelRouteId";
 import type { ReasoningEffort } from "@/generated/ReasoningEffort";
-import type { ConversationAdapter } from "@/platform/conversations";
+import type { ConversationAdapter, ConversationConnection } from "@/platform/conversations";
 import type { ModelControlsAdapter } from "@/platform/model-controls";
 import type { PromptAttachment } from "@/platform/prompt-attachments";
 import type { InboxSnapshot } from "@/platform/project-inbox";
@@ -49,6 +49,17 @@ const conversationAdapter: ConversationAdapter = {
 
 const selectedRoute = { modelId: "qwen3.8-27b", provider: "local-mlx" };
 const modelControlsAdapter: ModelControlsAdapter<number> = {
+  get: vi.fn().mockResolvedValue({
+    appliesAfterCurrentStep: false,
+    efforts: ["low", "medium", "xhigh"],
+    routes: [{ acceptsImages: false, id: selectedRoute, name: "Qwen 3.8 27B" }],
+    selectedEffort: "medium",
+    selectedRoute,
+  }),
+  selectEffort: vi.fn(),
+  selectRoute: vi.fn(),
+};
+const chatModelControlsAdapter: ModelControlsAdapter = {
   get: vi.fn().mockResolvedValue({
     appliesAfterCurrentStep: false,
     efforts: ["low", "medium", "xhigh"],
@@ -124,6 +135,7 @@ type CreateChat = (
 ) => Promise<string | undefined>;
 
 function WorkspaceHarness({
+  adapter = conversationAdapter,
   initialChatId = null,
   initialProjectId = null,
   initialSnapshot = populatedSnapshot,
@@ -133,6 +145,7 @@ function WorkspaceHarness({
     .fn<(chatId: string, title: string) => Promise<string | undefined>>()
     .mockResolvedValue(undefined),
 }: {
+  adapter?: ConversationAdapter;
   initialChatId?: string | null;
   initialProjectId?: number | null;
   initialSnapshot?: InboxSnapshot;
@@ -173,7 +186,8 @@ function WorkspaceHarness({
     <InboxWorkspace
       actionError={undefined}
       activities={activities}
-      conversationAdapter={conversationAdapter}
+      chatModelControlsAdapter={chatModelControlsAdapter}
+      conversationAdapter={adapter}
       conversationRevision={0}
       drafts={drafts}
       modelControlsAdapter={modelControlsAdapter}
@@ -304,6 +318,63 @@ test("New Chat clears the conversation and All Projects targets the first availa
   expect(screen.getByRole("textbox", { name: "Draft for Atlas" })).toHaveValue(
     "Explain the parser",
   );
+});
+
+test("restores a recently visited transcript immediately while its connection resumes", async () => {
+  const user = userEvent.setup();
+  let olderConnectionCount = 0;
+  let resolveOlderReconnect: ((connection: ConversationConnection) => void) | undefined;
+  const connection = (chatId: string, phase: "idle" | "running" = "idle") => ({
+    disconnect: vi.fn(),
+    snapshot: {
+      failure: null,
+      inputRequest: null,
+      items: [
+        {
+          id: `${chatId}-message`,
+          kind: "message" as const,
+          queued: false,
+          role: "assistant" as const,
+          text: `Transcript ${chatId}`,
+        },
+      ],
+      phase,
+    },
+  });
+  const adapter: ConversationAdapter = {
+    ...conversationAdapter,
+    connect: vi.fn((chatId: string): Promise<ConversationConnection> => {
+      if (chatId === "older" && ++olderConnectionCount === 2) {
+        return new Promise<ConversationConnection>((resolve) => {
+          resolveOlderReconnect = resolve;
+        });
+      }
+      return Promise.resolve(
+        connection(chatId, chatId === "older" && olderConnectionCount === 1 ? "running" : "idle"),
+      );
+    }),
+  };
+  render(<WorkspaceHarness adapter={adapter} initialChatId="older" />);
+
+  expect(await screen.findByText("Transcript older")).toBeVisible();
+  await user.type(screen.getByRole("textbox", { name: "Message Più" }), "Keep this draft");
+  await user.click(
+    screen.getByRole("button", {
+      name: /Keep this deliberately long chat title stable.*idle/,
+    }),
+  );
+  expect(await screen.findByText("Transcript middle")).toBeVisible();
+
+  await user.click(screen.getByRole("button", { name: "Document the importer, idle" }));
+  expect(screen.getByText("Transcript older")).toBeVisible();
+  expect(screen.getByRole("textbox", { name: "Message Più" })).toHaveValue("Keep this draft");
+  expect(screen.getByText("Reconnect to send")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Steer active turn" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Model: Qwen 3.8 27B" })).toBeDisabled();
+  expect(adapter.connect).toHaveBeenCalledTimes(3);
+
+  act(() => resolveOlderReconnect?.(connection("older")));
+  expect(await screen.findByRole("button", { name: "Send message" })).toBeEnabled();
 });
 
 test("secondary click and overflow expose the same ordered Rename and Delete actions", async () => {

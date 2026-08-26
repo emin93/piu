@@ -45,6 +45,7 @@
   display: flex;
   gap: 6px;
   align-items: center;
+  color: var(--foreground);
 }
 
 @media (max-width: 960px) {

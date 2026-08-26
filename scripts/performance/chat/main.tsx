@@ -1,5 +1,7 @@
 import { Profiler, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/profiling";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { inboxRenderCount, resetInboxRenderCounts } from "#inbox-performance-review";
 
@@ -378,6 +380,7 @@ function PerformanceReview() {
       currentScenario.current = undefined;
 
       setStatus("Measuring simulated Pi streaming");
+      await afterPaint();
       const receive = eventReceivers.current.get("performance-chat-0");
       if (!receive) throw new Error("Conversation event receiver is unavailable");
       resetInboxRenderCounts();
@@ -508,6 +511,28 @@ function RunOnce({ run }: { run: () => Promise<void> }) {
   return null;
 }
 
+function PerformanceRoot() {
+  const [active, setActive] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+    void Promise.allSettled([getCurrentWindow().setFocus(), getCurrentWebview().setFocus()]).then(
+      () => {
+        if (mounted) setActive(true);
+      },
+    );
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  return active ? (
+    <PerformanceReview />
+  ) : (
+    <output className="performance-review-status">Waiting for the packaged window</output>
+  );
+}
+
 const root = document.getElementById("root");
 if (!root) throw new Error("Più performance root is missing");
-createRoot(root).render(<PerformanceReview />);
+createRoot(root).render(<PerformanceRoot />);

@@ -568,6 +568,12 @@ function ConversationComposer({
   }, [onStop, pendingAction]);
 
   const showAuthenticationRecovery = Boolean(error?.authenticationRecovery && onRequestCodexSignIn);
+  const showModelControlsAuthenticationRecovery = Boolean(
+    modelControlsSnapshot.error &&
+    !modelControlsSnapshot.controls &&
+    modelControls &&
+    onRequestCodexSignIn,
+  );
   const showModelControlsRetry = Boolean(modelControlsSnapshot.error && modelControls);
 
   return (
@@ -614,9 +620,11 @@ function ConversationComposer({
         error || modelControlsSnapshot.error
           ? {
               action:
-                showAuthenticationRecovery || showModelControlsRetry ? (
+                showAuthenticationRecovery ||
+                showModelControlsAuthenticationRecovery ||
+                showModelControlsRetry ? (
                   <div className="conversation-composer-error-actions">
-                    {showAuthenticationRecovery ? (
+                    {showAuthenticationRecovery || showModelControlsAuthenticationRecovery ? (
                       <Button
                         onClick={onRequestCodexSignIn}
                         size="sm"
@@ -662,7 +670,7 @@ function ConversationComposer({
           />
           {modelControls ? (
             <ComposerInferenceControls
-              disabled={Boolean(pendingAction)}
+              disabled={!onSend || Boolean(pendingAction)}
               onSelectEffort={modelControls.selectEffort}
               onSelectRoute={modelControls.selectRoute}
               snapshot={modelControlsSnapshot}
@@ -674,12 +682,12 @@ function ConversationComposer({
       onValueChange={onDraftChange}
       placeholder={active ? "Steer the active turn" : "Continue the conversation"}
       status={
-        active && modelControlsSnapshot.controls?.appliesAfterCurrentStep ? (
+        !onSend ? (
+          <span>Reconnect to send</span>
+        ) : active && modelControlsSnapshot.controls?.appliesAfterCurrentStep ? (
           <span aria-live="polite">Switches after the current step</span>
         ) : active ? (
           <span>Steers at the next safe point</span>
-        ) : !onSend ? (
-          <span>Reconnect to send</span>
         ) : undefined
       }
       submitOnMetaEnter
