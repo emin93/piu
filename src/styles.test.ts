@@ -69,18 +69,44 @@ test("native controls and inherited sidebar copy keep explicit system-theme cont
   expect(stylesheet).toMatch(
     /\.product-composer-input\s*\{[^}]*color: var\(--foreground\);[^}]*caret-color: var\(--foreground\);/,
   );
+  expect(stylesheet).toMatch(/\.draft-row-prompt\s*\{[^}]*color: var\(--sidebar-foreground\);/);
+});
+
+test("application chrome owns nonselection without blocking diagnostic content", () => {
+  expect(stylesheet).not.toMatch(
+    /html,\s*body,\s*#root\s*\{[^}]*-webkit-user-select: none;[^}]*user-select: none;/,
+  );
   expect(stylesheet).toMatch(
-    /\.project-row-name,[\s\S]*?\.draft-row-prompt\s*\{[^}]*color: var\(--sidebar-foreground\);/,
+    /\.inbox-sidebar\s*\{[^}]*-webkit-user-select: none;[^}]*user-select: none;/,
+  );
+  expect(stylesheet).toMatch(
+    /input,\s*textarea,\s*\[contenteditable="true"\],\s*\.conversation-transcript\s*\{[^}]*-webkit-user-select: text;[^}]*user-select: text;/,
+  );
+  expect(stylesheet).toMatch(
+    /\.sidebar-error\s*\{[^}]*-webkit-user-select: text;[^}]*user-select: text;/,
   );
 });
 
 test("long chat branches stay inside their inbox metadata column", () => {
   expect(stylesheet).toMatch(/\.chat-row-copy\s*\{[\s\S]*?display: grid;[\s\S]*?min-width: 0;/);
   expect(stylesheet).toMatch(
-    /\.chat-row-metadata span:first-child\s*\{[\s\S]*?max-width: 42%;[\s\S]*?overflow: hidden;[\s\S]*?text-overflow: ellipsis;/,
+    /\.chat-row-project\s*\{[\s\S]*?max-width: 42%;[\s\S]*?overflow: hidden;[\s\S]*?text-overflow: ellipsis;/,
   );
   expect(stylesheet).toMatch(
-    /\.chat-row-metadata span:last-child\s*\{[\s\S]*?min-width: 0;[\s\S]*?overflow: hidden;[\s\S]*?text-overflow: ellipsis;/,
+    /\.chat-row-branch\s*\{[\s\S]*?min-width: 0;[\s\S]*?overflow: hidden;[\s\S]*?text-overflow: ellipsis;/,
+  );
+});
+
+test("project-scoped idle chats collapse to a compact two-line row", () => {
+  expect(stylesheet).toMatch(/\.chat-row\s*\{[^}]*contain-intrinsic-block-size: 62px;/);
+  expect(stylesheet).toMatch(
+    /\.chat-row\[data-compact="true"\]\s*\{[^}]*contain-intrinsic-block-size: 46px;/,
+  );
+  expect(stylesheet).toMatch(
+    /\.chat-row\[data-compact="true"\] \.chat-row-select\s*\{[^}]*min-height: 46px;/,
+  );
+  expect(stylesheet).toMatch(
+    /\.chat-row\[data-compact="true"\] \.chat-actions-trigger\s*\{[^}]*top: 11px;/,
   );
 });
 

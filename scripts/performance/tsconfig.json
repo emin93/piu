@@ -4,5 +4,11 @@
     "tsBuildInfoFile": "../../node_modules/.cache/tsconfig.performance.tsbuildinfo",
     "types": ["node"]
   },
-  "include": ["../../src/vite-env.d.ts", "chat/**/*.d.ts", "chat/**/*.tsx", "chat.vite.config.ts"]
+  "include": [
+    "../../src/vite-env.d.ts",
+    "chat/**/*.d.ts",
+    "chat/**/*.ts",
+    "chat/**/*.tsx",
+    "chat.vite.config.ts"
+  ]
 }

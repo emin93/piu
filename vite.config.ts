@@ -16,6 +16,10 @@ export default defineConfig(({ mode }) => {
     resolve: {
       alias: {
         "@": resolve(import.meta.dirname, "src"),
+        "#inbox-performance-review": resolve(
+          import.meta.dirname,
+          "src/features/inbox/inbox-performance-review.production.ts",
+        ),
         "#model-resource-qa": resolve(import.meta.dirname, qaEntry),
       },
     },

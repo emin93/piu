@@ -1,13 +1,16 @@
 import {
   ChevronDownIcon,
+  FolderIcon,
   FolderPlusIcon,
   MoreHorizontalIcon,
   PencilIcon,
   SearchIcon,
   SettingsIcon,
+  SquarePenIcon,
   Trash2Icon,
 } from "lucide-react";
 import {
+  Fragment,
   lazy,
   memo,
   Suspense,
@@ -33,12 +36,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
-  ContextMenu,
-  ContextMenuContent,
-  ContextMenuItem,
-  ContextMenuTrigger,
-} from "@/components/ui/context-menu";
-import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -50,12 +47,13 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Separator } from "@/components/ui/separator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ChatSummary, InboxSnapshot, ProjectSummary } from "@/platform/project-inbox";
 import type { ConversationAdapter } from "@/platform/conversations";
@@ -63,6 +61,7 @@ import type { PromptAttachment } from "@/platform/prompt-attachments";
 import type { ModelControlsAdapter } from "@/platform/model-controls";
 import type { ModelRouteId } from "@/generated/ModelRouteId";
 import type { ReasoningEffort } from "@/generated/ReasoningEffort";
+import { recordInboxRender } from "#inbox-performance-review";
 
 import { ChatComposer } from "./ChatComposer";
 import type { TranscriptViewState } from "../conversation/ConversationSurface";
@@ -90,16 +89,17 @@ interface InboxWorkspaceProps {
     route: ModelRouteId,
     effort: ReasoningEffort,
   ) => Promise<string | undefined>;
+  onDeleteChat: (chatId: string) => Promise<string | undefined>;
+  onNewChat: () => void;
   onOpenRepository: () => void;
   onOpenTerminal: (chatId: string) => Promise<string | undefined>;
   onOpenSettings: () => void;
   onRequestCodexSignIn: () => void;
+  onProjectScopeChange: (projectId: number | null) => void;
   onQueryChange: (query: string) => void;
-  onRemoveProject: (projectId: number) => Promise<string | undefined>;
   onRenameChat: (chatId: string, title: string) => Promise<string | undefined>;
   onRetrySetup: (chatId: string) => Promise<string | undefined>;
   onSelectChat: (chatId: string) => void;
-  onSelectProject: (projectId: number | null) => void;
   query: string;
   selectedProjectId: number | null;
   selectedChatId: string | null;
@@ -110,85 +110,7 @@ interface InboxWorkspaceProps {
 
 export type { DraftPersistenceStatus };
 
-const ProjectFilter = memo(function ProjectFilter({
-  onRemove,
-  onSelect,
-  project,
-  selected,
-}: {
-  onRemove: (trigger: HTMLButtonElement) => void;
-  onSelect: () => void;
-  project: ProjectSummary;
-  selected: boolean;
-}) {
-  const actionsTriggerRef = useRef<HTMLButtonElement>(null);
-  const removalBlocked = project.unmergedChatCount > 0;
-  const activeChatLabel = `${project.unmergedChatCount} active ${project.unmergedChatCount === 1 ? "chat" : "chats"}`;
-  const availabilityLabel =
-    project.availability === "available" ? "available" : "repository unavailable";
-  const removalReasonId = `project-${project.id}-removal-reason`;
-
-  return (
-    <li className="project-row">
-      <Button
-        aria-label={`${project.name}, ${availabilityLabel}, ${activeChatLabel}`}
-        aria-pressed={selected}
-        className="project-row-select"
-        onClick={onSelect}
-        type="button"
-        variant="ghost"
-      >
-        <span
-          aria-hidden="true"
-          className="project-availability"
-          data-availability={project.availability}
-        />
-        <span className="project-row-copy">
-          <span className="project-row-name" title={project.name}>
-            {project.name}
-          </span>
-          <span>{project.availability === "available" ? activeChatLabel : availabilityLabel}</span>
-        </span>
-      </Button>
-
-      <DropdownMenu>
-        <DropdownMenuTrigger
-          render={
-            <Button
-              aria-label={`Project actions for ${project.name}`}
-              className="project-actions-trigger"
-              ref={actionsTriggerRef}
-              size="icon-sm"
-              type="button"
-              variant="ghost"
-            />
-          }
-        >
-          <MoreHorizontalIcon aria-hidden="true" />
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-44">
-          <DropdownMenuItem
-            aria-describedby={removalBlocked ? removalReasonId : undefined}
-            disabled={removalBlocked}
-            onClick={() => {
-              if (actionsTriggerRef.current) onRemove(actionsTriggerRef.current);
-            }}
-            variant="destructive"
-          >
-            <Trash2Icon aria-hidden="true" />
-            Remove project
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-
-      {removalBlocked ? (
-        <span className="sr-only" id={removalReasonId}>
-          Merge active chats before removing {project.name}.
-        </span>
-      ) : null}
-    </li>
-  );
-});
+const ALL_PROJECTS_SCOPE = "all";
 
 const ChatConversationPanel = lazy(() => import("../conversation/ChatConversationPanel"));
 const MAX_CACHED_TRANSCRIPT_STATES = 32;
@@ -210,6 +132,7 @@ class TranscriptStateCache {
 }
 
 function SelectedChatStage({
+  cacheOwner,
   chat,
   chatModelControlsAdapter,
   conversationAdapter,
@@ -222,6 +145,7 @@ function SelectedChatStage({
   rememberTranscriptState,
   setups,
 }: {
+  cacheOwner: object;
   chat: ChatSummary;
   chatModelControlsAdapter?: ModelControlsAdapter;
   conversationAdapter: ConversationAdapter;
@@ -268,6 +192,7 @@ function SelectedChatStage({
     >
       <ChatConversationPanel
         adapter={conversationAdapter}
+        cacheOwner={cacheOwner}
         chatId={chat.id}
         initialTranscriptState={initialTranscriptState}
         key={chat.id}
@@ -280,21 +205,61 @@ function SelectedChatStage({
   );
 }
 
+const CHAT_ACTIONS = [
+  {
+    destructive: false,
+    Icon: PencilIcon,
+    id: "rename",
+    label: "Rename chat",
+    separatorBefore: false,
+  },
+  {
+    destructive: true,
+    Icon: Trash2Icon,
+    id: "delete",
+    label: "Delete chat",
+    separatorBefore: true,
+  },
+] as const;
+
+type ChatActionId = (typeof CHAT_ACTIONS)[number]["id"];
+const MERGED_CHAT_ACTIONS = CHAT_ACTIONS.slice(0, 1);
+
+function availableChatActions(chat: ChatSummary) {
+  return chat.mergeState === "merged" ? MERGED_CHAT_ACTIONS : CHAT_ACTIONS;
+}
+
+const CHAT_PHASE_LABELS = {
+  cancelled: "Cancelled",
+  failed: "Failed",
+  finished: "Finished",
+  idle: "Idle",
+  interrupted: "Interrupted",
+  "needs-input": "Needs input",
+  notRequired: "Idle",
+  pending: "Preparing",
+  running: "Running",
+  succeeded: "Idle",
+} as const;
+
 const ChatRow = memo(function ChatRow({
   activities,
   chat,
-  onRename,
+  onAction,
   onSelect,
   selected,
+  showProjectIdentity,
   setups,
 }: {
   activities: ChatActivityController;
   chat: ChatSummary;
-  onRename: (trigger: HTMLButtonElement) => void;
-  onSelect: () => void;
+  onAction: (action: ChatActionId, chat: ChatSummary, trigger: HTMLButtonElement) => void;
+  onSelect: (chatId: string) => void;
   selected: boolean;
+  showProjectIdentity: boolean;
   setups: ChatSetupController;
 }) {
+  recordInboxRender?.({ id: chat.id, kind: "chat-row" });
   const selectTriggerRef = useRef<HTMLButtonElement>(null);
   const subscribe = useCallback(
     (listener: () => void) => setups.subscribe(chat.id, listener),
@@ -310,55 +275,90 @@ const ChatRow = memo(function ChatRow({
   );
   const rowPhase =
     setup.phase === "succeeded" || setup.phase === "notRequired" ? activity.phase : setup.phase;
+  const transientStatus = rowPhase === "idle" ? null : CHAT_PHASE_LABELS[rowPhase];
+  const actions = availableChatActions(chat);
+  const compact = !showProjectIdentity && !transientStatus;
+  const openNativeMenu = useCallback(
+    async (position?: { x: number; y: number }) => {
+      const trigger = selectTriggerRef.current;
+      if (!trigger) return;
+      trigger.focus({ preventScroll: true });
+      const { popupNativeContextMenu } = await import("@/platform/native-context-menu");
+      await popupNativeContextMenu({
+        actions: availableChatActions(chat),
+        onAction: (action) => onAction(action, chat, trigger),
+        position,
+      });
+    },
+    [chat, onAction],
+  );
+  const requestNativeMenu = useCallback(
+    (position?: { x: number; y: number }) => {
+      void openNativeMenu(position).catch(() => undefined);
+    },
+    [openNativeMenu],
+  );
+
   return (
     <li
       className="chat-row"
-      data-activity={activity.phase}
+      data-activity={rowPhase}
       data-chat-id={chat.id}
+      data-compact={compact || undefined}
       data-unread={activity.unread || undefined}
     >
-      <ContextMenu>
-        <ContextMenuTrigger className="chat-row-context-trigger">
-          <Button
-            aria-label={`${chat.title}, ${rowPhase}${activity.unread ? ", unread" : ""}`}
-            aria-pressed={selected}
-            className="chat-row-select"
-            onClick={onSelect}
-            ref={selectTriggerRef}
-            type="button"
-            variant="ghost"
-          >
-            <span aria-hidden="true" className="chat-setup-indicator" data-phase={rowPhase} />
-            <span className="chat-row-copy">
-              <span className="chat-row-title" id={`chat-${chat.id}-title`} title={chat.title}>
-                {chat.title}
-              </span>
-              <span className="chat-row-metadata">
-                <span>{chat.projectName}</span>
-                <span aria-hidden="true">/</span>
-                <span className="font-mono" title={chat.branchName}>
-                  {chat.branchName}
+      <Button
+        aria-label={`${chat.title}, ${rowPhase}${activity.unread ? ", unread" : ""}`}
+        aria-pressed={selected}
+        className="chat-row-select"
+        onClick={() => onSelect(chat.id)}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          requestNativeMenu();
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+          event.preventDefault();
+          event.stopPropagation();
+          const bounds = event.currentTarget.getBoundingClientRect();
+          requestNativeMenu({
+            x: Math.round(bounds.left + Math.min(16, bounds.width / 2)),
+            y: Math.round(bounds.top + Math.min(28, bounds.height)),
+          });
+        }}
+        ref={selectTriggerRef}
+        type="button"
+        variant="ghost"
+      >
+        <span className="chat-row-copy">
+          {showProjectIdentity || transientStatus ? (
+            <span className="chat-row-eyebrow">
+              {showProjectIdentity ? (
+                <span className="chat-row-project">{chat.projectName}</span>
+              ) : null}
+              {transientStatus ? (
+                <span className="chat-row-status" data-phase={rowPhase}>
+                  {transientStatus}
                 </span>
-              </span>
+              ) : null}
+            </span>
+          ) : null}
+          <span className="chat-row-title" id={`chat-${chat.id}-title`} title={chat.title}>
+            {chat.title}
+          </span>
+          <span className="chat-row-metadata">
+            <span className="chat-row-branch font-mono" title={chat.branchName}>
+              {chat.branchName}
             </span>
             {chat.pullRequestNumber !== null ? (
               <Badge className="font-mono" variant="outline">
                 #{chat.pullRequestNumber}
               </Badge>
             ) : null}
-          </Button>
-        </ContextMenuTrigger>
-        <ContextMenuContent className="w-40">
-          <ContextMenuItem
-            onClick={() => {
-              if (selectTriggerRef.current) onRename(selectTriggerRef.current);
-            }}
-          >
-            <PencilIcon aria-hidden="true" />
-            Rename chat
-          </ContextMenuItem>
-        </ContextMenuContent>
-      </ContextMenu>
+          </span>
+        </span>
+      </Button>
 
       <DropdownMenu>
         <DropdownMenuTrigger
@@ -376,109 +376,138 @@ const ChatRow = memo(function ChatRow({
           <MoreHorizontalIcon aria-hidden="true" />
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="w-40">
-          <DropdownMenuItem
-            onClick={() => {
-              if (selectTriggerRef.current) onRename(selectTriggerRef.current);
-            }}
-          >
-            <PencilIcon aria-hidden="true" />
-            Rename chat
-          </DropdownMenuItem>
+          {actions.map((action) => (
+            <Fragment key={action.id}>
+              {action.separatorBefore ? <DropdownMenuSeparator /> : null}
+              <DropdownMenuItem
+                onClick={() => {
+                  if (selectTriggerRef.current) onAction(action.id, chat, selectTriggerRef.current);
+                }}
+                variant={action.destructive ? "destructive" : "default"}
+              >
+                <action.Icon aria-hidden="true" />
+                {action.label}
+              </DropdownMenuItem>
+            </Fragment>
+          ))}
         </DropdownMenuContent>
       </DropdownMenu>
     </li>
   );
 });
 
-function DraftList({
-  drafts,
-  onSelectProject,
+const ProjectScopeControl = memo(function ProjectScopeControl({
+  onOpenRepository,
+  onProjectScopeChange,
   projects,
-  query,
+  scopeProject,
   selectedProjectId,
 }: {
-  drafts: ProjectDraftController;
-  onSelectProject: (projectId: number | null) => void;
-  projects: ProjectSummary[];
-  query: string;
+  onOpenRepository: () => void;
+  onProjectScopeChange: (projectId: number | null) => void;
+  projects: readonly ProjectSummary[];
+  scopeProject: ProjectSummary | undefined;
   selectedProjectId: number | null;
 }) {
-  useSyncExternalStore(drafts.subscribeAll, drafts.getRevision, drafts.getRevision);
-  const normalizedQuery = query.trim().toLocaleLowerCase();
-  const visibleDrafts = projects.flatMap((project) => {
-    if (selectedProjectId !== null && project.id !== selectedProjectId) return [];
-    const draft = drafts.get(project.id);
-    if (!draft.prompt && draft.attachments.length === 0) return [];
-    const attachmentNames = draft.attachments.map(({ name }) => name).join(" ");
-    if (
-      normalizedQuery &&
-      !`${project.name} ${draft.prompt} ${attachmentNames}`
-        .toLocaleLowerCase()
-        .includes(normalizedQuery)
-    ) {
-      return [];
-    }
-    const summary =
-      draft.prompt ||
-      (draft.attachments.length === 1
-        ? `Attached ${draft.attachments[0].name}`
-        : `${draft.attachments.length} attached files`);
-    return [{ draft, project, summary }];
-  });
-
-  if (visibleDrafts.length === 0) return null;
+  recordInboxRender?.({ kind: "scope-control" });
 
   return (
-    <section aria-labelledby="retained-drafts-heading">
-      <div className="sidebar-section-heading">
-        <span id="retained-drafts-heading">Drafts</span>
-        <span className="font-mono">{visibleDrafts.length}</span>
-      </div>
-      <ul aria-label="Unsent drafts" className="draft-list">
-        {visibleDrafts.map(({ draft, project, summary }) => (
-          <li key={project.id}>
+    <div className="sidebar-scope-row">
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
             <Button
-              className="draft-row"
-              onClick={() => onSelectProject(project.id)}
+              aria-label={`Project scope: ${scopeProject?.name ?? "All Projects"}`}
+              className="project-scope-trigger"
               type="button"
               variant="ghost"
-            >
-              <span className="draft-row-project">{project.name}</span>
-              <span className="draft-row-prompt">{summary}</span>
-              {draft.status.state === "failed" ? (
-                <span className="draft-row-failure">Not saved</span>
-              ) : null}
-            </Button>
-            {draft.status.state === "failed" ? (
-              <Button
-                className="draft-row-retry"
-                onClick={() => void drafts.retry(project.id)}
-                size="sm"
-                type="button"
-                variant="ghost"
-              >
-                Retry
-              </Button>
-            ) : null}
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
+            />
+          }
+        >
+          <FolderIcon aria-hidden="true" />
+          <span>{scopeProject?.name ?? "All Projects"}</span>
+          <ChevronDownIcon aria-hidden="true" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="project-scope-menu">
+          <DropdownMenuRadioGroup
+            onValueChange={(value) =>
+              onProjectScopeChange(value === ALL_PROJECTS_SCOPE ? null : Number(value))
+            }
+            value={selectedProjectId === null ? ALL_PROJECTS_SCOPE : String(selectedProjectId)}
+          >
+            <DropdownMenuRadioItem closeOnClick value={ALL_PROJECTS_SCOPE}>
+              <FolderIcon aria-hidden="true" />
+              <span>All Projects</span>
+            </DropdownMenuRadioItem>
+            {projects.map((project) => (
+              <DropdownMenuRadioItem closeOnClick key={project.id} value={String(project.id)}>
+                <FolderIcon aria-hidden="true" />
+                <span>{project.name}</span>
+              </DropdownMenuRadioItem>
+            ))}
+          </DropdownMenuRadioGroup>
+        </DropdownMenuContent>
+      </DropdownMenu>
 
-function SearchStage({ count }: { count: number }) {
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <Button
+              aria-label="Open Repository"
+              onClick={onOpenRepository}
+              size="icon-lg"
+              type="button"
+              variant="ghost"
+            />
+          }
+        >
+          <FolderPlusIcon aria-hidden="true" />
+        </TooltipTrigger>
+        <TooltipContent side="right">Open Repository</TooltipContent>
+      </Tooltip>
+    </div>
+  );
+});
+
+function ProjectDraftRow({
+  drafts,
+  onSelect,
+  project,
+}: {
+  drafts: ProjectDraftController;
+  onSelect: () => void;
+  project: ProjectSummary;
+}) {
+  useSyncExternalStore(drafts.subscribeAll, drafts.getRevision, drafts.getRevision);
+  const draft = drafts.get(project.id);
+  if (!draft.prompt && draft.attachments.length === 0) return null;
+  const summary =
+    draft.prompt ||
+    (draft.attachments.length === 1
+      ? `Attached ${draft.attachments[0].name}`
+      : `${draft.attachments.length} attached files`);
+
   return (
-    <Empty className="stage-empty">
-      <EmptyHeader>
-        <EmptyTitle>{count === 0 ? "No matching chats" : `${count} matching chats`}</EmptyTitle>
-        <EmptyDescription>
-          {count === 0
-            ? "Try a title, project, branch, or pull-request number."
-            : "Search results are shown in the inbox."}
-        </EmptyDescription>
-      </EmptyHeader>
-    </Empty>
+    <li className="draft-row-shell" data-draft-project-id={project.id}>
+      <Button className="draft-row" onClick={onSelect} type="button" variant="ghost">
+        <span className="draft-row-project">Draft</span>
+        <span className="draft-row-prompt">{summary}</span>
+        {draft.status.state === "failed" ? (
+          <span className="draft-row-failure">Not saved</span>
+        ) : null}
+      </Button>
+      {draft.status.state === "failed" ? (
+        <Button
+          className="draft-row-retry"
+          onClick={() => void drafts.retry(project.id)}
+          size="sm"
+          type="button"
+          variant="ghost"
+        >
+          Retry
+        </Button>
+      ) : null}
+    </li>
   );
 }
 
@@ -492,16 +521,17 @@ export function InboxWorkspace({
   modelControlsAdapter,
   onCancelSetup,
   onCreateChat,
+  onDeleteChat,
+  onNewChat,
   onOpenRepository,
   onOpenTerminal,
   onOpenSettings,
   onRequestCodexSignIn,
+  onProjectScopeChange,
   onQueryChange,
-  onRemoveProject,
   onRenameChat,
   onRetrySetup,
   onSelectChat,
-  onSelectProject,
   query,
   selectedProjectId,
   selectedChatId,
@@ -509,46 +539,38 @@ export function InboxWorkspace({
   setups,
   snapshot,
 }: InboxWorkspaceProps) {
-  const [projectPendingRemoval, setProjectPendingRemoval] = useState<ProjectSummary>();
-  const [removalError, setRemovalError] = useState<string>();
-  const [removing, setRemoving] = useState(false);
-  const removalCancelRef = useRef<HTMLButtonElement>(null);
-  const removalTriggerRef = useRef<HTMLButtonElement>(null);
   const [chatPendingRename, setChatPendingRename] = useState<ChatSummary>();
   const [renameTitle, setRenameTitle] = useState("");
   const [renameError, setRenameError] = useState<string>();
   const [renaming, setRenaming] = useState(false);
   const renameInputRef = useRef<HTMLInputElement>(null);
   const renameTriggerRef = useRef<HTMLButtonElement>(null);
+  const [chatPendingDeletion, setChatPendingDeletion] = useState<ChatSummary>();
+  const [deletionError, setDeletionError] = useState<string>();
+  const [deleting, setDeleting] = useState(false);
+  const deletionCancelRef = useRef<HTMLButtonElement>(null);
+  const deletionFinalFocusRef = useRef<HTMLButtonElement>(null);
+  const deletionNeighborChatIdRef = useRef<string | undefined>(undefined);
+  const newChatTriggerRef = useRef<HTMLButtonElement>(null);
   const transcriptStates = useMemo(() => new TranscriptStateCache(), []);
+  const conversationCacheOwner = useMemo(
+    () => ({ chatModelControlsAdapter, conversationAdapter }),
+    [chatModelControlsAdapter, conversationAdapter],
+  );
+  const scopeProject = snapshot.projects.find(({ id }) => id === selectedProjectId);
   const selection = useMemo(
     () => selectInbox(snapshot, { projectId: selectedProjectId, query }),
     [query, selectedProjectId, snapshot],
   );
   const targetProject = composerProject(snapshot, selectedProjectId);
   const selectedChat = snapshot.chats.find(({ id }) => id === selectedChatId);
-  const visibleChatCount = selection.unmergedChats.length;
+
   const rememberTranscriptState = useCallback(
     (chatId: string, state: TranscriptViewState) => {
       transcriptStates.remember(chatId, state);
     },
     [transcriptStates],
   );
-
-  const closeRemovalDialog = useCallback(() => {
-    setProjectPendingRemoval(undefined);
-    setRemovalError(undefined);
-  }, []);
-
-  const confirmRemoval = useCallback(async () => {
-    if (!projectPendingRemoval) return;
-    setRemoving(true);
-    setRemovalError(undefined);
-    const error = await onRemoveProject(projectPendingRemoval.id);
-    setRemoving(false);
-    if (error) setRemovalError(error);
-    else closeRemovalDialog();
-  }, [closeRemovalDialog, onRemoveProject, projectPendingRemoval]);
 
   const closeRenameDialog = useCallback(() => {
     setChatPendingRename(undefined);
@@ -565,61 +587,111 @@ export function InboxWorkspace({
     else closeRenameDialog();
   }, [chatPendingRename, closeRenameDialog, onRenameChat, renameTitle]);
 
-  const pendingRemovalHasDraft = projectPendingRemoval
-    ? Boolean(
-        drafts.get(projectPendingRemoval.id).prompt ||
-        drafts.get(projectPendingRemoval.id).attachments.length,
-      )
-    : false;
-  const totalSearchResults = selection.unmergedChats.length + selection.mergedChats.length;
+  const closeDeletionDialog = useCallback(() => {
+    setChatPendingDeletion(undefined);
+    setDeletionError(undefined);
+  }, []);
+
+  const handleChatAction = useCallback(
+    (action: ChatActionId, chat: ChatSummary, trigger: HTMLButtonElement) => {
+      if (action === "rename") {
+        renameTriggerRef.current = trigger;
+        setRenameTitle(chat.title);
+        setRenameError(undefined);
+        setChatPendingRename(chat);
+        return;
+      }
+
+      const visibleChats =
+        chat.mergeState === "merged" ? selection.mergedChats : selection.unmergedChats;
+      const chatIndex = visibleChats.findIndex(({ id }) => id === chat.id);
+      deletionNeighborChatIdRef.current =
+        visibleChats[chatIndex + 1]?.id ?? visibleChats[chatIndex - 1]?.id;
+      deletionFinalFocusRef.current = trigger;
+      setDeletionError(undefined);
+      setChatPendingDeletion(chat);
+    },
+    [selection.mergedChats, selection.unmergedChats],
+  );
+
+  const confirmDeletion = useCallback(async () => {
+    if (!chatPendingDeletion) return;
+    setDeleting(true);
+    setDeletionError(undefined);
+    const error = await onDeleteChat(chatPendingDeletion.id);
+    setDeleting(false);
+    if (error) {
+      setDeletionError(error);
+      return;
+    }
+
+    const { invalidateCachedChatConversationSession } =
+      await import("../conversation/chat-conversation-session-cache");
+    invalidateCachedChatConversationSession(conversationCacheOwner, chatPendingDeletion.id);
+
+    const neighborChatId = deletionNeighborChatIdRef.current;
+    const neighborRow = neighborChatId
+      ? [...document.querySelectorAll<HTMLElement>("[data-chat-id]")].find(
+          ({ dataset }) => dataset.chatId === neighborChatId,
+        )
+      : undefined;
+    deletionFinalFocusRef.current =
+      neighborRow?.querySelector<HTMLButtonElement>(".chat-row-select") ??
+      newChatTriggerRef.current;
+    closeDeletionDialog();
+  }, [chatPendingDeletion, closeDeletionDialog, conversationCacheOwner, onDeleteChat]);
 
   return (
     <main className="workspace" aria-label="Più inbox">
       <aside
         aria-label="Chat inbox navigation"
         className="inbox-sidebar"
-        inert={projectPendingRemoval || chatPendingRename ? true : undefined}
+        inert={chatPendingRename || chatPendingDeletion ? true : undefined}
       >
         <div className="sidebar-header">
-          <div className="sidebar-title-row">
-            <h1>Inbox</h1>
-            <div className="sidebar-title-actions">
-              <Badge aria-label={`${visibleChatCount} active chats`} variant="secondary">
-                {visibleChatCount}
-              </Badge>
-              {snapshot.projects.length > 0 ? (
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
-                      <Button
-                        aria-label="Open Repository"
-                        onClick={onOpenRepository}
-                        size="icon"
-                        type="button"
-                        variant="ghost"
-                      />
-                    }
-                  >
-                    <FolderPlusIcon aria-hidden="true" />
-                  </TooltipTrigger>
-                  <TooltipContent side="right">Open Repository</TooltipContent>
-                </Tooltip>
-              ) : null}
-            </div>
+          <h1 className="sr-only">Inbox</h1>
+          <div className="sidebar-search-row">
+            <label className="search-field">
+              <span className="sr-only">Search chats</span>
+              <SearchIcon aria-hidden="true" />
+              <Input
+                aria-label="Search chats"
+                disabled={snapshot.projects.length === 0}
+                onChange={(event) => onQueryChange(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key !== "Escape" || !query) return;
+                  event.preventDefault();
+                  onQueryChange("");
+                  event.currentTarget.focus();
+                }}
+                placeholder="Search chats"
+                type="search"
+                value={query}
+              />
+            </label>
+            <Button
+              className="sidebar-new-chat-action"
+              disabled={!targetProject}
+              onClick={onNewChat}
+              ref={newChatTriggerRef}
+              size="icon-lg"
+              type="button"
+              variant="ghost"
+              aria-label="New Chat"
+            >
+              <SquarePenIcon aria-hidden="true" />
+            </Button>
           </div>
 
-          <label className="search-field">
-            <span className="sr-only">Search chats</span>
-            <SearchIcon aria-hidden="true" />
-            <Input
-              aria-label="Search chats"
-              disabled={snapshot.projects.length === 0}
-              onChange={(event) => onQueryChange(event.target.value)}
-              placeholder="Search chats"
-              type="search"
-              value={query}
+          {snapshot.projects.length > 0 ? (
+            <ProjectScopeControl
+              onOpenRepository={onOpenRepository}
+              onProjectScopeChange={onProjectScopeChange}
+              projects={snapshot.projects}
+              scopeProject={scopeProject}
+              selectedProjectId={selectedProjectId}
             />
-          </label>
+          ) : null}
 
           {actionError && snapshot.projects.length > 0 ? (
             <p className="sidebar-error" role="alert">
@@ -630,79 +702,29 @@ export function InboxWorkspace({
 
         <ScrollArea className="sidebar-scroll-area">
           <div className="sidebar-scroll-content">
-            <nav aria-label="Project filters" className="project-filters">
-              <div className="sidebar-section-heading">
-                <span>Projects</span>
-              </div>
-              <Button
-                aria-label={`All Projects, ${snapshot.projects.length} ${snapshot.projects.length === 1 ? "project" : "projects"}`}
-                aria-pressed={selectedProjectId === null}
-                className="all-projects-filter"
-                disabled={snapshot.projects.length === 0}
-                onClick={() => onSelectProject(null)}
-                type="button"
-                variant="ghost"
-              >
-                <span>All Projects</span>
-                <span className="font-mono">{snapshot.projects.length}</span>
-              </Button>
-              <ul>
-                {snapshot.projects.map((project) => (
-                  <ProjectFilter
-                    key={project.id}
-                    onRemove={(trigger) => {
-                      removalTriggerRef.current = trigger;
-                      setRemovalError(undefined);
-                      setProjectPendingRemoval(project);
-                    }}
-                    onSelect={() => onSelectProject(project.id)}
-                    project={project}
-                    selected={selectedProjectId === project.id}
+            {selection.unmergedChats.length > 0 || (scopeProject && !query.trim()) ? (
+              <ul aria-label="Chat inbox" className="chat-list">
+                {scopeProject && !query.trim() ? (
+                  <ProjectDraftRow drafts={drafts} onSelect={onNewChat} project={scopeProject} />
+                ) : null}
+                {selection.unmergedChats.map((chat) => (
+                  <ChatRow
+                    activities={activities}
+                    chat={chat}
+                    key={chat.id}
+                    onAction={handleChatAction}
+                    onSelect={onSelectChat}
+                    selected={selectedChatId === chat.id}
+                    setups={setups}
+                    showProjectIdentity={selectedProjectId === null}
                   />
                 ))}
               </ul>
-            </nav>
-
-            <Separator className="sidebar-separator" />
-
-            <DraftList
-              drafts={drafts}
-              onSelectProject={onSelectProject}
-              projects={snapshot.projects}
-              query={query}
-              selectedProjectId={selectedProjectId}
-            />
-
-            <section aria-labelledby="active-chats-heading" className="chat-list-section">
-              <div className="sidebar-section-heading">
-                <span id="active-chats-heading">Chats</span>
-                <span className="font-mono">{visibleChatCount}</span>
-              </div>
-              {selection.unmergedChats.length > 0 ? (
-                <ul aria-label="Active chats" className="chat-list">
-                  {selection.unmergedChats.map((chat) => (
-                    <ChatRow
-                      activities={activities}
-                      chat={chat}
-                      key={chat.id}
-                      onRename={(trigger) => {
-                        renameTriggerRef.current = trigger;
-                        setRenameTitle(chat.title);
-                        setRenameError(undefined);
-                        setChatPendingRename(chat);
-                      }}
-                      onSelect={() => onSelectChat(chat.id)}
-                      selected={selectedChatId === chat.id}
-                      setups={setups}
-                    />
-                  ))}
-                </ul>
-              ) : (
-                <p className="sidebar-zero-copy">
-                  {query.trim() ? "No matching chats" : "No active chats"}
-                </p>
-              )}
-            </section>
+            ) : (
+              <p className="sidebar-zero-copy">
+                {query.trim() ? "No matching chats" : "No active chats"}
+              </p>
+            )}
 
             {selection.mergedChats.length > 0 ? (
               <Collapsible className="merged-history">
@@ -722,15 +744,11 @@ export function InboxWorkspace({
                         activities={activities}
                         chat={chat}
                         key={chat.id}
-                        onRename={(trigger) => {
-                          renameTriggerRef.current = trigger;
-                          setRenameTitle(chat.title);
-                          setRenameError(undefined);
-                          setChatPendingRename(chat);
-                        }}
-                        onSelect={() => onSelectChat(chat.id)}
+                        onAction={handleChatAction}
+                        onSelect={onSelectChat}
                         selected={selectedChatId === chat.id}
                         setups={setups}
+                        showProjectIdentity={selectedProjectId === null}
                       />
                     ))}
                   </ul>
@@ -758,14 +776,14 @@ export function InboxWorkspace({
       <section
         aria-label="Chat workspace"
         className="conversation-stage"
-        inert={projectPendingRemoval || chatPendingRename ? true : undefined}
+        data-selected-chat-id={selectedChat?.id}
+        inert={chatPendingRename || chatPendingDeletion ? true : undefined}
       >
         {snapshot.projects.length === 0 ? (
           <EmptyInbox actionError={actionError} onOpenRepository={onOpenRepository} />
-        ) : query.trim() ? (
-          <SearchStage count={totalSearchResults} />
         ) : selectedChat ? (
           <SelectedChatStage
+            cacheOwner={conversationCacheOwner}
             chat={selectedChat}
             chatModelControlsAdapter={chatModelControlsAdapter}
             conversationAdapter={conversationAdapter}
@@ -783,44 +801,48 @@ export function InboxWorkspace({
             drafts={drafts}
             key={targetProject.id}
             modelControlsAdapter={modelControlsAdapter}
+            onRequestCodexSignIn={onRequestCodexSignIn}
             onSubmit={onCreateChat}
             project={targetProject}
+            revision={conversationRevision}
           />
         ) : null}
       </section>
 
       <AlertDialog
         onOpenChange={(open) => {
-          if (!open && !removing) closeRemovalDialog();
+          if (!open && !deleting) closeDeletionDialog();
         }}
-        open={Boolean(projectPendingRemoval)}
+        open={Boolean(chatPendingDeletion)}
       >
-        {projectPendingRemoval ? (
-          <AlertDialogContent finalFocus={removalTriggerRef} initialFocus={removalCancelRef}>
+        {chatPendingDeletion ? (
+          <AlertDialogContent
+            finalFocus={() => deletionFinalFocusRef.current}
+            initialFocus={deletionCancelRef}
+          >
             <AlertDialogHeader>
-              <AlertDialogTitle>Remove {projectPendingRemoval.name}?</AlertDialogTitle>
+              <AlertDialogTitle>Delete “{chatPendingDeletion.title}”?</AlertDialogTitle>
               <AlertDialogDescription>
-                Più will forget this project. The repository on disk won&apos;t be changed.
-                {pendingRemovalHasDraft ? (
-                  <span className="mt-2 block">Its unsent draft will be deleted from Più.</span>
-                ) : null}
+                This permanently deletes the local conversation, managed worktree, and local branch.
+                It won&apos;t close a pull request or delete a remote branch.
+                <span className="mt-2 block">Any active agent will be stopped first.</span>
               </AlertDialogDescription>
             </AlertDialogHeader>
-            {removalError ? (
+            {deletionError ? (
               <p className="dialog-error" role="alert">
-                {removalError}
+                {deletionError}
               </p>
             ) : null}
             <AlertDialogFooter>
-              <AlertDialogCancel disabled={removing} ref={removalCancelRef}>
+              <AlertDialogCancel disabled={deleting} ref={deletionCancelRef}>
                 Cancel
               </AlertDialogCancel>
               <AlertDialogAction
-                disabled={removing}
-                onClick={() => void confirmRemoval()}
+                disabled={deleting}
+                onClick={() => void confirmDeletion()}
                 variant="destructive"
               >
-                {removing ? "Removing" : "Remove project"}
+                {deleting ? "Deleting" : "Delete chat"}
               </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>

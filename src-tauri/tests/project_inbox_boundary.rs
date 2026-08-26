@@ -5,6 +5,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs,
+    os::unix::fs::symlink,
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex, mpsc},
@@ -14,20 +15,20 @@ use std::{
 use piu_lib::{
     agent_environment::{AgentEnvironment, AgentEnvironmentPolicy, AgentEnvironmentProcessSpec},
     application::ApplicationCore,
-    chat_runtime_host::{ModelRouteId, ReasoningEffort},
+    chat_runtime_host::{ChatRuntimeHost, ModelRouteId, ReasoningEffort},
     git_process::GitProcess,
     host_boundary::{HostRoundTripRequest, HostRoundTripResponse},
     project_commands::{
         CHAT_SETUP_CHANGED_EVENT, CHAT_TERMINAL_REQUESTED_EVENT, ChatIdRequest, CreateChatRequest,
         CreateChatResponse, OpenRepositoryRequest, OpenRepositoryResponse,
-        PROJECT_INBOX_CHANGED_EVENT, ProjectInboxChangedEvent, RenameChatRequest,
-        SaveProjectDraftRequest,
+        PROJECT_INBOX_CHANGED_EVENT, ProjectCommandError, ProjectCommandErrorCode,
+        ProjectInboxChangedEvent, RenameChatRequest, SaveProjectDraftRequest,
     },
     project_inbox::{
         DraftSummary, ProjectInbox, RepositoryIdentity, RepositoryInspectionError,
         RepositoryInspector,
     },
-    runtime_preferences::RuntimePreferences,
+    runtime_preferences::{ModelRoute, RuntimePreferences},
 };
 use support::TemporaryGitRemote;
 use tauri::{
@@ -41,13 +42,14 @@ fn fixture_agent_environment(
     database_path: &Path,
     inbox: Arc<ProjectInbox>,
     fixture_root: &Path,
+    mode: &str,
 ) -> Arc<AgentEnvironment> {
     let mut environment = BTreeMap::new();
     environment.insert(OsString::from("HOME"), OsString::from("/Users/piu-test"));
     environment.insert(OsString::from("PATH"), OsString::from("/usr/bin:/bin"));
     environment.insert(
         OsString::from("PIU_ENVIRONMENT_FIXTURE_MODE"),
-        OsString::from("snapshot"),
+        OsString::from(mode),
     );
     environment.insert(
         OsString::from("PIU_ENVIRONMENT_FIXTURE_RECORD_DIR"),
@@ -298,8 +300,12 @@ fn first_send_crosses_the_typed_boundary_and_publishes_setup_and_terminal_action
         .unwrap()
         .project
         .id;
-    let environment =
-        fixture_agent_environment(&database_path, core.project_inbox(), fixture.path());
+    let environment = fixture_agent_environment(
+        &database_path,
+        core.project_inbox(),
+        fixture.path(),
+        "snapshot",
+    );
     let app = piu_lib::configure_builder(test::mock_builder().manage(core).manage(environment))
         .build(test::mock_context(test::noop_assets()))
         .unwrap();
@@ -427,4 +433,230 @@ fn first_send_crosses_the_typed_boundary_and_publishes_setup_and_terminal_action
         .unwrap();
     assert!(!terminal_event.contains("worktrees"));
     assert!(terminal_event.contains(&response.chat.id));
+}
+
+#[test]
+fn deletion_crosses_the_production_boundary_stops_pi_and_emits_one_local_only_change() {
+    let fixture = tempfile::TempDir::new().unwrap();
+    let repository = TemporaryGitRemote::new();
+    fs::write(repository.working_path().join("README.md"), "fixture\n").unwrap();
+    repository.git(["add", "README.md"]);
+    repository.git(["commit", "-m", "fixture"]);
+    repository.git(["push", "-u", "origin", "main"]);
+    let database_path = fixture.path().join("piu.sqlite3");
+    let core = ApplicationCore::open(
+        &database_path,
+        GitProcess::with_executable("/usr/bin/git".into()),
+    )
+    .unwrap();
+    let project_id = core
+        .project_inbox()
+        .open_repository(repository.working_path())
+        .unwrap()
+        .project
+        .id;
+    let chat = core
+        .chat_workspaces()
+        .create_chat(
+            project_id,
+            "Delete through the native boundary",
+            &[],
+            ModelRoute::new("openai-codex", "gpt-5.6-sol")
+                .unwrap()
+                .selection(Some("xhigh")),
+        )
+        .unwrap()
+        .chat;
+    core.chat_workspaces()
+        .start_setup(&chat.id, Arc::new(|_| {}))
+        .unwrap();
+    let dirty_chat = core
+        .chat_workspaces()
+        .create_chat(
+            project_id,
+            "Preserve dirty data at the boundary",
+            &[],
+            ModelRoute::new("openai-codex", "gpt-5.6-sol")
+                .unwrap()
+                .selection(Some("xhigh")),
+        )
+        .unwrap()
+        .chat;
+    core.chat_workspaces()
+        .start_setup(&dirty_chat.id, Arc::new(|_| {}))
+        .unwrap();
+    let dirty_file = fixture
+        .path()
+        .join("worktrees")
+        .join(&dirty_chat.id)
+        .join("preserve-me.txt");
+    fs::write(&dirty_file, "uncommitted\n").unwrap();
+    repository.git([
+        "push",
+        "origin",
+        &format!("{}:{}", chat.branch_name, chat.branch_name),
+    ]);
+    rusqlite::Connection::open(&database_path)
+        .unwrap()
+        .execute(
+            "UPDATE chats SET pull_request_number = 42 WHERE id = ?1",
+            [&chat.id],
+        )
+        .unwrap();
+
+    let environment = fixture_agent_environment(
+        &database_path,
+        core.project_inbox(),
+        fixture.path(),
+        "chat-runtime",
+    );
+    let resource_directory = fixture.path().join("resources");
+    let node = resource_directory.join("agent-runtime/node/bin/node");
+    let launcher = resource_directory.join("agent-runtime/pi/launcher/chat-launcher.mjs");
+    fs::create_dir_all(node.parent().unwrap()).unwrap();
+    fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    fs::create_dir_all(resource_directory.join("agent-runtime/skills")).unwrap();
+    symlink("/bin/zsh", &node).unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat-runtime-child.zsh"),
+        &launcher,
+    )
+    .unwrap();
+    fs::create_dir_all(fixture.path().join("host-fixture/live")).unwrap();
+    fs::write(fixture.path().join("host-fixture/mode"), "quiet").unwrap();
+    let home = fixture.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let runtime = ChatRuntimeHost::new(
+        core.project_inbox(),
+        core.chat_workspaces(),
+        Arc::clone(&environment),
+        fixture.path(),
+        &resource_directory,
+        &home,
+    )
+    .unwrap();
+    tauri::async_runtime::block_on(runtime.open(&chat.id)).unwrap();
+    assert_eq!(
+        fs::read_dir(fixture.path().join("host-fixture/live"))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    let app = piu_lib::configure_builder(
+        test::mock_builder()
+            .manage(core)
+            .manage(environment)
+            .manage(runtime),
+    )
+    .build(test::mock_context(test::noop_assets()))
+    .unwrap();
+    let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let (event_sender, event_receiver) = mpsc::channel();
+    app.listen(PROJECT_INBOX_CHANGED_EVENT, move |event| {
+        event_sender
+            .send(
+                serde_json::from_str::<ProjectInboxChangedEvent>(event.payload())
+                    .expect("delete event should be typed"),
+            )
+            .unwrap();
+    });
+
+    let snapshot = test::get_ipc_response(
+        &webview,
+        InvokeRequest {
+            cmd: "delete_chat".into(),
+            callback: CallbackFn(30),
+            error: CallbackFn(31),
+            url: "tauri://localhost".parse().unwrap(),
+            body: InvokeBody::Json(serde_json::json!({
+                "request": ChatIdRequest {
+                    chat_id: chat.id.clone(),
+                }
+            })),
+            headers: Default::default(),
+            invoke_key: test::INVOKE_KEY.into(),
+        },
+    )
+    .unwrap()
+    .deserialize::<piu_lib::project_inbox::InboxSnapshot>()
+    .unwrap();
+    let event = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    assert_eq!(snapshot.chats.len(), 1);
+    assert_eq!(snapshot.chats[0].id, dirty_chat.id);
+    assert_eq!(event.snapshot, snapshot);
+    assert_eq!(event.focused_project_id, None);
+    assert!(event_receiver.try_recv().is_err());
+    assert!(!fixture.path().join("worktrees").join(&chat.id).exists());
+    assert_eq!(
+        repository
+            .git(["ls-remote", "--heads", "origin", &chat.branch_name])
+            .lines()
+            .count(),
+        1,
+        "the production command must not delete the remote branch"
+    );
+    assert_eq!(
+        fs::read_dir(fixture.path().join("host-fixture/live"))
+            .unwrap()
+            .count(),
+        0,
+        "the Pi child must stop before the worktree is removed"
+    );
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    let chat_rows: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM chats WHERE id = ?1",
+            [&chat.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let message_rows: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM chat_messages WHERE chat_id = ?1",
+            [&chat.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!((chat_rows, message_rows), (0, 0));
+
+    let rejected = test::get_ipc_response(
+        &webview,
+        InvokeRequest {
+            cmd: "delete_chat".into(),
+            callback: CallbackFn(32),
+            error: CallbackFn(33),
+            url: "tauri://localhost".parse().unwrap(),
+            body: InvokeBody::Json(serde_json::json!({
+                "request": ChatIdRequest {
+                    chat_id: dirty_chat.id.clone(),
+                }
+            })),
+            headers: Default::default(),
+            invoke_key: test::INVOKE_KEY.into(),
+        },
+    );
+    let rejected = serde_json::from_value::<ProjectCommandError>(
+        rejected.expect_err("dirty deletion should cross the typed error boundary"),
+    )
+    .unwrap();
+    assert!(matches!(
+        rejected.code,
+        ProjectCommandErrorCode::UnsafeChatDeletion
+    ));
+    assert!(rejected.message.contains("chat record was kept"));
+    assert!(!rejected.message.contains("local files were left"));
+    assert!(event_receiver.try_recv().is_err());
+    assert_eq!(fs::read_to_string(&dirty_file).unwrap(), "uncommitted\n");
+    let dirty_rows: u32 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM chats WHERE id = ?1",
+            [&dirty_chat.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dirty_rows, 1);
 }

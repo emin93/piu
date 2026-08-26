@@ -16,6 +16,7 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": resolve(repositoryRoot, "src"),
+      "#inbox-performance-review": resolve(import.meta.dirname, "chat/inbox-performance-review.ts"),
       "#model-resource-qa": resolve(
         repositoryRoot,
         "src/features/model-resources/model-resource-qa.production.tsx",

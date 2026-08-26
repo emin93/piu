@@ -9,12 +9,17 @@ import {
 import { type ModelControlsAdapter, tauriModelControlsAdapter } from "@/platform/model-controls";
 import type { PromptAttachment } from "@/platform/prompt-attachments";
 
-import { ModelControlsController } from "../model-controls/model-controls-controller";
+import {
+  createChatConversationSession,
+  readCachedChatConversationSession,
+  rememberCachedChatConversationSession,
+} from "./chat-conversation-session-cache";
 import { ConversationSurface, type TranscriptViewState } from "./ConversationSurface";
 import { ConversationController } from "./conversation-controller";
 
 interface ChatConversationPanelProps {
   adapter: ConversationAdapter;
+  cacheOwner?: object;
   chatId: string;
   initialTranscriptState?: TranscriptViewState;
   modelControlsAdapter?: ModelControlsAdapter;
@@ -36,27 +41,39 @@ function failureMessage(error: unknown) {
 
 function ConnectedChatConversationPanel({
   adapter,
+  cacheOwner,
   chatId,
   initialTranscriptState,
-  modelControlsAdapter = tauriModelControlsAdapter,
+  modelControlsAdapter,
   onRequestCodexSignIn,
   onTranscriptStateChange,
   revision = 0,
 }: ChatConversationPanelProps) {
-  const controller = useMemo(() => new ConversationController(chatId, adapter), [adapter, chatId]);
-  const modelControls = useMemo(
-    () => new ModelControlsController(chatId, modelControlsAdapter),
-    [chatId, modelControlsAdapter],
+  const effectiveModelControlsAdapter = modelControlsAdapter ?? tauriModelControlsAdapter;
+  const cachedSession = cacheOwner
+    ? readCachedChatConversationSession(cacheOwner, chatId)
+    : undefined;
+  const session = useMemo(
+    () =>
+      cachedSession ??
+      createChatConversationSession(adapter, chatId, effectiveModelControlsAdapter),
+    [adapter, cachedSession, chatId, effectiveModelControlsAdapter],
   );
+  const { composer, controller, modelControls } = session;
   const [connection, setConnection] = useState<ConnectionState>(() => ({
     controller,
     phase: "connecting",
   }));
   const [attempt, setAttempt] = useState(0);
-  const [draft, setDraft] = useState("");
-  const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
+  const [draft, setDraftState] = useState(composer.draft);
+  const [attachments, setAttachmentsState] = useState<PromptAttachment[]>(composer.attachments);
   const activeConnection: ConnectionState =
     connection.controller === controller ? connection : { controller, phase: "connecting" };
+  const showCachedConversation = activeConnection.phase === "connecting" && controller.hasSnapshot;
+
+  useEffect(() => {
+    if (cacheOwner) rememberCachedChatConversationSession(cacheOwner, chatId, session);
+  }, [cacheOwner, chatId, session]);
 
   useEffect(() => {
     let active = true;
@@ -91,23 +108,38 @@ function ConnectedChatConversationPanel({
     [controller],
   );
   const stop = useCallback(() => controller.stop(), [controller]);
+  const setDraft = useCallback(
+    (value: string) => {
+      composer.rememberDraft(value);
+      setDraftState(value);
+    },
+    [composer],
+  );
+  const setAttachments = useCallback(
+    (value: PromptAttachment[]) => {
+      composer.rememberAttachments(value);
+      setAttachmentsState(value);
+    },
+    [composer],
+  );
   const retry = useCallback(() => {
     setConnection({ controller, phase: "connecting" });
     setAttempt((current) => current + 1);
   }, [controller]);
 
-  if (activeConnection.phase === "connected") {
+  if (activeConnection.phase === "connected" || showCachedConversation) {
+    const connected = activeConnection.phase === "connected";
     return (
       <ConversationSurface
         attachments={attachments}
         draft={draft}
         initialTranscriptState={initialTranscriptState}
-        onAnswerInput={answerInput}
+        onAnswerInput={connected ? answerInput : undefined}
         onAttachmentsChange={setAttachments}
         onDraftChange={setDraft}
         onRequestCodexSignIn={onRequestCodexSignIn}
-        onSend={send}
-        onStop={stop}
+        onSend={connected ? send : undefined}
+        onStop={connected ? stop : undefined}
         onTranscriptStateChange={onTranscriptStateChange}
         modelControls={modelControls}
         store={controller.store}

@@ -10,6 +10,13 @@ printf '%s\n' "$PATH" > "$record_dir/path"
 printf '%s\n' "${GIT_EXEC_PATH:-}" > "$record_dir/git-exec-path"
 printf '%s\n' "${GIT_TEMPLATE_DIR:-}" > "$record_dir/git-template-dir"
 
+if [[ "${PIU_ENVIRONMENT_FIXTURE_MODE:-snapshot}" == "chat-runtime-delayed" ]]; then
+  while [[ ! -f "$record_dir/release" ]]; do
+    /bin/sleep 0.01
+  done
+  PIU_ENVIRONMENT_FIXTURE_MODE=chat-runtime
+fi
+
 case "${PIU_ENVIRONMENT_FIXTURE_MODE:-snapshot}" in
   chat-runtime)
     project_skill="$PWD/.pi/skills/check/SKILL.md"

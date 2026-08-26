@@ -14,6 +14,7 @@
     "moduleResolution": "Bundler",
     "paths": {
       "@/*": ["./src/*"],
+      "#inbox-performance-review": ["./src/features/inbox/inbox-performance-review.production.ts"],
       "#model-resource-qa": ["./src/features/model-resources/model-resource-qa.production.tsx"]
     },
     "resolveJsonModule": true,

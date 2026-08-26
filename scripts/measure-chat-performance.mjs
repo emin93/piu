@@ -32,6 +32,12 @@ function requireNoRenders(count, label) {
   }
 }
 
+function requireAtLeastOneRender(count, label) {
+  if (!Number.isInteger(count) || count < 1) {
+    throw new Error(`${label} did not render`);
+  }
+}
+
 function waitForChildExit(child, timeoutMs) {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
   return new Promise((resolveExit) => {
@@ -131,6 +137,26 @@ try {
   requireNoRenders(
     report.inferenceControlRendersDuringStreaming,
     "Inference controls during transcript streaming",
+  );
+  requireNoRenders(
+    report.scopeControlRendersDuringStreaming,
+    "Project scope control during transcript streaming",
+  );
+  requireNoRenders(
+    report.unrelatedChatRowRendersDuringStreaming,
+    "Unrelated chat row during transcript streaming",
+  );
+  requireNoRenders(
+    report.scopeControlRendersDuringActivityUpdate,
+    "Project scope control during one chat activity update",
+  );
+  requireNoRenders(
+    report.unrelatedChatRowRendersDuringActivityUpdate,
+    "Unrelated chat row during one chat activity update",
+  );
+  requireAtLeastOneRender(
+    report.targetChatRowRendersDuringActivityUpdate,
+    "Target chat row during its activity update",
   );
   requireNoSlowFrames(report.scrollingFrames, "Transcript scrolling");
   requireNoSlowFrames(report.streamingFrames, "Transcript streaming");

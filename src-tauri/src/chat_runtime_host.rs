@@ -1676,6 +1676,9 @@ impl ChatRuntimeHost {
             .map_err(|_| ChatRuntimeHostError::Lock)? = Some(context.project_id);
 
         let _operation = slot.operation.lock().await;
+        if !self.is_current_slot(chat_id, &slot)? {
+            return Err(ChatWorkspaceError::UnsafeDeletion.into());
+        }
         if slot
             .active
             .lock()
@@ -1909,6 +1912,27 @@ impl ChatRuntimeHost {
 
     pub async fn stop_runtime(&self, chat_id: &str) -> Result<(), ChatRuntimeHostError> {
         self.stop_slot(chat_id).await
+    }
+
+    pub async fn retire_for_deletion(&self, chat_id: &str) -> Result<(), ChatRuntimeHostError> {
+        let slot = self.slot(chat_id)?;
+        let operation = slot.operation.lock().await;
+        let active = slot
+            .active
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)?
+            .take();
+        if let Some(active) = active {
+            active.stop_events.cancel();
+            active.child.shutdown().await?;
+        }
+        self.inner
+            .slots
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)?
+            .remove(chat_id);
+        drop(operation);
+        Ok(())
     }
 
     async fn stop_slot(&self, chat_id: &str) -> Result<(), ChatRuntimeHostError> {
@@ -2164,6 +2188,22 @@ impl ChatRuntimeHost {
                 .entry(chat_id.to_owned())
                 .or_insert_with(|| Arc::new(ChatSlot::new())),
         ))
+    }
+
+    fn is_current_slot(
+        &self,
+        chat_id: &str,
+        expected: &Arc<ChatSlot>,
+    ) -> Result<bool, ChatRuntimeHostError> {
+        self.inner
+            .slots
+            .lock()
+            .map_err(|_| ChatRuntimeHostError::Lock)
+            .map(|slots| {
+                slots
+                    .get(chat_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, expected))
+            })
     }
 
     fn process_spec(

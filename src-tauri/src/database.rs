@@ -160,6 +160,23 @@ const CURRENT_SCHEMA: &str = r#"
         )
     );
 
+    CREATE TABLE IF NOT EXISTS chat_workspace_deletions (
+        chat_id TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+        branch_head TEXT NOT NULL CHECK (length(branch_head) > 0),
+        worktree_removed INTEGER NOT NULL CHECK (worktree_removed IN (0, 1)),
+        branch_removed INTEGER NOT NULL CHECK (branch_removed IN (0, 1)),
+        session_path TEXT,
+        session_device TEXT,
+        session_inode TEXT,
+        session_removed INTEGER NOT NULL CHECK (session_removed IN (0, 1)),
+        CHECK (
+            (session_path IS NULL AND session_device IS NULL AND session_inode IS NULL
+                AND session_removed = 1)
+            OR (session_path IS NOT NULL AND session_device IS NOT NULL
+                AND session_inode IS NOT NULL)
+        )
+    );
+
     CREATE INDEX IF NOT EXISTS chats_created_at ON chats(created_at_ms DESC, id ASC);
     CREATE INDEX IF NOT EXISTS chats_project_id ON chats(project_id);
     CREATE INDEX IF NOT EXISTS chat_messages_chat_id ON chat_messages(chat_id, sequence);

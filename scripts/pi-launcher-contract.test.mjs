@@ -4,6 +4,7 @@ import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/p
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 const runtimeRoot = resolve("src-tauri/vendor/agent-runtime/runtime");
 const nodeExecutable = join(runtimeRoot, "node", "bin", "node");
@@ -175,6 +176,23 @@ function startChat({
   };
 }
 
+async function waitForAvailableModel(chat, predicate, description) {
+  const deadline = Date.now() + 5_000;
+  let models;
+  do {
+    models = (await chat.request({ type: "get_available_models" })).data.models;
+    const match = models.find(predicate);
+    if (match) return match;
+    await delay(20);
+  } while (Date.now() < deadline);
+
+  assert.fail(
+    `Pi launcher did not publish ${description}; observed ${JSON.stringify(
+      models.map(({ provider, id }) => ({ provider, id })),
+    )}`,
+  );
+}
+
 test("the real pinned Pi process exposes the rich event contract without external inference", async () => {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "piu-event-contract-"));
   const paths = {
@@ -287,10 +305,10 @@ export default function (pi) {
     ]);
     await chat.request({ type: "set_thinking_level", level: "max" });
     assert.equal((await chat.request({ type: "get_state" })).data.thinkingLevel, "max");
-    const availableModels = (await chat.request({ type: "get_available_models" })).data.models;
-    assert.equal(
-      availableModels.some(({ provider, id }) => provider === "piu-contract" && id === "plain"),
-      true,
+    await waitForAvailableModel(
+      chat,
+      ({ provider, id }) => provider === "piu-contract" && id === "plain",
+      "the registered piu-contract/plain model",
     );
     await chat.request({ type: "set_model", provider: "piu-contract", modelId: "plain" });
     assert.deepEqual((await chat.request({ type: "get_available_thinking_levels" })).data.levels, [

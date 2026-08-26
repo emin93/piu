@@ -10,6 +10,7 @@ import type {
 } from "@/platform/conversations";
 import type { ModelControlsAdapter } from "@/platform/model-controls";
 
+import { invalidateCachedChatConversationSession } from "./chat-conversation-session-cache";
 import { ChatConversationPanel } from "./ChatConversationPanel";
 
 function deferred<T>() {
@@ -159,6 +160,71 @@ test("switching chats disconnects the previous conversation", async () => {
 
   rendered.unmount();
   expect(disconnectSecond).toHaveBeenCalledOnce();
+});
+
+test("invalidating a deleted cached chat removes its transcript and draft", async () => {
+  const user = userEvent.setup();
+  const cacheOwner = {};
+  const recreatedConnection = deferred<ConversationConnection>();
+  const adapter: ConversationAdapter = {
+    answerInput: vi.fn().mockResolvedValue(undefined),
+    connect: vi
+      .fn<ConversationAdapter["connect"]>()
+      .mockResolvedValueOnce({
+        disconnect: vi.fn(),
+        snapshot: {
+          failure: null,
+          inputRequest: null,
+          items: [
+            {
+              id: "deleted-message",
+              kind: "message",
+              queued: false,
+              role: "assistant",
+              text: "Deleted transcript",
+            },
+          ],
+          phase: "running",
+        },
+      })
+      .mockImplementationOnce(() => recreatedConnection.promise),
+    prompt: vi.fn().mockResolvedValue(undefined),
+    stop: vi.fn().mockResolvedValue(undefined),
+  };
+  const first = render(
+    <ChatConversationPanel
+      adapter={adapter}
+      cacheOwner={cacheOwner}
+      chatId="deleted-chat"
+      modelControlsAdapter={availableModelControls}
+      onRequestCodexSignIn={vi.fn()}
+    />,
+  );
+
+  expect(await screen.findByText("Deleted transcript")).toBeVisible();
+  await user.type(screen.getByRole("textbox", { name: "Message Più" }), "Delete this draft");
+  first.unmount();
+  invalidateCachedChatConversationSession(cacheOwner, "deleted-chat");
+
+  render(
+    <ChatConversationPanel
+      adapter={adapter}
+      cacheOwner={cacheOwner}
+      chatId="deleted-chat"
+      modelControlsAdapter={availableModelControls}
+      onRequestCodexSignIn={vi.fn()}
+    />,
+  );
+  expect(screen.getByRole("status")).toHaveTextContent("Connecting to chat");
+  expect(screen.queryByText("Deleted transcript")).not.toBeInTheDocument();
+
+  act(() =>
+    recreatedConnection.resolve({
+      disconnect: vi.fn(),
+      snapshot: { failure: null, inputRequest: null, items: [], phase: "idle" },
+    }),
+  );
+  expect(await screen.findByRole("textbox", { name: "Message Più" })).toHaveValue("");
 });
 
 test("a failed connection can be retried without replacing the chat", async () => {
@@ -543,4 +609,33 @@ test("a failed route change retains the working route and offers retry", async (
   await user.click(screen.getByRole("button", { name: "Try again" }));
   expect(selectRoute).toHaveBeenCalledTimes(2);
   expect(await screen.findByRole("button", { name: "Model: GPT-5.6 Sol" })).toBeVisible();
+});
+
+test("offers Codex sign-in when an existing chat has no model routes", async () => {
+  const user = userEvent.setup();
+  const requestCodexSignIn = vi.fn();
+  const adapter: ConversationAdapter = {
+    answerInput: vi.fn().mockResolvedValue(undefined),
+    connect: vi.fn().mockResolvedValue({
+      disconnect: vi.fn(),
+      snapshot: { failure: null, inputRequest: null, items: [], phase: "idle" },
+    }),
+    prompt: vi.fn().mockResolvedValue(undefined),
+    stop: vi.fn().mockResolvedValue(undefined),
+  };
+
+  render(
+    <ChatConversationPanel
+      adapter={adapter}
+      chatId="missing-model-routes-chat"
+      modelControlsAdapter={modelAdapter({
+        get: vi.fn().mockRejectedValue(new Error("no model routes")),
+      })}
+      onRequestCodexSignIn={requestCodexSignIn}
+    />,
+  );
+
+  await user.click(await screen.findByRole("button", { name: "Sign in to Codex" }));
+  expect(requestCodexSignIn).toHaveBeenCalledOnce();
+  expect(screen.getByRole("button", { name: "Try again" })).toBeVisible();
 });

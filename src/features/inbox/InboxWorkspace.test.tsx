@@ -1,24 +1,40 @@
 import { useEffect, useState } from "react";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { expect, test, vi } from "vitest";
+import { beforeEach, expect, test, vi } from "vitest";
 
-import type { InboxSnapshot } from "../../platform/project-inbox";
-import type { ConversationAdapter } from "../../platform/conversations";
-import type { ModelControlsAdapter } from "../../platform/model-controls";
-import type { PromptAttachment } from "../../platform/prompt-attachments";
-import { ProjectDraftController } from "./draft-controller";
+import type { ModelRouteId } from "@/generated/ModelRouteId";
+import type { ReasoningEffort } from "@/generated/ReasoningEffort";
+import type { ConversationAdapter, ConversationConnection } from "@/platform/conversations";
+import type { ModelControlsAdapter } from "@/platform/model-controls";
+import type { PromptAttachment } from "@/platform/prompt-attachments";
+import type { InboxSnapshot } from "@/platform/project-inbox";
+
 import { ChatActivityController } from "./chat-activity-controller";
+import { ProjectDraftController } from "./draft-controller";
+import { readRememberedProjectScope, rememberProjectScope } from "./inbox-scope";
 import { InboxWorkspace } from "./InboxWorkspace";
 import { ChatSetupController } from "./setup-controller";
 
+interface NativeMenuRequest {
+  actions: ReadonlyArray<{ id: "delete" | "rename"; separatorBefore: boolean }>;
+  onAction: (action: "delete" | "rename") => void;
+  position?: { x: number; y: number };
+}
+
+const popupNativeContextMenu = vi.hoisted(() =>
+  vi.fn<(request: NativeMenuRequest) => Promise<void>>().mockResolvedValue(undefined),
+);
+
+vi.mock("@/platform/native-context-menu", () => ({ popupNativeContextMenu }));
+
 const readySetup = {
-  phase: "succeeded" as const,
-  failure: null,
-  exitCode: 0,
-  signal: null,
   attempt: 1,
+  exitCode: 0,
+  failure: null,
   log: "",
+  phase: "succeeded" as const,
+  signal: null,
 };
 
 const conversationAdapter: ConversationAdapter = {
@@ -43,94 +59,106 @@ const modelControlsAdapter: ModelControlsAdapter<number> = {
   selectEffort: vi.fn(),
   selectRoute: vi.fn(),
 };
+const chatModelControlsAdapter: ModelControlsAdapter = {
+  get: vi.fn().mockResolvedValue({
+    appliesAfterCurrentStep: false,
+    efforts: ["low", "medium", "xhigh"],
+    routes: [{ acceptsImages: false, id: selectedRoute, name: "Qwen 3.8 27B" }],
+    selectedEffort: "medium",
+    selectedRoute,
+  }),
+  selectEffort: vi.fn(),
+  selectRoute: vi.fn(),
+};
 
 const populatedSnapshot: InboxSnapshot = {
   projects: [
-    { id: 1, name: "Atlas", availability: "available", unmergedChatCount: 2 },
-    { id: 2, name: "Beacon", availability: "missing", unmergedChatCount: 1 },
-    { id: 3, name: "Caldera", availability: "available", unmergedChatCount: 0 },
+    { availability: "available", id: 1, name: "Atlas", unmergedChatCount: 2 },
+    { availability: "missing", id: 2, name: "Beacon", unmergedChatCount: 1 },
+    { availability: "available", id: 3, name: "Caldera", unmergedChatCount: 0 },
   ],
   drafts: [{ attachments: [], projectId: 1, prompt: "Explain the parser", updatedAtMs: 500 }],
   chats: [
     {
+      branchName: "docs/importer",
+      createdAtMs: 100,
       id: "older",
+      mergeState: "unmerged",
       projectId: 1,
       projectName: "Atlas",
-      title: "Document the importer",
-      branchName: "docs/importer",
       pullRequestNumber: null,
-      createdAtMs: 100,
-      mergeState: "unmerged",
       setup: readySetup,
+      title: "Document the importer",
     },
     {
+      branchName: "fix/indexing",
+      createdAtMs: 300,
       id: "newer",
+      mergeState: "unmerged",
       projectId: 2,
       projectName: "Beacon",
-      title: "Repair repository indexing",
-      branchName: "fix/indexing",
       pullRequestNumber: 73,
-      createdAtMs: 300,
-      mergeState: "unmerged",
       setup: readySetup,
+      title: "Repair repository indexing",
     },
     {
+      branchName: "feature/stable-order",
+      createdAtMs: 200,
       id: "middle",
+      mergeState: "unmerged",
       projectId: 1,
       projectName: "Atlas",
-      title: "Keep this deliberately long chat title stable while its narrow row truncates cleanly",
-      branchName: "feature/stable-order",
       pullRequestNumber: 62,
-      createdAtMs: 200,
-      mergeState: "unmerged",
       setup: readySetup,
+      title: "Keep this deliberately long chat title stable while its row truncates cleanly",
     },
     {
+      branchName: "agent/history",
+      createdAtMs: 50,
       id: "merged",
+      mergeState: "merged",
       projectId: null,
       projectName: "Removed project",
-      title: "Historical result",
-      branchName: "agent/history",
       pullRequestNumber: 41,
-      createdAtMs: 50,
-      mergeState: "merged",
       setup: readySetup,
+      title: "Historical result",
     },
   ],
 };
 
+type CreateChat = (
+  projectId: number,
+  prompt: string,
+  attachments: readonly PromptAttachment[],
+  route: ModelRouteId,
+  effort: ReasoningEffort,
+) => Promise<string | undefined>;
+
 function WorkspaceHarness({
+  adapter = conversationAdapter,
+  initialChatId = null,
+  initialProjectId = null,
   initialSnapshot = populatedSnapshot,
-  onCreate = vi.fn().mockResolvedValue(undefined),
-  onRemove = vi.fn().mockResolvedValue(undefined),
-  onRename = vi.fn().mockResolvedValue(undefined),
-  onSave,
+  onCreate = vi.fn<CreateChat>().mockResolvedValue(undefined),
+  onDelete = vi.fn<(chatId: string) => Promise<string | undefined>>().mockResolvedValue(undefined),
+  onRename = vi
+    .fn<(chatId: string, title: string) => Promise<string | undefined>>()
+    .mockResolvedValue(undefined),
 }: {
+  adapter?: ConversationAdapter;
+  initialChatId?: string | null;
+  initialProjectId?: number | null;
   initialSnapshot?: InboxSnapshot;
-  onCreate?: (
-    projectId: number,
-    prompt: string,
-    attachments: readonly PromptAttachment[],
-  ) => Promise<string | undefined>;
-  onRemove?: (projectId: number) => Promise<string | undefined>;
+  onCreate?: CreateChat;
+  onDelete?: (chatId: string) => Promise<string | undefined>;
   onRename?: (chatId: string, title: string) => Promise<string | undefined>;
-  onSave?: (projectId: number, prompt: string) => Promise<void>;
 }) {
   const [snapshot, setSnapshot] = useState(initialSnapshot);
-  const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
-  const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
+  const [selectedProjectId, setSelectedProjectId] = useState(initialProjectId);
+  const [selectedChatId, setSelectedChatId] = useState<string | null>(initialChatId);
   const [query, setQuery] = useState("");
   const [drafts] = useState(() => {
-    const controller = new ProjectDraftController(async (projectId, prompt) => {
-      await onSave?.(projectId, prompt);
-      setSnapshot((current) => ({
-        ...current,
-        drafts: [
-          ...current.drafts.filter((draft) => draft.projectId !== projectId),
-          ...(prompt ? [{ attachments: [], projectId, prompt, updatedAtMs: 700 }] : []),
-        ],
-      }));
-    });
+    const controller = new ProjectDraftController(() => Promise.resolve());
     controller.reconcile(initialSnapshot);
     return controller;
   });
@@ -143,29 +171,42 @@ function WorkspaceHarness({
   useEffect(() => drafts.reconcile(snapshot), [drafts, snapshot]);
   useEffect(() => setups.reconcile(snapshot), [setups, snapshot]);
 
+  const deleteChat = async (chatId: string) => {
+    const error = await onDelete(chatId);
+    if (error) return error;
+    setSnapshot((current) => ({
+      ...current,
+      chats: current.chats.filter(({ id }) => id !== chatId),
+    }));
+    if (selectedChatId === chatId) setSelectedChatId(null);
+    return undefined;
+  };
+
   return (
     <InboxWorkspace
       actionError={undefined}
       activities={activities}
-      conversationAdapter={conversationAdapter}
+      chatModelControlsAdapter={chatModelControlsAdapter}
+      conversationAdapter={adapter}
       conversationRevision={0}
       drafts={drafts}
       modelControlsAdapter={modelControlsAdapter}
       onCancelSetup={vi.fn().mockResolvedValue(undefined)}
       onCreateChat={onCreate}
+      onDeleteChat={deleteChat}
+      onNewChat={() => {
+        setSelectedChatId(null);
+        setQuery("");
+      }}
       onOpenRepository={vi.fn()}
-      onOpenTerminal={vi.fn().mockResolvedValue(undefined)}
       onOpenSettings={vi.fn()}
-      onRequestCodexSignIn={vi.fn()}
+      onOpenTerminal={vi.fn().mockResolvedValue(undefined)}
+      onProjectScopeChange={setSelectedProjectId}
       onQueryChange={setQuery}
-      onRemoveProject={onRemove}
       onRenameChat={onRename}
+      onRequestCodexSignIn={vi.fn()}
       onRetrySetup={vi.fn().mockResolvedValue(undefined)}
       onSelectChat={setSelectedChatId}
-      onSelectProject={(projectId) => {
-        setSelectedProjectId(projectId);
-        setSelectedChatId(null);
-      }}
       query={query}
       selectedChatId={selectedChatId}
       selectedProjectId={selectedProjectId}
@@ -175,335 +216,324 @@ function WorkspaceHarness({
   );
 }
 
-test("exposes Settings as a quiet sidebar footer action", async () => {
-  const openSettings = vi.fn();
-  const user = userEvent.setup();
-  render(
-    <InboxWorkspace
-      actionError={undefined}
-      activities={new ChatActivityController()}
-      conversationAdapter={conversationAdapter}
-      conversationRevision={0}
-      drafts={new ProjectDraftController(() => Promise.resolve())}
-      modelControlsAdapter={modelControlsAdapter}
-      onCancelSetup={vi.fn().mockResolvedValue(undefined)}
-      onCreateChat={vi.fn().mockResolvedValue(undefined)}
-      onOpenRepository={vi.fn()}
-      onOpenTerminal={vi.fn().mockResolvedValue(undefined)}
-      onOpenSettings={openSettings}
-      onRequestCodexSignIn={vi.fn()}
-      onQueryChange={vi.fn()}
-      onRemoveProject={vi.fn().mockResolvedValue(undefined)}
-      onRenameChat={vi.fn().mockResolvedValue(undefined)}
-      onRetrySetup={vi.fn().mockResolvedValue(undefined)}
-      onSelectChat={vi.fn()}
-      onSelectProject={vi.fn()}
-      query=""
-      selectedChatId={null}
-      selectedProjectId={null}
-      setups={new ChatSetupController()}
-      snapshot={{ projects: [], drafts: [], chats: [] }}
-    />,
-  );
-
-  await user.click(screen.getByRole("button", { name: "Settings" }));
-  expect(openSettings).toHaveBeenCalledOnce();
+beforeEach(() => {
+  window.localStorage.clear();
+  vi.clearAllMocks();
 });
 
-test("renders stable global rows and composes project filtering with search", async () => {
-  const user = userEvent.setup();
+function latestNativeMenuRequest() {
+  const request = popupNativeContextMenu.mock.calls.at(-1)?.[0];
+  if (!request) throw new Error("The native context menu was not requested");
+  return request;
+}
+
+test("renders a compact header and a headerless flat newest-created-first inbox", () => {
   render(<WorkspaceHarness />);
 
-  const inbox = screen.getByRole("list", { name: "Active chats" });
+  expect(screen.getByRole("searchbox", { name: "Search chats" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "New Chat" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Project scope: All Projects" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Open Repository" })).toBeVisible();
+  expect(screen.queryByRole("heading", { name: /Projects|Drafts|Chats/ })).not.toBeInTheDocument();
+
+  const inbox = screen.getByRole("list", { name: "Chat inbox" });
   expect(
     within(inbox)
       .getAllByRole("listitem")
       .map((row) => row.dataset.chatId),
   ).toEqual(["newer", "middle", "older"]);
+  expect(within(inbox).getByText("Beacon")).toBeVisible();
+  expect(within(inbox).getAllByText("Atlas")).toHaveLength(2);
+});
 
-  await user.click(screen.getByRole("button", { name: /Atlas, available, 2 active chats/ }));
+test("changes scope without closing the current chat and exposes one inline project draft", async () => {
+  const user = userEvent.setup();
+  render(<WorkspaceHarness initialChatId="newer" />);
+
+  await user.click(screen.getByRole("button", { name: "Project scope: All Projects" }));
+  await user.click(await screen.findByRole("menuitemradio", { name: "Atlas" }));
+
+  expect(screen.getByRole("button", { name: "Project scope: Atlas" })).toBeVisible();
+  expect(screen.getByText("Explain the parser")).toBeVisible();
+  expect(screen.getByText("Draft")).toBeVisible();
+  expect(
+    within(screen.getByRole("list", { name: "Chat inbox" })).queryByText("Beacon"),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Document the importer, idle" }).closest("li"),
+  ).toHaveAttribute("data-compact", "true");
+  expect(screen.getByRole("region", { name: "Chat workspace" })).toHaveAttribute(
+    "data-selected-chat-id",
+    "newer",
+  );
+
+  await user.click(screen.getByRole("button", { name: "Project scope: Atlas" }));
+  await user.click(await screen.findByRole("menuitemradio", { name: "All Projects" }));
+  expect(screen.queryByText("Draft")).not.toBeInTheDocument();
+});
+
+test("stores and reads a versioned project scope without inventing a missing scope", () => {
+  expect(readRememberedProjectScope()).toBeNull();
+  rememberProjectScope(3);
+  expect(readRememberedProjectScope()).toBe(3);
+  rememberProjectScope(null);
+  expect(readRememberedProjectScope()).toBeNull();
+  window.localStorage.setItem("piu.inbox-scope.v1", "not-a-project");
+  expect(readRememberedProjectScope()).toBeNull();
+});
+
+test("search filters metadata in stable order, stays sidebar-only, and Escape clears it", async () => {
+  const user = userEvent.setup();
+  render(<WorkspaceHarness initialChatId="older" />);
+
+  const search = screen.getByRole("searchbox", { name: "Search chats" });
+  await user.type(search, "#62");
+  const inbox = screen.getByRole("list", { name: "Chat inbox" });
+  expect(
+    within(inbox)
+      .getAllByRole("listitem")
+      .map((row) => row.dataset.chatId),
+  ).toEqual(["middle"]);
+  expect(screen.getByRole("region", { name: "Chat workspace" })).toHaveAttribute(
+    "data-selected-chat-id",
+    "older",
+  );
+
+  await user.keyboard("{Escape}");
+  expect(search).toHaveValue("");
+  expect(search).toHaveFocus();
+  expect(
+    within(screen.getByRole("list", { name: "Chat inbox" })).getAllByRole("listitem"),
+  ).toHaveLength(3);
+});
+
+test("New Chat clears the conversation and All Projects targets the first available project", async () => {
+  const user = userEvent.setup();
+  render(<WorkspaceHarness initialChatId="newer" />);
+
+  await user.click(screen.getByRole("button", { name: "New Chat" }));
+
+  expect(await screen.findByRole("heading", { name: "Start a chat" })).toBeVisible();
+  expect(screen.getByText(/New chat in/)).toHaveTextContent("New chat in Atlas");
   expect(screen.getByRole("textbox", { name: "Draft for Atlas" })).toHaveValue(
     "Explain the parser",
   );
-  expect(
-    within(screen.getByRole("list", { name: "Active chats" })).getAllByRole("listitem"),
-  ).toHaveLength(2);
-
-  await user.type(screen.getByRole("searchbox", { name: "Search chats" }), "#62");
-  expect(screen.queryByRole("textbox", { name: "Draft for Atlas" })).not.toBeInTheDocument();
-  expect(screen.getByText(/deliberately long chat title/)).toBeVisible();
-  expect(screen.queryByText("Document the importer")).not.toBeInTheDocument();
 });
 
-test("offers chat actions through right click and a visible menu, then renames presentation only", async () => {
-  const renameChat = vi.fn().mockResolvedValue(undefined);
+test("restores a recently visited transcript immediately while its connection resumes", async () => {
   const user = userEvent.setup();
-  render(<WorkspaceHarness onRename={renameChat} />);
+  let olderConnectionCount = 0;
+  let resolveOlderReconnect: ((connection: ConversationConnection) => void) | undefined;
+  const connection = (chatId: string, phase: "idle" | "running" = "idle") => ({
+    disconnect: vi.fn(),
+    snapshot: {
+      failure: null,
+      inputRequest: null,
+      items: [
+        {
+          id: `${chatId}-message`,
+          kind: "message" as const,
+          queued: false,
+          role: "assistant" as const,
+          text: `Transcript ${chatId}`,
+        },
+      ],
+      phase,
+    },
+  });
+  const adapter: ConversationAdapter = {
+    ...conversationAdapter,
+    connect: vi.fn((chatId: string): Promise<ConversationConnection> => {
+      if (chatId === "older" && ++olderConnectionCount === 2) {
+        return new Promise<ConversationConnection>((resolve) => {
+          resolveOlderReconnect = resolve;
+        });
+      }
+      return Promise.resolve(
+        connection(chatId, chatId === "older" && olderConnectionCount === 1 ? "running" : "idle"),
+      );
+    }),
+  };
+  render(<WorkspaceHarness adapter={adapter} initialChatId="older" />);
 
+  expect(await screen.findByText("Transcript older")).toBeVisible();
+  await user.type(screen.getByRole("textbox", { name: "Message Più" }), "Keep this draft");
+  await user.click(
+    screen.getByRole("button", {
+      name: /Keep this deliberately long chat title stable.*idle/,
+    }),
+  );
+  expect(await screen.findByText("Transcript middle")).toBeVisible();
+
+  await user.click(screen.getByRole("button", { name: "Document the importer, idle" }));
+  expect(screen.getByText("Transcript older")).toBeVisible();
+  expect(screen.getByRole("textbox", { name: "Message Più" })).toHaveValue("Keep this draft");
+  expect(screen.getByText("Reconnect to send")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Steer active turn" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Model: Qwen 3.8 27B" })).toBeDisabled();
+  expect(adapter.connect).toHaveBeenCalledTimes(3);
+
+  act(() => resolveOlderReconnect?.(connection("older")));
+  expect(await screen.findByRole("button", { name: "Send message" })).toBeEnabled();
+});
+
+test("secondary click and overflow expose the same ordered Rename and Delete actions", async () => {
+  const user = userEvent.setup();
+  render(<WorkspaceHarness />);
   const row = screen.getByRole("button", { name: "Document the importer, idle" });
+
+  fireEvent.contextMenu(row, { clientX: 120, clientY: 160 });
+  await vi.waitFor(() => expect(popupNativeContextMenu).toHaveBeenCalledOnce());
   expect(
+    latestNativeMenuRequest().actions.map((action) => [action.id, action.separatorBefore]),
+  ).toEqual([
+    ["rename", false],
+    ["delete", true],
+  ]);
+  expect(latestNativeMenuRequest().position).toBeUndefined();
+
+  await user.click(
     within(row.closest("li") as HTMLLIElement).getByRole("button", {
       name: "More chat actions",
     }),
-  ).toBeInTheDocument();
+  );
+  const overflowMenu = await screen.findByRole("menu");
+  expect(
+    within(overflowMenu)
+      .getAllByRole("menuitem")
+      .map((item) => item.textContent),
+  ).toEqual(["Rename chat", "Delete chat"]);
+  expect(within(overflowMenu).getByRole("separator")).toBeVisible();
+});
+
+test("keyboard context-menu keys open the native menu beside the focused row", async () => {
+  render(<WorkspaceHarness />);
+  const row = screen.getByRole("button", { name: "Document the importer, idle" });
+  vi.spyOn(row, "getBoundingClientRect").mockReturnValue({
+    bottom: 142,
+    height: 62,
+    left: 40,
+    right: 220,
+    toJSON: () => ({}),
+    top: 80,
+    width: 180,
+    x: 40,
+    y: 80,
+  });
+
+  fireEvent.keyDown(row, { key: "F10", shiftKey: true });
+
+  await vi.waitFor(() => expect(popupNativeContextMenu).toHaveBeenCalledOnce());
+  expect(latestNativeMenuRequest().position).toEqual({ x: 56, y: 108 });
+  expect(row).toHaveFocus();
+
+  popupNativeContextMenu.mockClear();
+  fireEvent.keyDown(row, { key: "ContextMenu" });
+  await vi.waitFor(() => expect(popupNativeContextMenu).toHaveBeenCalledOnce());
+  expect(latestNativeMenuRequest().position).toEqual({ x: 56, y: 108 });
+});
+
+test("merged chats retain Rename but omit Delete until merged records can be removed", async () => {
+  const user = userEvent.setup();
+  render(<WorkspaceHarness />);
+  await user.click(screen.getByRole("button", { name: /Merged/ }));
+  const row = screen.getByRole("button", { name: "Historical result, idle" });
+
+  fireEvent.contextMenu(row);
+  await vi.waitFor(() => expect(popupNativeContextMenu).toHaveBeenCalledOnce());
+  expect(latestNativeMenuRequest().actions.map((action) => action.id)).toEqual(["rename"]);
+
+  await user.click(
+    within(row.closest("li") as HTMLLIElement).getByRole("button", {
+      name: "More chat actions",
+    }),
+  );
+  const overflowMenu = await screen.findByRole("menu");
+  expect(within(overflowMenu).getAllByRole("menuitem")).toHaveLength(1);
+  expect(within(overflowMenu).getByRole("menuitem", { name: "Rename chat" })).toBeVisible();
+  expect(within(overflowMenu).queryByRole("menuitem", { name: "Delete chat" })).toBeNull();
+});
+
+test("rename remains presentation-only and restores focus to the row", async () => {
+  const renameChat = vi.fn().mockResolvedValue(undefined);
+  const user = userEvent.setup();
+  render(<WorkspaceHarness onRename={renameChat} />);
+  const row = screen.getByRole("button", { name: "Document the importer, idle" });
 
   fireEvent.contextMenu(row, { clientX: 120, clientY: 160 });
-  await user.click(await screen.findByRole("menuitem", { name: "Rename chat" }));
-
+  await vi.waitFor(() => expect(popupNativeContextMenu).toHaveBeenCalledOnce());
+  act(() => {
+    latestNativeMenuRequest().onAction("rename");
+  });
   const title = screen.getByRole("textbox", { name: "Title" });
-  expect(title).toHaveValue("Document the importer");
   await user.clear(title);
   await user.type(title, "Importer documentation");
   await user.click(screen.getByRole("button", { name: "Save" }));
 
   expect(renameChat).toHaveBeenCalledWith("older", "Importer documentation");
-  expect(screen.queryByRole("dialog", { name: "Rename chat" })).not.toBeInTheDocument();
+  await vi.waitFor(() => expect(row).toHaveFocus());
 });
 
-test("keeps one controlled draft per project across navigation", async () => {
+test("delete confirms local-only effects, recovers neighbor focus, and reports failure", async () => {
+  const deleteChat = vi
+    .fn<(chatId: string) => Promise<string | undefined>>()
+    .mockResolvedValueOnce(undefined)
+    .mockResolvedValueOnce("The managed worktree changed unexpectedly.");
   const user = userEvent.setup();
-  render(<WorkspaceHarness />);
+  render(<WorkspaceHarness onDelete={deleteChat} />);
 
-  await user.click(screen.getByRole("button", { name: /Atlas, available, 2 active chats/ }));
-  const draft = screen.getByRole("textbox", { name: "Draft for Atlas" });
-  await user.clear(draft);
-  await user.type(draft, "A replacement prompt");
-  expect(draft).toHaveValue("A replacement prompt");
-
-  await user.click(screen.getByRole("button", { name: /Caldera, available, 0 active chats/ }));
-  expect(screen.getByRole("textbox", { name: "Draft for Caldera" })).toHaveValue("");
-  await user.click(screen.getByRole("button", { name: /Atlas, available, 2 active chats/ }));
-  expect(screen.getByRole("textbox", { name: "Draft for Atlas" })).toHaveValue(
-    "A replacement prompt",
+  const older = screen.getByRole("button", { name: "Document the importer, idle" });
+  fireEvent.contextMenu(older, { clientX: 120, clientY: 160 });
+  await vi.waitFor(() => expect(popupNativeContextMenu).toHaveBeenCalledOnce());
+  act(() => {
+    latestNativeMenuRequest().onAction("delete");
+  });
+  const confirmation = screen.getByRole("alertdialog", { name: /Delete.*Document the importer/ });
+  expect(confirmation).toHaveTextContent("local conversation, managed worktree, and local branch");
+  expect(confirmation).toHaveTextContent("won't close a pull request or delete a remote branch");
+  expect(confirmation).toHaveTextContent("Any active agent will be stopped first");
+  await vi.waitFor(() =>
+    expect(within(confirmation).getByRole("button", { name: "Cancel" })).toHaveFocus(),
   );
-});
-
-test("scopes a failed chat submission to the project that produced it", async () => {
-  const onCreate = vi
-    .fn()
-    .mockResolvedValueOnce(
-      "Più couldn’t fetch a fresh origin/main. Check remote access and try again.",
-    )
-    .mockResolvedValue(undefined);
-  const user = userEvent.setup();
-  render(<WorkspaceHarness onCreate={onCreate} />);
-
-  const atlasDraft = screen.getByRole("textbox", { name: "Draft for Atlas" });
-  await user.clear(atlasDraft);
-  await user.type(atlasDraft, "Create the Atlas chat");
-  await user.click(screen.getByRole("button", { name: "Send message" }));
-  expect(await screen.findByText(/couldn’t fetch a fresh origin\/main/)).toBeVisible();
-
-  await user.click(screen.getByRole("button", { name: /Caldera, available, 0 active chats/ }));
-
-  expect(screen.getByRole("textbox", { name: "Draft for Caldera" })).toBeVisible();
-  expect(screen.queryByText(/couldn’t fetch a fresh origin\/main/)).not.toBeInTheDocument();
-});
-
-test("All Projects uses the first available project as the centered composer target", async () => {
-  const user = userEvent.setup();
-  render(<WorkspaceHarness />);
-
-  expect(screen.getByRole("button", { name: "All Projects, 3 projects" })).toHaveAttribute(
-    "aria-pressed",
-    "true",
+  await user.click(within(confirmation).getByRole("button", { name: "Delete chat" }));
+  expect(deleteChat).toHaveBeenCalledWith("older");
+  await vi.waitFor(() =>
+    expect(
+      screen.getByRole("button", {
+        name: /Keep this deliberately long chat title stable.*idle/,
+      }),
+    ).toHaveFocus(),
   );
-  const composer = screen.getByRole("textbox", { name: "Draft for Atlas" });
-  expect(composer).toHaveValue("Explain the parser");
-  expect(screen.getByRole("heading", { name: "Start a chat" })).toBeVisible();
-  expect(screen.getByText(/New chat in/)).toHaveTextContent("New chat in Atlas");
 
-  await user.clear(composer);
-  await user.type(composer, "Use the global inbox draft");
-  expect(composer).toHaveValue("Use the global inbox draft");
+  const newer = screen.getByRole("button", { name: "Repair repository indexing, idle" });
+  popupNativeContextMenu.mockClear();
+  fireEvent.contextMenu(newer, { clientX: 120, clientY: 160 });
+  await vi.waitFor(() => expect(popupNativeContextMenu).toHaveBeenCalledOnce());
+  act(() => {
+    latestNativeMenuRequest().onAction("delete");
+  });
+  await user.click(
+    within(screen.getByRole("alertdialog")).getByRole("button", { name: "Delete chat" }),
+  );
+  expect(await screen.findByRole("alert")).toHaveTextContent("changed unexpectedly");
+  expect(screen.getByRole("alertdialog")).toBeVisible();
 });
 
-test("the inbox sidebar resize seam is keyboard operable", async () => {
+test("preserves the thin keyboard and pointer resize seam", async () => {
   const user = userEvent.setup();
   render(<WorkspaceHarness />);
 
+  expect(screen.getByRole("button", { name: "Settings" })).toBeVisible();
   const resizeHandle = screen.getByRole("separator", { name: "Resize inbox" });
   expect(resizeHandle).toHaveAttribute("aria-valuenow", "256");
   await user.click(resizeHandle);
   await user.keyboard("{ArrowRight}");
   expect(resizeHandle).toHaveAttribute("aria-valuenow", "272");
-  await user.keyboard("{Home}");
-  expect(resizeHandle).toHaveAttribute("aria-valuenow", "208");
-});
 
-test("the inbox sidebar drag width stays on the four-pixel grid", () => {
-  render(<WorkspaceHarness />);
-
-  const resizeHandle = screen.getByRole("separator", { name: "Resize inbox" });
   expect(fireEvent.pointerDown(resizeHandle, { clientX: 100, pointerId: 1 })).toBe(false);
   expect(document.documentElement).toHaveAttribute("data-inbox-sidebar-resizing");
   fireEvent.pointerMove(resizeHandle, { clientX: 111, pointerId: 1 });
-
-  expect(resizeHandle).toHaveAttribute("aria-valuenow", "268");
-
+  expect(resizeHandle).toHaveAttribute("aria-valuenow", "284");
   fireEvent.pointerUp(resizeHandle, { pointerId: 1 });
   expect(document.documentElement).not.toHaveAttribute("data-inbox-sidebar-resizing");
-});
-
-test("explains unavailable projects and enforces removal rules", async () => {
-  const removeProject = vi.fn().mockResolvedValue(undefined);
-  const user = userEvent.setup();
-  render(<WorkspaceHarness onRemove={removeProject} />);
-
-  const blockedTrigger = screen.getByRole("button", { name: "Project actions for Atlas" });
-  await user.click(blockedTrigger);
-  const blockedRemoval = await screen.findByRole("menuitem", { name: "Remove project" });
-  expect(blockedRemoval).toHaveAttribute("aria-disabled", "true");
-  expect(blockedRemoval).toHaveAccessibleDescription("Merge active chats before removing Atlas.");
-  await user.click(blockedRemoval);
-  expect(removeProject).not.toHaveBeenCalled();
-
-  await user.keyboard("{Escape}");
-  await user.click(screen.getByRole("button", { name: /Beacon, repository unavailable/ }));
-  expect(screen.getByRole("heading", { name: "Beacon is unavailable" })).toBeVisible();
-  expect(screen.queryByRole("textbox", { name: /Beacon/ })).not.toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: /Send message/ })).not.toBeInTheDocument();
-
-  const trigger = screen.getByRole("button", { name: "Project actions for Caldera" });
-  await user.click(trigger);
-  await user.click(await screen.findByRole("menuitem", { name: "Remove project" }));
-  const confirmation = screen.getByRole("alertdialog", { name: "Remove Caldera?" });
-  expect(confirmation).toHaveTextContent("repository on disk won't be changed");
-  await vi.waitFor(() =>
-    expect(within(confirmation).getByRole("button", { name: "Cancel" })).toHaveFocus(),
-  );
-  await user.keyboard("{Escape}");
-  expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
-  expect(trigger).toHaveFocus();
-
-  await user.click(trigger);
-  await user.click(await screen.findByRole("menuitem", { name: "Remove project" }));
-  const reopenedConfirmation = screen.getByRole("alertdialog", { name: "Remove Caldera?" });
-  await user.click(within(reopenedConfirmation).getByRole("button", { name: "Remove project" }));
-  expect(removeProject).toHaveBeenCalledWith(3);
-});
-
-test("an unavailable project presents its retained draft read-only without send affordances", async () => {
-  const retainedSnapshot: InboxSnapshot = {
-    ...populatedSnapshot,
-    drafts: [
-      ...populatedSnapshot.drafts,
-      {
-        attachments: [],
-        projectId: 2,
-        prompt: "Keep the unavailable repository context",
-        updatedAtMs: 600,
-      },
-    ],
-  };
-  const user = userEvent.setup();
-  render(<WorkspaceHarness initialSnapshot={retainedSnapshot} />);
-
-  await user.click(screen.getByRole("button", { name: /Beacon, repository unavailable/ }));
-
-  const retainedDraft = screen.getByRole("textbox", { name: "Retained draft for Beacon" });
-  expect(retainedDraft).toHaveValue("Keep the unavailable repository context");
-  expect(retainedDraft).toHaveAttribute("readonly");
-  expect(retainedDraft).not.toHaveAttribute("placeholder");
-  expect(screen.queryByRole("button", { name: /Send message/ })).not.toBeInTheDocument();
-});
-
-test("removal discloses draft deletion and keeps the modal open on failure", async () => {
-  const removeProject = vi.fn().mockResolvedValue("Couldn't remove that project. Try again.");
-  const user = userEvent.setup();
-  render(<WorkspaceHarness onRemove={removeProject} />);
-
-  await user.click(screen.getByRole("button", { name: /Caldera, available/ }));
-  await user.type(screen.getByRole("textbox", { name: "Draft for Caldera" }), "Unsent work");
-  await user.click(screen.getByRole("button", { name: "Project actions for Caldera" }));
-  await user.click(await screen.findByRole("menuitem", { name: "Remove project" }));
-  const dialog = screen.getByRole("alertdialog", { name: "Remove Caldera?" });
-  expect(dialog).toHaveTextContent("unsent draft will be deleted");
-
-  await user.click(within(dialog).getByRole("button", { name: "Remove project" }));
-
-  expect(await within(dialog).findByRole("alert")).toHaveTextContent("Couldn't remove");
-  expect(dialog).toBeVisible();
-});
-
-test("attachment-only drafts stay visible and are disclosed before project removal", async () => {
-  const user = userEvent.setup();
-  const attachmentOnlySnapshot: InboxSnapshot = {
-    ...populatedSnapshot,
-    drafts: [
-      ...populatedSnapshot.drafts,
-      {
-        attachments: [
-          {
-            content: "Release notes",
-            id: "notes-attachment",
-            kind: "text",
-            mimeType: "text/plain",
-            name: "notes.txt",
-            sizeBytes: 13,
-          },
-        ],
-        projectId: 3,
-        prompt: "",
-        updatedAtMs: 700,
-      },
-    ],
-  };
-  render(<WorkspaceHarness initialSnapshot={attachmentOnlySnapshot} />);
-
-  const draftsList = screen.getByRole("list", { name: "Unsent drafts" });
-  expect(within(draftsList).getByText("Attached notes.txt")).toBeVisible();
-
-  await user.click(screen.getByRole("button", { name: "Project actions for Caldera" }));
-  await user.click(await screen.findByRole("menuitem", { name: "Remove project" }));
-
-  expect(screen.getByRole("alertdialog", { name: "Remove Caldera?" })).toHaveTextContent(
-    "unsent draft will be deleted",
-  );
-});
-
-test("a failed draft stays visible in All Projects and can be retried", async () => {
-  const save = vi
-    .fn<(projectId: number, prompt: string) => Promise<void>>()
-    .mockRejectedValueOnce(new Error("database offline"))
-    .mockResolvedValueOnce();
-  const user = userEvent.setup();
-  render(<WorkspaceHarness onSave={save} />);
-
-  await user.click(screen.getByRole("button", { name: /Caldera, available/ }));
-  await user.type(screen.getByRole("textbox", { name: "Draft for Caldera" }), "Keep this work");
-  expect(await screen.findByText(/Couldn't save this draft/)).toBeVisible();
-  await user.click(screen.getByRole("button", { name: "All Projects, 3 projects" }));
-
-  const draftsList = screen.getByRole("list", { name: "Unsent drafts" });
-  expect(within(draftsList).getByText("Keep this work")).toBeVisible();
-  await user.click(within(draftsList).getByRole("button", { name: "Retry" }));
-  await vi.waitFor(() => expect(save).toHaveBeenCalledTimes(2));
-  expect(within(draftsList).queryByText("Not saved")).not.toBeInTheDocument();
-});
-
-test("removal keeps focus contained while the host response is pending", async () => {
-  let finishRemoval: ((value: string | undefined) => void) | undefined;
-  const removeProject = vi.fn(
-    () =>
-      new Promise<string | undefined>((resolve) => {
-        finishRemoval = resolve;
-      }),
-  );
-  const user = userEvent.setup();
-  render(<WorkspaceHarness onRemove={removeProject} />);
-
-  await user.click(screen.getByRole("button", { name: "Project actions for Caldera" }));
-  await user.click(await screen.findByRole("menuitem", { name: "Remove project" }));
-  const dialog = screen.getByRole("alertdialog", { name: "Remove Caldera?" });
-  await user.click(within(dialog).getByRole("button", { name: "Remove project" }));
-  expect(within(dialog).getByRole("button", { name: "Removing" })).toBeDisabled();
-
-  await user.keyboard("{Tab}{Tab}");
-  expect(dialog).toContainElement(document.activeElement as HTMLElement);
-  await user.keyboard("{Escape}");
-  expect(dialog).toBeVisible();
-
-  finishRemoval?.(undefined);
-  await vi.waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
 });

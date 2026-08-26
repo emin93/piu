@@ -7,7 +7,7 @@ use ts_rs::TS;
 use crate::{
     agent_environment::AgentEnvironment,
     application::ApplicationCore,
-    chat_runtime_host::{ModelRouteId, ReasoningEffort},
+    chat_runtime_host::{ChatRuntimeHost, ModelRouteId, ReasoningEffort},
     chat_workspaces::{
         ChatSetupChangedEvent, ChatTerminalRequest, ChatWorkspaceError, CreatedChat,
     },
@@ -113,6 +113,8 @@ pub enum ProjectCommandErrorCode {
     RepositoryInspectionFailed,
     StorageUnavailable,
     InvalidAttachment,
+    UnsafeChatDeletion,
+    ChatDeletionFailed,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -188,6 +190,8 @@ impl From<ChatWorkspaceError> for ChatWorkspaceCommandError {
             | ChatWorkspaceError::InvalidOwnership
             | ChatWorkspaceError::Reconciliation(_)
             | ChatWorkspaceError::Interrupted(_)
+            | ChatWorkspaceError::UnsafeDeletion
+            | ChatWorkspaceError::Deletion(_)
             | ChatWorkspaceError::SetupSupervisor(_)
             | ChatWorkspaceError::Inbox(_) => Self {
                 code: ChatWorkspaceCommandErrorCode::CreationFailed,
@@ -324,6 +328,45 @@ pub async fn rename_chat<R: Runtime>(
     let snapshot =
         blocking_project_operation(move || inbox.rename_chat(&request.chat_id, &request.title))
             .await?;
+    emit_change(
+        &app,
+        ProjectInboxChangedEvent {
+            snapshot: snapshot.clone(),
+            focused_project_id: None,
+        },
+    )?;
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub async fn delete_chat<R: Runtime>(
+    app: AppHandle<R>,
+    core: State<'_, ApplicationCore>,
+    runtime: State<'_, ChatRuntimeHost>,
+    request: ChatIdRequest,
+) -> Result<InboxSnapshot, ProjectCommandError> {
+    let workspaces = core.chat_workspaces();
+    let chat_id = request.chat_id;
+    let prepare_workspaces = Arc::clone(&workspaces);
+    let prepare_chat_id = chat_id.clone();
+    let deletion = tauri::async_runtime::spawn_blocking(move || {
+        prepare_workspaces.prepare_chat_deletion(&prepare_chat_id)
+    })
+    .await
+    .map_err(|_| deletion_failed("Più couldn’t prepare this chat for deletion. Try again."))?
+    .map_err(map_deletion_error)?;
+
+    if runtime.retire_for_deletion(&chat_id).await.is_err() {
+        let _ = tauri::async_runtime::spawn_blocking(move || deletion.cancel_if_untouched()).await;
+        return Err(deletion_failed(
+            "Più couldn’t stop this chat’s agent process, so nothing was deleted. Try again.",
+        ));
+    }
+
+    let snapshot = tauri::async_runtime::spawn_blocking(move || deletion.execute())
+        .await
+        .map_err(|_| deletion_failed("Più couldn’t finish deleting this chat. Try again."))?
+        .map_err(map_deletion_error)?;
     emit_change(
         &app,
         ProjectInboxChangedEvent {
@@ -510,6 +553,37 @@ where
             message: "Più couldn’t finish creating this chat. Try again.".into(),
         })?
         .map_err(Into::into)
+}
+
+fn map_deletion_error(error: ChatWorkspaceError) -> ProjectCommandError {
+    match error {
+        ChatWorkspaceError::Inbox(ProjectInboxError::ChatNotFound { .. }) => ProjectCommandError {
+            code: ProjectCommandErrorCode::ChatNotFound,
+            message: "That chat is no longer in Più.".into(),
+        },
+        ChatWorkspaceError::UnsafeDeletion | ChatWorkspaceError::InvalidOwnership => {
+            ProjectCommandError {
+                code: ProjectCommandErrorCode::UnsafeChatDeletion,
+                message: "Più stopped because it could no longer verify a local deletion target. The chat record was kept so the deletion can be inspected and retried.".into(),
+            }
+        }
+        ChatWorkspaceError::Inbox(ProjectInboxError::AppData(_))
+        | ChatWorkspaceError::Inbox(ProjectInboxError::Database(_))
+        | ChatWorkspaceError::Inbox(ProjectInboxError::DatabaseLock) => ProjectCommandError {
+            code: ProjectCommandErrorCode::StorageUnavailable,
+            message: "Più couldn’t save the chat deletion. Try again.".into(),
+        },
+        _ => deletion_failed(
+            "Più couldn’t safely finish deleting this chat. Its record was kept so you can retry.",
+        ),
+    }
+}
+
+fn deletion_failed(message: &str) -> ProjectCommandError {
+    ProjectCommandError {
+        code: ProjectCommandErrorCode::ChatDeletionFailed,
+        message: message.into(),
+    }
 }
 
 fn emit_change<R: Runtime>(

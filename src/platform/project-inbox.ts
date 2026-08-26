@@ -27,6 +27,8 @@ const PROJECT_COMMAND_ERROR_CODES = new Set<ProjectCommandErrorCode>([
   "repositoryInspectionFailed",
   "storageUnavailable",
   "invalidAttachment",
+  "unsafeChatDeletion",
+  "chatDeletionFailed",
 ]);
 
 export function loadProjectInbox() {
@@ -53,6 +55,10 @@ export function removeProject(projectId: number) {
 
 export function renameChat(chatId: string, title: string) {
   return invoke<InboxSnapshot>("rename_chat", { request: { chatId, title } });
+}
+
+export function deleteChat(chatId: string) {
+  return invoke<InboxSnapshot>("delete_chat", { request: { chatId } });
 }
 
 export function listenToProjectInbox(onChange: (event: ProjectInboxChangedEvent) => void) {
