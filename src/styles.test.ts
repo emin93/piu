@@ -72,14 +72,19 @@ test("native controls and inherited sidebar copy keep explicit system-theme cont
   expect(stylesheet).toMatch(/\.draft-row-prompt\s*\{[^}]*color: var\(--sidebar-foreground\);/);
 });
 
-test("application chrome is nonselectable while editing and transcript content remain selectable", () => {
-  expect(stylesheet).toMatch(
+test("application chrome owns nonselection without blocking diagnostic content", () => {
+  expect(stylesheet).not.toMatch(
     /html,\s*body,\s*#root\s*\{[^}]*-webkit-user-select: none;[^}]*user-select: none;/,
+  );
+  expect(stylesheet).toMatch(
+    /\.inbox-sidebar\s*\{[^}]*-webkit-user-select: none;[^}]*user-select: none;/,
   );
   expect(stylesheet).toMatch(
     /input,\s*textarea,\s*\[contenteditable="true"\],\s*\.conversation-transcript\s*\{[^}]*-webkit-user-select: text;[^}]*user-select: text;/,
   );
-  expect(stylesheet).not.toMatch(/body\s*\{[^}]*user-select: text;/);
+  expect(stylesheet).toMatch(
+    /\.sidebar-error\s*\{[^}]*-webkit-user-select: text;[^}]*user-select: text;/,
+  );
 });
 
 test("long chat branches stay inside their inbox metadata column", () => {
